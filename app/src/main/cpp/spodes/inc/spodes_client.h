@@ -118,7 +118,7 @@ public:
 	 * @return - true в случае успешного выполнения метода, иначе false
 	 */
 	bool EstablishConnectionRequest(const uint8_t& security_level, const SecurityParams* params,
-									const uint16_t &client_max_receive_pdu_size, const OptionalParams *optional_params);
+	                                const uint16_t &client_max_receive_pdu_size, const OptionalParams *optional_params);
 
 	/**
 	 * @brief Ответ от сервера при установлении подключения по СПОДЭС (AARE)
@@ -144,7 +144,7 @@ public:
 
 	/**
 	 * @brief Запрос на чтение значений нескольких атрибутов. Запрашивать значения с одинаковым типом данных
-	 * @param params - параметры запроса (номер класса, obis-код, номер атрибута, флаг повторного запроса) 
+	 * @param params - параметры запроса (номер класса, obis-код, номер атрибута, флаг повторного запроса)
 	 * @param param_count - количество параметров
 	 * @return - true в случае успешного выполнения метода, иначе false
 	 */
@@ -158,6 +158,42 @@ public:
 	 * @return - true в случае успешного выполнения метода, иначе false
 	 */
 	bool GetRequest(const RequestParams &params, void* selective_access, const uint8_t &selector);
+
+	/**
+	 * @brief [Android-патч] GET-запрос с "плоской" однобайтовой HDLC-адресацией и
+	 * invoke-id-and-priority без бита service_class — именно так собирает кадры
+	 * штатная прошивка пульта РиМ 040.40 при обращении к этому конкретному счётчику
+	 * (подтверждено сравнением с реальным логом Tera Term и рабочим GET-запросом,
+	 * получившим настоящий ответ от прибора). Обычный GetRequest() всегда пишет
+	 * двухбайтовый logical+physical адрес и service_class=true — этот счётчик такие
+	 * кадры молча игнорирует, поэтому обычный GetRequest() с ним не работает.
+	 * @param params - параметры запроса (класс, obis-код, атрибут)
+	 * @param dest_address - уже готовый (не сдвинутый) байт HDLC-адреса счётчика, см. HDLC_Wrapper_Preset в прошивке пульта
+	 * @param src_address - уже готовый байт HDLC-адреса клиента (у пульта = 0x43)
+	 * @return - true, если кадр успешно собран и отправлен
+	 */
+	bool GetRequestFlatAddress(const RequestParams &params, const uint8_t &dest_address, const uint8_t &src_address);
+
+	/**
+	 * @brief [Android-патч] "Сырой" ответ на GET-запрос без разбора APDU библиотечными
+	 * ProcessResponseXxx-функциями. Нужен для ответов, которые сама библиотека не умеет
+	 * разбирать корректно: во-первых, у этого счётчика ответ на GetRequestFlatAddress()
+	 * приходит с однобайтовым HDLC-адресом (как и запрос), из-за чего фиксированные
+	 * смещения (response.at(13)/(15)/(16)) в существующем GetResponseGeneral() указывают
+	 * не туда, где они рассчитаны на двухбайтовый адрес; во-вторых, реальный ответ этого
+	 * прибора на первый GET (класс 7, OBIS 0.0.21.0.2.255) — это COSEM-массив из
+	 * нескольких структур {double-long-unsigned, enum} (пятитарифные значения энергии
+	 * с масштабом/единицей), а не скаляр, который понимают GetResponseInt/GetResponseFloat.
+	 * Здесь только читается ответ с транспорта (в т.ч. дособирается, если пришёл несколькими
+	 * BLE-уведомлениями) и расшифровывается при необходимости — сам разбор DLMS-структуры
+	 * (LLC-заголовок, service-id, invoke-id, тип данных, вложенные элементы) выполняется
+	 * на стороне Kotlin (см. MeterRepositoryImpl.kt), где это проще итерировать без
+	 * пересборки нативной библиотеки под каждый новый формат ответа.
+	 * @param[out] response - "сырые" байты одного полного ответа сервера, начиная с флага 0x7E
+	 * @return - true, если ответ успешно получен с транспорта (не гарантирует, что это
+	 *           именно GET-response нужного формата — эту проверку делает вызывающий код)
+	 */
+	bool GetResponseRaw(std::vector<uint8_t> &response);
 
 	/**
 	 * @brief Ответ на запрос значения атрибута объекта (сервис GET)
@@ -293,15 +329,15 @@ public:
 	 * @param value_array - массив значений
 	 * @param array_size - размер массива
 	 * @param value_type - тип данных (если значение объекта не массив, а строка)
-	 * @param element_type - тип данных у элемента массива 
+	 * @param element_type - тип данных у элемента массива
 	 * @return - true в случае успешного выполнения метода, иначе false
 	 */
 	bool SetRequestArrayByte(const RequestParams &params, const uint8_t* value_array,
-							const uint8_t &array_size, const uint8_t &value_type, const uint8_t &element_type);
+	                         const uint8_t &array_size, const uint8_t &value_type, const uint8_t &element_type);
 	bool SetRequestArrayInt(const RequestParams &params, const uint64_t* value_array,
-							const uint8_t &array_size, const uint8_t &element_type);
+	                        const uint8_t &array_size, const uint8_t &element_type);
 	bool SetRequestArrayFloat(const RequestParams &params, const double* value_array,
-								const uint8_t &array_size, const uint8_t &element_type);
+	                          const uint8_t &array_size, const uint8_t &element_type);
 
 	/**
 	 * @brief Запрос на запись значения объекта атрибута (сервис SET)
@@ -323,7 +359,7 @@ public:
 	 * @return - true в случае успешного выполнения метода, иначе false
 	 */
 	bool SetRequestArrayBitString(const RequestParams &params, const uint8_t** value_array, const uint8_t &array_size,
-								const uint8_t &element_size, const uint8_t &elem_type);
+	                              const uint8_t &element_size, const uint8_t &elem_type);
 
 	/**
 	 * @brief Запрос на запись значения объекта атрибута (сервис SET)
@@ -378,7 +414,7 @@ public:
 	 * @brief Запрос на запись значения объекта атрибута (сервис ACTION)
 	 * @param params - параметры запроса (номер класса, obis-код, номер атрибута, флаг повторного запроса)
 	 * @param structure - устанавливаемые значения (структура)
-	 * @param struct_id - номер структуры 
+	 * @param struct_id - номер структуры
 	 * @return - true в случае успешного выполнения метода, иначе false
 	 */
 	bool ActionRequestStructure(const RequestParams &params, void* structure, const uint8_t &struct_id);
@@ -388,7 +424,7 @@ public:
 	 * @param params - параметры запроса (номер класса, obis-код, номер атрибута, флаг повторного запроса)
 	 * @param structure_array - массив значений (структур)
 	 * @param struct_id - номер массива структур
-	 * @param array_size - размер массива (кол-во структур) 
+	 * @param array_size - размер массива (кол-во структур)
 	 * @return - true в случае успешного выполнения метода, иначе false
 	 */
 	bool ActionRequestArrayStructure(const RequestParams &params, void** structure_array, uint8_t &struct_id, uint8_t &array_size);
@@ -418,7 +454,7 @@ private:
 
 	// кол-во отправленных кадров
 	uint8_t send_sequence_number_ = 0;
-	
+
 	// параметры, используемые при шифровании/аутентификации
 	uint8_t sec_control_byte_ = 30;
 	uint8_t respond_ap_title_[8] = {};
@@ -485,7 +521,7 @@ private:
 	 * @return - true в случае успешного выполнения метода, иначе false
 	 */
 	bool WriteRequestGeneral(const ServiceFunctions::LLCParams &llc_params, const RequestParams &req_params,
-							const std::vector<uint8_t> &info_field, const bool &is_action);
+	                         const std::vector<uint8_t> &info_field, const bool &is_action);
 
 	/**
 	 * @brief Чтение блоков данных (при длинном ответе)
@@ -514,7 +550,7 @@ private:
 	/**
 	 * @brief Шифрование (если используется), формирование запроса на запись и отправление сообщения
 	 * @param request - содержимое запроса
-	 * @param is_action - флаг использования сервиса ACTION 
+	 * @param is_action - флаг использования сервиса ACTION
 	 * @param is_last - флаг последнего блока
 	 * @return - true в случае успешного выполнения метода, иначе false
 	 */
@@ -535,7 +571,7 @@ private:
 	bool WriteRequestDateTime(const RequestParams &params, const DateTime &date_time, const bool &date_format, const bool &is_action);
 	bool WriteRequestStructure(const RequestParams &params, void* structure, const uint8_t &struct_id, const bool &is_action);
 	bool WriteRequestArrayStructure(const RequestParams &params, void** structure_array, const uint8_t &struct_id,
-									uint8_t &array_size, const bool &is_action);
+	                                uint8_t &array_size, const bool &is_action);
 
 	using IoException = std::runtime_error;
 };

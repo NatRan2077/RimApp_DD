@@ -25,9 +25,9 @@
 
 namespace {
 
-SpodesClient* AsClient(jlong handle) {
-    return reinterpret_cast<SpodesClient*>(handle);
-}
+    SpodesClient* AsClient(jlong handle) {
+        return reinterpret_cast<SpodesClient*>(handle);
+    }
 
 }  // namespace
 
@@ -42,29 +42,52 @@ Java_ru_rim_dd_core_bridge_SpodesClientBridge_nativeCreate(JNIEnv* /*env*/, jobj
 
 JNIEXPORT void JNICALL
 Java_ru_rim_dd_core_bridge_SpodesClientBridge_nativeDestroy(JNIEnv* /*env*/, jobject /*thiz*/,
-                                                              jlong handle) {
+                                                            jlong handle) {
     delete AsClient(handle);
 }
 
 JNIEXPORT jbyteArray JNICALL
 Java_ru_rim_dd_core_bridge_SpodesClientBridge_nativePullOutgoing(JNIEnv* env, jobject /*thiz*/,
-                                                                   jlong handle) {
+                                                                 jlong handle) {
     std::vector<uint8_t> bytes = AsClient(handle)->PullOutgoingBytes();
     jbyteArray result = env->NewByteArray(static_cast<jsize>(bytes.size()));
     if (!bytes.empty()) {
         env->SetByteArrayRegion(result, 0, static_cast<jsize>(bytes.size()),
-                                 reinterpret_cast<const jbyte*>(bytes.data()));
+                                reinterpret_cast<const jbyte*>(bytes.data()));
     }
     return result;
 }
 
 JNIEXPORT void JNICALL
 Java_ru_rim_dd_core_bridge_SpodesClientBridge_nativePushIncoming(JNIEnv* env, jobject /*thiz*/,
-                                                                   jlong handle, jbyteArray bytes) {
+                                                                 jlong handle, jbyteArray bytes) {
     jsize len = env->GetArrayLength(bytes);
     std::vector<uint8_t> buf(len);
     env->GetByteArrayRegion(bytes, 0, len, reinterpret_cast<jbyte*>(buf.data()));
     AsClient(handle)->FeedIncomingBytes(buf.data(), static_cast<unsigned long>(len));
+}
+
+JNIEXPORT jboolean JNICALL
+Java_ru_rim_dd_core_bridge_SpodesClientBridge_nativeSetNormalResponseMode(
+        JNIEnv* /*env*/, jobject /*thiz*/, jlong handle,
+        jint sourceAddress, jint logicalAddress, jint physicalAddress) {
+    SpodesClient* client = AsClient(handle);
+
+    SpodesClient::ConnectionAddresses addr{};
+    addr.source_address = static_cast<uint8_t>(sourceAddress);
+    addr.logical_address = static_cast<uint8_t>(logicalAddress);
+    addr.physical_address = static_cast<uint8_t>(physicalAddress);
+
+    // Дефолты ConnectionParams (128/128/7/7) — согласование окна/размера кадра HDLC.
+    SpodesClient::ConnectionParams params{};
+
+    return client->SetNormalResponseMode(addr, &params) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jint JNICALL
+Java_ru_rim_dd_core_bridge_SpodesClientBridge_nativeReceiveUnnumberedAcknowledge(
+        JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
+    return static_cast<jint>(AsClient(handle)->ReceiveUnnumberedAcknowledge());
 }
 
 JNIEXPORT jboolean JNICALL
@@ -115,10 +138,44 @@ Java_ru_rim_dd_core_bridge_SpodesClientBridge_nativeGetRequest(
     return client->GetRequest(params, nullptr, 0) ? JNI_TRUE : JNI_FALSE;
 }
 
+JNIEXPORT jboolean JNICALL
+Java_ru_rim_dd_core_bridge_SpodesClientBridge_nativeGetRequestFlatAddress(
+        JNIEnv* env, jobject /*thiz*/, jlong handle, jint classId, jstring obisCode,
+        jint attributeId, jint destAddress, jint srcAddress) {
+    SpodesClient* client = AsClient(handle);
+
+    const char* obis_chars = env->GetStringUTFChars(obisCode, nullptr);
+    SpodesClient::RequestParams params{};
+    params.class_id = static_cast<uint16_t>(classId);
+    params.instance_id = std::string(obis_chars);
+    params.attribute_id = static_cast<uint8_t>(attributeId);
+    params.retry = false;
+    env->ReleaseStringUTFChars(obisCode, obis_chars);
+
+    return client->GetRequestFlatAddress(params, static_cast<uint8_t>(destAddress),
+                                         static_cast<uint8_t>(srcAddress)) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jbyteArray JNICALL
+Java_ru_rim_dd_core_bridge_SpodesClientBridge_nativeGetResponseRaw(JNIEnv* env, jobject /*thiz*/,
+                                                                   jlong handle) {
+    std::vector<uint8_t> response;
+    bool ok = AsClient(handle)->GetResponseRaw(response);
+    if (!ok) {
+        return env->NewByteArray(0);
+    }
+    jbyteArray result = env->NewByteArray(static_cast<jsize>(response.size()));
+    if (!response.empty()) {
+        env->SetByteArrayRegion(result, 0, static_cast<jsize>(response.size()),
+                                reinterpret_cast<const jbyte*>(response.data()));
+    }
+    return result;
+}
+
 JNIEXPORT jdouble JNICALL
 Java_ru_rim_dd_core_bridge_SpodesClientBridge_nativeGetResponseFloat(JNIEnv* /*env*/,
-                                                                       jobject /*thiz*/,
-                                                                       jlong handle) {
+                                                                     jobject /*thiz*/,
+                                                                     jlong handle) {
     double value = 0.0;
     AsClient(handle)->GetResponseFloat(value);
     return value;
@@ -126,8 +183,8 @@ Java_ru_rim_dd_core_bridge_SpodesClientBridge_nativeGetResponseFloat(JNIEnv* /*e
 
 JNIEXPORT jlong JNICALL
 Java_ru_rim_dd_core_bridge_SpodesClientBridge_nativeGetResponseInt(JNIEnv* /*env*/,
-                                                                     jobject /*thiz*/,
-                                                                     jlong handle) {
+                                                                   jobject /*thiz*/,
+                                                                   jlong handle) {
     uint64_t value = 0;
     AsClient(handle)->GetResponseInt(value);
     return static_cast<jlong>(value);
@@ -135,7 +192,7 @@ Java_ru_rim_dd_core_bridge_SpodesClientBridge_nativeGetResponseInt(JNIEnv* /*env
 
 JNIEXPORT jstring JNICALL
 Java_ru_rim_dd_core_bridge_SpodesClientBridge_nativeGetErrorMessage(JNIEnv* env, jobject /*thiz*/,
-                                                                      jlong handle) {
+                                                                    jlong handle) {
     return env->NewStringUTF(AsClient(handle)->GetErrorMessage());
 }
 

@@ -68,6 +68,23 @@ class SpodesClientBridge @Inject constructor() {
     fun establishConnection(securityLevel: Int, password: String?): Boolean =
         nativeEstablishConnection(nativeHandle, securityLevel, password)
 
+    /**
+     * [Android-патч] AARQ с "плоской" однобайтовой HDLC-адресацией — как и getRequestFlatAddress(),
+     * нужен потому, что обычный establishConnection() пишет двухбайтовый адрес через
+     * FormHDLCHeader(), а этот счётчик такие кадры молча игнорирует. Проверено диагностикой:
+     * ЛЮБОЙ GET, кроме самого первого "публичного" объекта (0.0.21.0.2.255), получает
+     * data-access-result "object unavailable" — в том числе Association LN (0.0.40.0.0.255),
+     * который обязан существовать на любом DLMS-сервере. Похоже, без установленной прикладной
+     * ассоциации счётчик отдаёт только этот один объект, а остальные требуют AARQ/AARE,
+     * которые наш клиент раньше пропускал целиком. securityLevel=0/password=null — нижайший
+     * уровень (без пароля), пробуем его первым.
+     */
+    fun establishConnectionFlatAddress(securityLevel: Int, password: String?, destAddress: Int, srcAddress: Int): Boolean =
+        nativeEstablishConnectionFlatAddress(nativeHandle, securityLevel, password, destAddress, srcAddress)
+
+    /** [Android-патч] "Сырые" байты ответа на establishConnectionFlatAddress() (AARE), см. getResponseRawBytes(). */
+    fun establishConnectionResponseRawBytes(): ByteArray = nativeEstablishConnectionResponseRaw(nativeHandle)
+
     /** Запрос чтения атрибута (сервис GET). obisCode — "1.0.1.8.0.255" и т.п. из ObisCatalog. */
     fun getRequest(classId: Int, obisCode: String, attributeId: Int): Boolean =
         nativeGetRequest(nativeHandle, classId, obisCode, attributeId)
@@ -108,6 +125,8 @@ class SpodesClientBridge @Inject constructor() {
     private external fun nativeSetNormalResponseMode(handle: Long, sourceAddress: Int, logicalAddress: Int, physicalAddress: Int): Boolean
     private external fun nativeReceiveUnnumberedAcknowledge(handle: Long): Int
     private external fun nativeEstablishConnection(handle: Long, securityLevel: Int, password: String?): Boolean
+    private external fun nativeEstablishConnectionFlatAddress(handle: Long, securityLevel: Int, password: String?, destAddress: Int, srcAddress: Int): Boolean
+    private external fun nativeEstablishConnectionResponseRaw(handle: Long): ByteArray
     private external fun nativeGetRequest(handle: Long, classId: Int, obisCode: String, attributeId: Int): Boolean
     private external fun nativeGetRequestFlatAddress(handle: Long, classId: Int, obisCode: String, attributeId: Int, destAddress: Int, srcAddress: Int): Boolean
     private external fun nativeGetResponseRaw(handle: Long): ByteArray

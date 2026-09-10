@@ -14,7 +14,12 @@ data class PhaseValues(
 data class NetworkParams(
     val voltage: PhaseValues,
     val current: PhaseValues,
-    val power: PhaseValues,
+    val power: PhaseValues,            // активная мощность, кВт (OBIS 1.0.1.7.0.255)
     val frequencyHz: Double? = null,   // опционально, если разрешено конфигурацией ПУ
     val cosPhi: PhaseValues? = null,   // опционально — см. DLMS_COS / L1/L2/L3_COS в прошивке
+    // Ниже — реально найденные в буфере счётчика мгновенные величины (см. историю диагностики),
+    // которых не было в исходной модели: реактивная/полная мощность и ток нейтрали.
+    val reactivePowerKvar: Double? = null, // OBIS 1.0.3.7.0.255
+    val apparentPowerKva: Double? = null,  // OBIS 1.0.9.7.0.255
+    val neutralCurrentA: Double? = null,   // OBIS 1.0.91.7.0.255
 )

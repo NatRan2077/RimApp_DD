@@ -153,7 +153,24 @@ unsigned long SpodesClient::ReadResponse (std::vector<char> &answer)
     std::vector<uint8_t> message(answer.begin(), answer.begin() + result_size);
     last_message_.push_back(message);
 
-    ++receive_sequence_number_;
+    // [Android-патч] Раньше receive_sequence_number_ увеличивался БЕЗУСЛОВНО, даже при
+    // таймауте (result_size == 0) — то есть даже когда от счётчика реально не пришло ни
+    // байта. У этого прибора SNRM/UA всегда таймаутится (см. establishHdlcChannel() в
+    // MeterRepositoryImpl — мы шлём SNRM "на лучший эффорт" и не ждём его подтверждения,
+    // потому что счётчик вообще не использует классический HDLC-хендшейк). Из-за этого
+    // N(R), который мы сообщаем устройству в каждом следующем I-кадре, оказывался на 1
+    // больше настоящего количества реально принятых кадров — устройство какое-то время
+    // это терпело (первые 1-2 GET-запроса проходили), а затем могло начать отвечать
+    // data-access-result с кодами рассинхронизации (13 = data-block-number-invalid и т.п.).
+    // ВАЖНО (уточнено после дальнейшей диагностики): этот фикс сам по себе НЕ был причиной
+    // массовых отказов 0x0B на переборе стандартных OBIS — тот код 11 оказался вовсе не
+    // "no-long-get-in-progress" (это код 16!), а "object-unavailable" по стандартному
+    // перечню Data-Access-Result — то есть счётчик отвечал корректно "такого объекта с
+    // таким атрибутом нет", а не путался в номерах кадров. Инкремент всё равно оставляем
+    // условным — это правильное поведение HDLC само по себе, просто не решает ту задачу.
+    // Инкрементируем receive_sequence_number_ только когда кадр реально получен.
+    if (result_size > 0)
+        ++receive_sequence_number_;
     ServiceFunctions serv_funcs;
     serv_funcs.CheckRawResponse(result_size, answer);
     return result_size;
@@ -236,6 +253,28 @@ bool SpodesClient::SendReadyToReceive(const int8_t &block_number)
     if (block_number > -1)
         send_sequence_number_ ++;
     return true;
+}
+
+// [Android-патч] см. объяснение в spodes_client.h — HDLC S-frame "RR" (нет DLMS-содержимого,
+// только запрос следующего сегмента) с плоской адресацией, точная копия того, что шлёт пульт
+// РиМ 040.40 между сегментами длинного ответа (подтверждено логом реального обмена).
+bool SpodesClient::SendReadyToReceiveFlatAddress ()
+{
+    uint8_t control_field = static_cast<uint8_t>(((receive_sequence_number_ & 0x07) << 5) | (1 << 4) | 1);
+    std::vector<uint8_t> request = {0x7E, 0, 0, flat_dest_address_, flat_src_address_, control_field, 0, 0, 0x7E};
+
+    uint16_t request_size = static_cast<uint16_t>(request.size()) - 2;
+    uint16_t value = (request_size & 0x07FF) | 0xA000;
+    request[1] = static_cast<uint8_t>((value >> 8) & 0xFF);
+    request[2] = static_cast<uint8_t>(value & 0xFF);
+
+    ServiceFunctions serv_funcs;
+    uint16_t crc = serv_funcs.CalculateCRC(std::vector<uint8_t>(request.begin(), request.end() - 2), false);
+    request[request.size() - 3] = crc & 0xFF;
+    request[request.size() - 2] = (crc >> 8) & 0xFF;
+
+    // Это S-frame, не I-frame — send_sequence_number_ не трогаем (как и в SendReadyToReceive(-1)).
+    return SendRequest(request);
 }
 
 uint8_t SpodesClient::ReceiveUnnumberedAcknowledge ()
@@ -508,14 +547,45 @@ bool SpodesClient::GetRequest (const RequestParams &params, void* selective_acce
 // отличается только HDLC-адресация и байт invoke-id-and-priority (service_class=false).
 bool SpodesClient::GetRequestFlatAddress (const RequestParams &params, const uint8_t &dest_address, const uint8_t &src_address)
 {
+    // [Android-патч] ОТКАЧЕНО: раньше здесь стоял безусловный сброс send_sequence_number_/
+    // receive_sequence_number_ в 0 перед КАЖДЫМ верхнеуровневым запросом — предполагалось, что
+    // счётчик не хранит нумерацию кадров между отдельными командами. Гипотеза оказалась НЕВЕРНОЙ:
+    // по следующему логу (после включения этого сброса) счётчик стал отвечать на ВТОРОЙ и любой
+    // следующий запрос ОДИНАКОВЫМ голым S-frame RR (без данных) — то есть повторная подача N(S)=0
+    // выглядит для него как ПОВТОР уже обработанного кадра 0 (стандартное HDLC-поведение при
+    // получении дублирующегося N(S): переслать тот же ACK, не переисполняя команду повторно), а не
+    // как новый запрос. Значит счётчик КАК РАЗ ХРАНИТ настоящую нумерацию кадров в рамках всего
+    // BLE-соединения — со сбросом мы гарантированно ломали каждый запрос, кроме самого первого.
+    // Была и обратная проблема (см. историю диагностики кнопки «Обновить»): без сброса
+    // send_sequence_number_ у нас "убежал" на 4 после всего одного реального запроса вместо
+    // ожидаемой 1 — это, вероятнее всего, оказалось побочным эффектом отдельного бага в
+    // BleTransport::ReadData() (см. ble_transport.h — ждала полного max_length_ байт вместо
+    // одного HDLC-кадра, из-за чего каждое чтение сегмента тянулось секундами и, возможно,
+    // склеивало границы кадров неправильно). Сначала чиним транспорт, дальше смотрим по новому
+    // логу, останется ли реальный дрейф счётчиков без сброса.
     std::vector<uint8_t> body;
     ServiceFunctions serv_funcs;
 
-    // service_id=192 (0xC0, GET-request-normal), service_type=1 (normal),
-    // service_class=false, priority=true → invoke-id-and-priority = 0x81,
-    // как в реальном обмене пульт↔счётчик (у обычного GetRequest() всегда 0xC1).
-    ServiceFunctions::LLCParams llc_params {192, 1, false, true};
-    serv_funcs.FormLLCHeader(body, llc_params);
+    // [Android-патч] НЕ используем serv_funcs.FormLLCHeader() — она хардкодит младшие
+    // 6 бит invoke-id-and-priority константой 1 для АБСОЛЮТНО ВСЕХ запросов библиотеки
+    // (см. service_functions.cpp: "uint8_t invoke_id_and_priority = 1;"). У этого
+    // счётчика повторный invoke-id для НОВОГО запроса, судя по всему, интерпретируется
+    // как обращение к уже завершённой/несуществующей транзакции — подтверждено логом
+    // реального обмена: первый GET (invoke-id 0x81=0x80|1) прошёл успешно, а КАЖДЫЙ
+    // следующий с тем же invoke-id 0x81 получал data-access-result с кодом 11
+    // (no-long-get-in-progress) или 4 (object-undefined), хотя запрашиваемые OBIS-коды
+    // были совершенно разными. Поэтому здесь собираем LLC-заголовок вручную и держим
+    // свой счётчик invoke-id (flat_invoke_id_, см. spodes_client.h) — приоритет (бит 7,
+    // как и раньше) выставлен, service_class (бит 6) — нет, а младшие 6 бит теперь
+    // реально меняются от запроса к запросу вместо жёстко зашитой единицы.
+    flat_invoke_id_ = (flat_invoke_id_ % 63) + 1; // 6 бит на invoke-id, 0 оставляем неиспользуемым
+    uint8_t invoke_id_and_priority = flat_invoke_id_ | (1 << 7);
+    body.insert(body.end(), {0xE6, 0xE6, 0, 192, 1, invoke_id_and_priority});
+
+    // [Android-патч] запоминаем адреса — нужны GetResponseRaw()/SendReadyToReceiveFlatAddress(),
+    // если ответ окажется сегментированным (см. flat_dest_address_/flat_src_address_ в .h).
+    flat_dest_address_ = dest_address;
+    flat_src_address_ = src_address;
     if (!serv_funcs.AddAddress(body, params, error_message_))
         return false;
     body.push_back(0); // без selective access, как в обычном GetRequest
@@ -546,7 +616,68 @@ bool SpodesClient::GetRequestFlatAddress (const RequestParams &params, const uin
     return true;
 }
 
-bool SpodesClient::GetResponseRaw (std::vector<uint8_t> &response)
+// [Android-патч] см. EstablishConnectionRequestFlatAddress() в spodes_client.h — та же идея,
+// что и в GetRequestFlatAddress(): переиспользуем штатную сборку APDU (SpodesHandler), но
+// оборачиваем в HDLC-заголовок с однобайтовой "плоской" адресацией вместо FormHDLCHeader().
+bool SpodesClient::EstablishConnectionRequestFlatAddress (const uint8_t &securityLevel, const SecurityParams *params,
+                                                          const uint16_t &clientMaxReceivePduSize,
+                                                          const uint8_t &dest_address, const uint8_t &src_address)
+{
+    if (params != nullptr)
+        security_params_ = *params;
+
+    std::vector<uint8_t> body;
+    SpodesHandler spodes_handler;
+    try
+    {
+        spodes_handler.FormConnectionRequest(body, securityLevel, connection_addr_, security_params_, optional_params_);
+    }
+    catch (const std::runtime_error &re)
+    {
+        error_message_ = "SpodesClient::EstablishConnectionRequestFlatAddress: " + (std::string)re.what();
+        return false;
+    }
+    spodes_handler.AddUserInformation(body, securityLevel, init_vec_, sec_control_byte_, security_params_.has_ciphering,
+                                      clientMaxReceivePduSize, optional_params_);
+
+    // [Android-патч] ВАЖНО: FormConnectionRequest() сама не проставляет длину AARQ-APDU —
+    // это делает вызывающий код (см. штатный EstablishConnectionRequest(): "request[13] =
+    // request.size() - 14", где 9 из этих 14 — преаллоцированный ПОД СТАНДАРТНЫЙ HDLC-заголовок
+    // префикс). Здесь body собирается с нуля без такого префикса, поэтому байт длины — по
+    // абсолютному смещению 4 внутри body (после "E6 E6 00 0x60"), а его значение — длина всего,
+    // что идёт ПОСЛЕ этого байта (сам AARQ-контент + добавленный AddUserInformation блок BE).
+    // Без этой правки счётчик получит AARQ с нулевой длиной APDU и либо промолчит, либо
+    // отклонит кадр как некорректный.
+    body[4] = static_cast<uint8_t>(body.size() - 5);
+
+    ServiceFunctions serv_funcs;
+    uint8_t control_field = serv_funcs.CalculateControlField(send_sequence_number_, receive_sequence_number_, 1);
+    std::vector<uint8_t> request = {0x7E, 0, 0, dest_address, src_address, control_field, 0, 0};
+    request.insert(request.end(), body.begin(), body.end());
+    request.push_back(0);
+    request.push_back(0);
+    request.push_back(0x7E);
+
+    uint16_t request_size = static_cast<uint16_t>(request.size()) - 2;
+    uint16_t value = (request_size & 0x07FF) | 0xA000;
+    request[1] = static_cast<uint8_t>((value >> 8) & 0xFF);
+    request[2] = static_cast<uint8_t>(value & 0xFF);
+
+    uint16_t hcs = serv_funcs.CalculateCRC(std::vector<uint8_t>(request.begin(), request.begin() + 6), true);
+    request[6] = hcs & 0xFF;
+    request[7] = (hcs >> 8) & 0xFF;
+
+    uint16_t fcs = serv_funcs.CalculateCRC(std::vector<uint8_t>(request.begin(), request.end() - 2), false);
+    request[request.size() - 3] = fcs & 0xFF;
+    request[request.size() - 2] = (fcs >> 8) & 0xFF;
+
+    if (!SendRequest(request))
+        return false;
+    send_sequence_number_++;
+    return true;
+}
+
+bool SpodesClient::EstablishConnectionResponseRaw (std::vector<uint8_t> &response)
 {
     std::vector<char> answer(max_length_, 0);
     try
@@ -555,21 +686,84 @@ bool SpodesClient::GetResponseRaw (std::vector<uint8_t> &response)
         response.resize(result_size);
         for (unsigned long i = 0; i < result_size; i++)
             response[i] = static_cast<uint8_t>(answer[i]);
+        return true;
+    }
+    catch (const std::exception &ex)
+    {
+        error_message_ = "SpodesClient::EstablishConnectionResponseRaw: " + (std::string)ex.what();
+        return false;
+    }
+}
 
-        // [Android-патч] НЕ вызываем ReadFrame(), в отличие от GetResponseGeneral().
-        // У этого счётчика бит "сегментировано" (бит 3 второго байта заголовка) оказывается
-        // установлен даже в полном одиночном ответе, пришедшем ОДНИМ BLE-уведомлением
-        // (подтверждено реальным логом: 139-байтовый кадр с этим битом — валиден целиком,
-        // FCS сходится, других уведомлений после него нет). Если всё-таки вызвать
-        // ReadFrame(), она шлёт RR-кадр с запросом продолжения (SendReadyToReceive) и потом
-        // блокируется на transport_->ReadData() ещё на 3 с в ожидании кадра, которого
-        // счётчик никогда не пришлёт — итог: GetResponseRaw() виснет на 6 с и в конце
-        // получает 0 байт (см. историю диагностики, лог с "Couldn't read response from
-        // server" после лишней исходящей 10-байтовой RR-посылки). Раз на выходе GetResponseRaw
-        // уже сырые байты для Kotlin-парсера — пусть он сам решает, полный кадр или нет
-        // (у него есть открывающий/закрывающий 0x7E и он падает с понятной ошибкой, если
-        // данных не хватает), а не полагается на этот ненадёжный у данного прибора бит.
-        (void)result_size;
+bool SpodesClient::GetResponseRaw (std::vector<uint8_t> &response)
+{
+    std::vector<char> answer(max_length_, 0);
+    try
+    {
+        unsigned long result_size = ReadResponse(answer);
+        if (result_size == 0)
+        {
+            // Пустой ответ от транспорта (таймаут) — отдаём как есть, без фиктивного "хвоста"
+            // ниже, иначе Kotlin-сторона (проверяющая raw.isEmpty()) перестанет отличать
+            // "счётчик не ответил" от "пришёл 3-байтовый мусор".
+            response.clear();
+            return true;
+        }
+        std::vector<uint8_t> first(result_size);
+        for (unsigned long i = 0; i < result_size; i++)
+            first[i] = static_cast<uint8_t>(answer[i]);
+
+        // [Android-патч] ИСПРАВЛЕНО после разбора реального лога пульта РиМ 040.40: бит
+        // "сегментировано" (бит 3 второго байта HDLC-заголовка) на этом счётчике НЕ ложный —
+        // предыдущая версия этого метода игнорировала его, считая любой полученный BLE-пакет
+        // уже полным ответом. На самом деле ответ на GET 0.0.21.0.2.255 реально приходит 7+
+        // сегментами (лог пульта: "HDLC - Segmentation" повторяется, пульт шлёт RR-кадр после
+        // каждого сегмента, пока не увидит "End Of Segmentation") — в буфере этого профиля
+        // лежат ВСЕ ~80 параметров индикации счётчика, а не 5 показаний, которые мы видели —
+        // это были просто первые ~137 байт до среза. Второй и последующие сегменты НЕ содержат
+        // повторного LLC/APDU-заголовка — это прямое продолжение потока байт первого сегмента,
+        // поэтому у каждого следующего сегмента отрезаем HDLC-заголовок (8 байт: 0x7E,
+        // длина(2), dest, src, control, hcs(2)) и хвост (FCS(2)+закрывающий 0x7E), а "начинку"
+        // приклеиваем к уже накопленному потоку. RR-кадр между сегментами шлём через
+        // SendReadyToReceiveFlatAddress() — с той же плоской адресацией, что и сам GET (обычный
+        // SendReadyToReceive() пишет двухбайтовый connection_addr_, который счётчик игнорирует —
+        // это и было причиной 6-секундного зависания, из-за которого сегментацию когда-то
+        // признали "ложной", хотя на самом деле просто RR-кадр не доходил до счётчика).
+        std::vector<uint8_t> payload;
+        bool more = false;
+        size_t header_len = first.size() < 8 ? first.size() : 8;
+        std::vector<uint8_t> first_header(first.begin(), first.begin() + header_len);
+        if (first.size() >= 11)
+        {
+            more = (first.at(1) >> 3) & 1;
+            payload.insert(payload.end(), first.begin() + 8, first.end() - 3);
+        }
+
+        int guard = 0;
+        while (more && guard++ < 32)
+        {
+            if (!SendReadyToReceiveFlatAddress())
+                break;
+            std::vector<char> next(max_length_, 0);
+            unsigned long next_size = ReadResponse(next);
+            if (next_size < 11)
+                break;
+            std::vector<uint8_t> segment(next_size);
+            for (unsigned long i = 0; i < next_size; i++)
+                segment[i] = static_cast<uint8_t>(next[i]);
+            payload.insert(payload.end(), segment.begin() + 8, segment.end() - 3);
+            more = (segment.at(1) >> 3) & 1;
+        }
+
+        // Пересобираем "кадр" для Kotlin-парсера: реальные FCS/бит сегментации в результате уже
+        // не важны — парсер (GetResponseParser.kt) ищет только LLC-маркер "E6 E7 00" и разбирает
+        // DLMS-значение после него, не проверяя обрамление, поэтому голову первого сегмента
+        // оставляем как есть, а следом — склеенную начинку всех сегментов.
+        response = first_header;
+        response.insert(response.end(), payload.begin(), payload.end());
+        response.push_back(0);
+        response.push_back(0);
+        response.push_back(0x7E);
 
         ServiceFunctions serv_funcs;
         if (security_params_.has_ciphering)

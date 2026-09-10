@@ -175,6 +175,43 @@ public:
 	bool GetRequestFlatAddress(const RequestParams &params, const uint8_t &dest_address, const uint8_t &src_address);
 
 	/**
+	 * @brief [Android-патч] AARQ (запрос на установление DLMS/COSEM-соединения) с той же
+	 * "плоской" однобайтовой HDLC-адресацией, что и GetRequestFlatAddress() — обычный
+	 * EstablishConnectionRequest() библиотеки собирает HDLC-заголовок через FormHDLCHeader()
+	 * (двухбайтовый logical+physical адрес), а этот счётчик такие кадры молча игнорирует
+	 * (см. GetRequestFlatAddress). Причина, по которой это понадобилось: диагностика
+	 * показала, что ЛЮБОЙ GET, кроме самого первого (класс 7, OBIS 0.0.21.0.2.255 — профиль,
+	 * собранный специально для показометров/пультов без аутентификации), получает
+	 * data-access-result "object unavailable" (0x0B) — включая объект Association LN
+	 * (класс 15, OBIS 0.0.40.0.0.255), который на любом настоящем DLMS-сервере обязан
+	 * существовать. Это указывает не на "таких объектов нет", а на то, что без полноценной
+	 * прикладной ассоциации (AARQ/AARE) счётчик отдаёт только один "публичный" объект для
+	 * дисплея, а остальные требуют установленного соединения — которое пульт, видимо,
+	 * устанавливает, а наш клиент до сих пор пропускал целиком (шёл сразу к GET).
+	 * APDU (LLC-заголовок, AARQ-тело, User Information) собирается штатным SpodesHandler
+	 * (как и в обычном EstablishConnectionRequest) — отличается только HDLC-заголовок.
+	 * @param securityLevel - 0 (нижайший, без пароля) / 1 (низкий, пароль) / 2 (высокий, ключ)
+	 * @param params - параметры безопасности, см. EstablishConnectionRequest(); nullptr для уровня 0
+	 * @param clientMaxReceivePduSize - максимальный размер принимаемого пакета
+	 * @param dest_address - HDLC-адрес счётчика (для этого прибора — 0x03)
+	 * @param src_address - HDLC-адрес клиента (для этого прибора — 0x43, как у пульта)
+	 * @return - true, если кадр успешно собран и отправлен
+	 */
+	bool EstablishConnectionRequestFlatAddress(const uint8_t &securityLevel, const SecurityParams *params,
+	                                           const uint16_t &clientMaxReceivePduSize,
+	                                           const uint8_t &dest_address, const uint8_t &src_address);
+
+	/**
+	 * @brief [Android-патч] "Сырой" ответ на запрос установления соединения (AARE) — тот же
+	 * подход, что и GetResponseRaw(): не пытаемся разобрать библиотечными функциями,
+	 * рассчитанными на двухбайтовую HDLC-адресацию, а отдаём сырые байты для разбора на
+	 * стороне Kotlin (там же, где и остальной DLMS-разбор — см. MeterRepositoryImpl.kt).
+	 * @param[out] response - "сырые" байты ответа сервера, начиная с флага 0x7E
+	 * @return - true, если ответ получен с транспорта
+	 */
+	bool EstablishConnectionResponseRaw(std::vector<uint8_t> &response);
+
+	/**
 	 * @brief [Android-патч] "Сырой" ответ на GET-запрос без разбора APDU библиотечными
 	 * ProcessResponseXxx-функциями. Нужен для ответов, которые сама библиотека не умеет
 	 * разбирать корректно: во-первых, у этого счётчика ответ на GetRequestFlatAddress()
@@ -452,6 +489,23 @@ private:
 	// кол-во принятых кадров
 	uint8_t receive_sequence_number_ = 0;
 
+	// [Android-патч] см. GetRequestFlatAddress() в .cpp — счётчик invoke-id для этого
+	// метода. FormLLCHeader() библиотеки хардкодит младшие 6 бит invoke-id-and-priority
+	// константой 1 для ВСЕХ запросов; этот счётчик у нас свой, чтобы GetRequestFlatAddress
+	// мог использовать РАЗНЫЕ invoke-id на каждый вызов (см. подробное объяснение там же).
+	uint8_t flat_invoke_id_ = 0;
+
+	// [Android-патч] см. GetResponseRaw()/SendReadyToReceiveFlatAddress() в .cpp — HDLC-адреса
+	// последнего запроса, отправленного через GetRequestFlatAddress(). Реальный лог пульта
+	// РиМ 040.40 (обмен с настоящим счётчиком) показал: ответ на GET 0.0.21.0.2.255 реально
+	// сегментирован на ~7 кадров (это не ложный бит — в буфере этого профиля лежат ВСЕ ~80
+	// параметров индикации счётчика, а не 5, как мы решили раньше по одному полученному
+	// сегменту), и пульт запрашивает каждый следующий сегмент отдельным HDLC S-frame (RR) с
+	// ТОЙ ЖЕ плоской адресацией, что и сам GET. Чтобы отправить такой RR, GetResponseRaw()
+	// должен знать dest/src адреса исходного запроса — храним их здесь.
+	uint8_t flat_dest_address_ = 0;
+	uint8_t flat_src_address_ = 0;
+
 	// кол-во отправленных кадров
 	uint8_t send_sequence_number_ = 0;
 
@@ -489,6 +543,18 @@ private:
 	 * @return - true в случае успешного выполнения метода, иначе false
 	 */
 	bool SendReadyToReceive(const int8_t &block_number);
+
+	/**
+	 * @brief [Android-патч] То же, что SendReadyToReceive(-1) (просто HDLC S-frame "RR" —
+	 * подтверждение приёма и запрос следующего сегмента, без DLMS-содержимого), но с "плоской"
+	 * однобайтовой HDLC-адресацией вместо connection_addr_.logical_address/physical_address/
+	 * source_address — именно так продолжает читать сегментированный ответ пульт РиМ 040.40
+	 * (подтверждено логом реального обмена: кадр из 9 байт вида "7E A0 07 <dest> <src>
+	 * <control> <crcLo> <crcHi> 7E", где control кодирует RR с текущим N(R) и битом Poll).
+	 * Использует flat_dest_address_/flat_src_address_, сохранённые в GetRequestFlatAddress().
+	 * @return - true, если кадр успешно собран и отправлен
+	 */
+	bool SendReadyToReceiveFlatAddress();
 
 	/**
 	 * @brief Получение запроса на продолжение записи данных (для длинных запросов)

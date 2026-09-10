@@ -122,6 +122,49 @@ Java_ru_rim_dd_core_bridge_SpodesClientBridge_nativeEstablishConnection(
 }
 
 JNIEXPORT jboolean JNICALL
+Java_ru_rim_dd_core_bridge_SpodesClientBridge_nativeEstablishConnectionFlatAddress(
+        JNIEnv* env, jobject /*thiz*/, jlong handle, jint securityLevel, jstring password,
+        jint destAddress, jint srcAddress) {
+    SpodesClient* client = AsClient(handle);
+
+    SpodesClient::SecurityParams sec_params{};
+    const char* pw_chars = password ? env->GetStringUTFChars(password, nullptr) : nullptr;
+    if (pw_chars) {
+        sec_params.password = pw_chars;
+    }
+
+    constexpr uint16_t kClientMaxReceivePduSize = 128;
+    bool request_ok = client->EstablishConnectionRequestFlatAddress(
+            static_cast<uint8_t>(securityLevel),
+            securityLevel == 0 ? nullptr : &sec_params,
+            kClientMaxReceivePduSize,
+            static_cast<uint8_t>(destAddress),
+            static_cast<uint8_t>(srcAddress));
+
+    if (pw_chars) {
+        env->ReleaseStringUTFChars(password, pw_chars);
+    }
+
+    return request_ok ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jbyteArray JNICALL
+Java_ru_rim_dd_core_bridge_SpodesClientBridge_nativeEstablishConnectionResponseRaw(
+        JNIEnv* env, jobject /*thiz*/, jlong handle) {
+    std::vector<uint8_t> response;
+    bool ok = AsClient(handle)->EstablishConnectionResponseRaw(response);
+    if (!ok) {
+        return env->NewByteArray(0);
+    }
+    jbyteArray result = env->NewByteArray(static_cast<jsize>(response.size()));
+    if (!response.empty()) {
+        env->SetByteArrayRegion(result, 0, static_cast<jsize>(response.size()),
+                                reinterpret_cast<const jbyte*>(response.data()));
+    }
+    return result;
+}
+
+JNIEXPORT jboolean JNICALL
 Java_ru_rim_dd_core_bridge_SpodesClientBridge_nativeGetRequest(
         JNIEnv* env, jobject /*thiz*/, jlong handle, jint classId, jstring obisCode,
         jint attributeId) {

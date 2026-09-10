@@ -37,6 +37,11 @@ class NetworkViewModel @Inject constructor(
     private val _turnOnCountdown = MutableStateFlow<Int?>(null)
     val turnOnCountdown: StateFlow<Int?> = _turnOnCountdown
 
+    /** Кнопка «Обновить» — переспрашивает тот же буфер счётчика, что обновляет и «Показания». */
+    fun refresh() {
+        viewModelScope.launch { repository.refreshReadings() }
+    }
+
     fun turnRelayOff() {
         viewModelScope.launch { repository.turnRelayOff() }
     }

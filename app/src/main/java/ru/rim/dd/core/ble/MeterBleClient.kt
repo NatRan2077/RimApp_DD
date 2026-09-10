@@ -117,8 +117,14 @@ class MeterBleClient @Inject constructor(
      * с [namePrefix] (пульты РиМ 040.40 рекламируются как "RIM ..."), с подключением
      * к первому найденному. Используется, когда известен только серийный номер ПУ,
      * а не MAC-адрес пульта (UC-02).
+     *
+     * [Android-патч] Возвращает найденный [BleDevice] (а не Unit) — вызывающему коду
+     * (MeterRepositoryImpl.connectBySerialNumber) нужно РЕАЛЬНОЕ рекламируемое имя устройства,
+     * а не то, что ввёл пользователь: модель и серийный номер счётчика зашиты именно в имени
+     * (см. parseModelAndSerialFromDeviceName()), а введённый пользователем номер — это лишь
+     * фильтр поиска.
      */
-    suspend fun connectByNamePrefix(namePrefix: String, timeoutMs: Long = 10_000) {
+    suspend fun connectByNamePrefix(namePrefix: String, timeoutMs: Long = 10_000): BleDevice {
         val found = withTimeoutOrNull(timeoutMs) {
             scan().first { it.name?.startsWith(namePrefix, ignoreCase = true) == true }
         } ?: throw IllegalStateException(
@@ -127,6 +133,7 @@ class MeterBleClient @Inject constructor(
         val device = adapter?.getRemoteDevice(found.address)
             ?: throw IllegalStateException("Bluetooth недоступен на этом устройстве")
         connect(device)
+        return found
     }
 
     /** Отправить кадр протокола (сырые байты, уже собранные SpodesClientBridge). */

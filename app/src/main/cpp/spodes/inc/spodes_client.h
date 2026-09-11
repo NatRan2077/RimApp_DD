@@ -175,6 +175,37 @@ public:
 	bool GetRequestFlatAddress(const RequestParams &params, const uint8_t &dest_address, const uint8_t &src_address);
 
 	/**
+	 * @brief [Android-патч] ACTION-запрос (управление объектом, напр. размыкателем/реле) с той
+	 * же "плоской" однобайтовой HDLC-адресацией и собственным счётчиком invoke-id, что и
+	 * GetRequestFlatAddress() — по тем же причинам (этот счётчик игнорирует стандартные кадры
+	 * FormHDLCHeader()/FormLLCHeader() библиотеки).
+	 *
+	 * ПОДТВЕРЖДЕНО реальным логом пульта РиМ 040.40 (захвачен обмен с настоящим прибором,
+	 * помечен в логе пульта как "DLMS - Recive Relay Connect" — включение реле):
+	 *   TX: E6 E6 00 C3 01 <invoke> <class_id:2> <obis:6> <method_id> 01 0F 00
+	 *   RX: E6 E7 00 C7 01 <invoke> 00 00                (00=Action-Result success, 00=нет данных)
+	 * Метод 2 (remote_reconnect, класс Disconnect Control=70) вызывается именно так — с
+	 * параметром "01" (параметр присутствует), тип 0x0F (Integer8), значение 0. Формат
+	 * ПАРАМЕТРА для метода 1 (remote_disconnect) РЕАЛЬНЫМ логом не подтверждён — вызывающий
+	 * код (см. turnRelayOff() в MeterRepositoryImpl.kt) собирает его по аналогии с методом 2,
+	 * это ПРЕДПОЛОЖЕНИЕ, а не факт.
+	 *
+	 * @param params - class_id/instance_id как обычно; attribute_id здесь используется как
+	 *                 МЕТОД (method-id) — AddAddress() дописывает его последним байтом
+	 *                 адреса объекта, для ACTION это ровно то место, где стандарт DLMS
+	 *                 ожидает method-id (адресация объекта у GET/SET/ACTION идентична).
+	 * @param has_parameter - есть ли у метода параметр (choice-байт 00/01 перед данными)
+	 * @param parameter_type - DLMS-тип параметра (используется, только если has_parameter)
+	 * @param parameter_value - значение параметра, один байт (как в подтверждённом логе)
+	 * @param dest_address - HDLC-адрес счётчика (для этого прибора — 0x03)
+	 * @param src_address - HDLC-адрес клиента (для этого прибора — 0x43, как у пульта)
+	 * @return - true, если кадр успешно собран и отправлен
+	 */
+	bool ActionRequestFlatAddress(const RequestParams &params, const bool &has_parameter,
+	                              const uint8_t &parameter_type, const uint8_t &parameter_value,
+	                              const uint8_t &dest_address, const uint8_t &src_address);
+
+	/**
 	 * @brief [Android-патч] AARQ (запрос на установление DLMS/COSEM-соединения) с той же
 	 * "плоской" однобайтовой HDLC-адресацией, что и GetRequestFlatAddress() — обычный
 	 * EstablishConnectionRequest() библиотеки собирает HDLC-заголовок через FormHDLCHeader()

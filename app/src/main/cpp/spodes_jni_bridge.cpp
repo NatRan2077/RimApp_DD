@@ -199,6 +199,28 @@ Java_ru_rim_dd_core_bridge_SpodesClientBridge_nativeGetRequestFlatAddress(
                                          static_cast<uint8_t>(srcAddress)) ? JNI_TRUE : JNI_FALSE;
 }
 
+JNIEXPORT jboolean JNICALL
+Java_ru_rim_dd_core_bridge_SpodesClientBridge_nativeActionRequestFlatAddress(
+        JNIEnv* env, jobject /*thiz*/, jlong handle, jint classId, jstring obisCode,
+        jint methodId, jboolean hasParameter, jint parameterType, jint parameterValue,
+        jint destAddress, jint srcAddress) {
+    SpodesClient* client = AsClient(handle);
+
+    const char* obis_chars = env->GetStringUTFChars(obisCode, nullptr);
+    SpodesClient::RequestParams params{};
+    params.class_id = static_cast<uint16_t>(classId);
+    params.instance_id = std::string(obis_chars);
+    params.attribute_id = static_cast<uint8_t>(methodId); // AddAddress() пишет это как method-id для ACTION
+    params.retry = false;
+    env->ReleaseStringUTFChars(obisCode, obis_chars);
+
+    return client->ActionRequestFlatAddress(params, hasParameter == JNI_TRUE,
+                                            static_cast<uint8_t>(parameterType),
+                                            static_cast<uint8_t>(parameterValue),
+                                            static_cast<uint8_t>(destAddress),
+                                            static_cast<uint8_t>(srcAddress)) ? JNI_TRUE : JNI_FALSE;
+}
+
 JNIEXPORT jbyteArray JNICALL
 Java_ru_rim_dd_core_bridge_SpodesClientBridge_nativeGetResponseRaw(JNIEnv* env, jobject /*thiz*/,
                                                                    jlong handle) {

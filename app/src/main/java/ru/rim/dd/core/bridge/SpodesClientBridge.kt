@@ -102,6 +102,27 @@ class SpodesClientBridge @Inject constructor() {
         nativeGetRequestFlatAddress(nativeHandle, classId, obisCode, attributeId, destAddress, srcAddress)
 
     /**
+     * [Android-патч] ACTION-запрос (управление объектом — напр. включение/отключение реле,
+     * класс Disconnect Control) с той же "плоской" адресацией, что и getRequestFlatAddress().
+     * methodId — номер метода (для Disconnect Control: 1=remote_disconnect, 2=remote_reconnect).
+     * hasParameter/parameterType/parameterValue — параметр метода, если он есть: у метода 2
+     * ПОДТВЕРЖДЕНО реальным логом пульта РиМ 040.40 (тип 0x0F=Integer8, значение 0) — см.
+     * turnRelayOn()/turnRelayOff() в MeterRepositoryImpl.kt.
+     */
+    fun actionRequestFlatAddress(
+        classId: Int,
+        obisCode: String,
+        methodId: Int,
+        hasParameter: Boolean,
+        parameterType: Int,
+        parameterValue: Int,
+        destAddress: Int,
+        srcAddress: Int,
+    ): Boolean = nativeActionRequestFlatAddress(
+        nativeHandle, classId, obisCode, methodId, hasParameter, parameterType, parameterValue, destAddress, srcAddress,
+    )
+
+    /**
      * [Android-патч] "Сырые" байты одного полного ответа сервера (с флага 0x7E до флага
      * 0x7E), без разбора APDU библиотечными GetResponseXxx (см. GetResponseRaw() в
      * spodes_client.h/.cpp — те завязаны на смещения для двухбайтовой HDLC-адресации и
@@ -129,6 +150,10 @@ class SpodesClientBridge @Inject constructor() {
     private external fun nativeEstablishConnectionResponseRaw(handle: Long): ByteArray
     private external fun nativeGetRequest(handle: Long, classId: Int, obisCode: String, attributeId: Int): Boolean
     private external fun nativeGetRequestFlatAddress(handle: Long, classId: Int, obisCode: String, attributeId: Int, destAddress: Int, srcAddress: Int): Boolean
+    private external fun nativeActionRequestFlatAddress(
+        handle: Long, classId: Int, obisCode: String, methodId: Int, hasParameter: Boolean,
+        parameterType: Int, parameterValue: Int, destAddress: Int, srcAddress: Int,
+    ): Boolean
     private external fun nativeGetResponseRaw(handle: Long): ByteArray
     private external fun nativeGetResponseFloat(handle: Long): Double
     private external fun nativeGetResponseInt(handle: Long): Long

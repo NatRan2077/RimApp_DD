@@ -21,6 +21,19 @@ data class ObisReading(
     val unit: Int?,
     /** Заполнено вместо rawValue/scaler/unit для OctetString-значений (напр. дата/время прибора). */
     val octetValue: ByteArray? = null,
+    /**
+     * [Android-патч] Заполнено вместо rawValue/scaler/unit, если значение атрибута — DLMS
+     * VisibleString (тег 0x0A), напр. версия ПО или другое текстовое служебное поле. Нужно
+     * для работы с РАЗНЫМИ счётчиками серии: пользователь обнаружил, что на другом приборе
+     * (не РиМ 040.40, на который были рассчитаны все предыдущие фиксы) первый сегмент буфера
+     * 0.0.21.0.2.255 БОЛЬШЕ и, судя по всему, содержит доп. поля вроде версии ПО прямо внутри
+     * "публичного" буфера индикации — то есть без отдельного GET и без ассоциации. Раньше
+     * collectReadings() ниже умел распознавать в паре {OBIS, значение} только число или
+     * OctetString — VisibleString (текст) просто терялся молча. Теперь ловится и он, поэтому
+     * ЛЮБОЙ счётчик с текстовым полем прямо в этом буфере подхватится сам, без хардкода под
+     * конкретную модель.
+     */
+    val textValue: String? = null,
 ) {
     /** rawValue * 10^scaler — значение в базовой единице (Вт, В, А, Гц, °C, Вт·ч, вар·ч...). */
     val value: Double get() = rawValue * Math.pow(10.0, scaler.toDouble())
@@ -147,6 +160,29 @@ fun parseGetResponseValue(rawFrame: ByteArray): DlmsValue {
     return root
 }
 
+/**
+ * [Android-патч] Разбирает ACTION-response (см. turnRelayOn()/turnRelayOff() в
+ * MeterRepositoryImpl.kt) — тот же принцип, что и у parseGetResponseValue(): ищем LLC-
+ * заголовок сервера "E6 E7 00", затем идёт service-id=0xC7 (action-response-normal),
+ * choice=0x01 (normal), invoke-id-and-priority, и СРАЗУ (без выбора data/data-access-result,
+ * как у GET-response) — однобайтовый Action-Result (0=success, остальные коды — по тому же
+ * перечислению Data-Access-Result: 1=hardware-fault, 3=read-write-denied и т.д.), а следом
+ * ещё один байт-выбор "есть ли возвращаемые данные" (в подтверждённом логе — 0, данных нет,
+ * этого достаточно для методов Disconnect Control). Подтверждено реальным логом пульта
+ * РиМ 040.40: ответ на ACTION method 2 (remote_reconnect, 0.0.96.3.10.255) — ровно
+ * "E6 E7 00 C7 01 <invoke> 00 00" (00=success, 00=без данных).
+ *
+ * @return код Action-Result (0 = успех) или null, если ответ короче ожидаемого/не ACTION-response.
+ */
+fun parseActionResponseResult(rawFrame: ByteArray): Int? {
+    val llcOffset = findLlcHeader(rawFrame) ?: return null
+    val pos = llcOffset + 3
+    if (pos + 4 > rawFrame.size) return null
+    val serviceId = rawFrame[pos].toInt() and 0xFF
+    if (serviceId != 0xC7) return null
+    return rawFrame[pos + 3].toInt() and 0xFF
+}
+
 private fun findLlcHeader(frame: ByteArray): Int? {
     for (i in 0..frame.size - 3) {
         if ((frame[i].toInt() and 0xFF) == 0xE6 &&
@@ -185,7 +221,30 @@ private fun collectReadings(value: DlmsValue, out: MutableList<ObisReading>) {
                 continue
             }
             if (valueItem is DlmsValue.OctetStr) {
-                out.add(ObisReading(obisCodeOf(obisItem.bytes), 0L, 0, null, octetValue = valueItem.bytes))
+                // [Android-патч] НАЙДЕНО по логу подключения к ДРУГОМУ счётчику (модель 189.40):
+                // версия ПО там лежит прямо в этом же буфере под OBIS 0.0.96.1.2.255 — ровно тем,
+                // что мы уже занесли в FIRMWARE_VERSION_OBIS_CANDIDATES (MeterRepositoryImpl) — но
+                // закодирована НЕ как VisibleString (тег 0x0A, ловится веткой ниже), а как OctetString
+                // (тег 0x09) с ASCII-текстом внутри ("31 2E 35 38" = "1.58"). Раньше это попадало
+                // только в octetValue (сырые байты) — textValue оставался null, и версия ПО не
+                // подхватывалась. Печатаемый ASCII из OctetString — частый способ хранить текст в
+                // DLMS (тот же приём уже применялся в textValueOf() для одиночных атрибутов) —
+                // используем его и здесь, не трогая octetValue (он всё ещё нужен для НЕ-текстовых
+                // OctetString, напр. даты/времени прибора — там байты непечатаемые, textValue
+                // останется null, поведение для них не меняется).
+                val text = valueItem.bytes.takeIf { it.isNotEmpty() && it.all { b -> (b.toInt() and 0xFF) in 0x20..0x7E } }
+                    ?.let { String(it, Charsets.US_ASCII) }
+                out.add(ObisReading(obisCodeOf(obisItem.bytes), 0L, 0, null, octetValue = valueItem.bytes, textValue = text))
+                val maybeScalerUnit = items.getOrNull(i + 2)
+                i += if (maybeScalerUnit is DlmsValue.Struct && maybeScalerUnit.items.size == 2) 3 else 2
+                continue
+            }
+            // [Android-патч] см. textValue в ObisReading — пара {OBIS, VisibleString} встречается,
+            // когда буфер конкретного счётчика включает текстовые служебные поля (напр. версию ПО)
+            // прямо внутри "публичного" профиля — на разных моделях счётчиков состав буфера разный,
+            // это ловит такие поля независимо от того, какой именно OBIS у них оказался.
+            if (valueItem is DlmsValue.VisibleStr) {
+                out.add(ObisReading(obisCodeOf(obisItem.bytes), 0L, 0, null, textValue = valueItem.text))
                 val maybeScalerUnit = items.getOrNull(i + 2)
                 i += if (maybeScalerUnit is DlmsValue.Struct && maybeScalerUnit.items.size == 2) 3 else 2
                 continue
@@ -251,6 +310,27 @@ fun textValueOf(value: DlmsValue): String = when (value) {
     is DlmsValue.Float32Val -> value.value.toString()
     is DlmsValue.Float64Val -> value.value.toString()
     else -> describeDlmsValue(value)
+}
+
+/**
+ * [Android-патч] Универсальное числовое/булево значение одиночного атрибута — для служебных
+ * объектов вроде состояния размыкателя (0.0.96.3.10.255, класс Disconnect Control), где заранее
+ * не известно, придёт ли Boolean (output_state) или Enum (control_state). В отличие от
+ * numericValueOf() ниже (используется только для показаний энергии — там Bool/Enum не нужны),
+ * эта функция публичная и покрывает ещё EnumVal и BoolVal.
+ */
+fun longOrBoolValueOf(value: DlmsValue): Long? = when (value) {
+    is DlmsValue.U8 -> value.value.toLong()
+    is DlmsValue.I8 -> value.value.toLong()
+    is DlmsValue.U16 -> value.value.toLong()
+    is DlmsValue.I16 -> value.value.toLong()
+    is DlmsValue.U32 -> value.value
+    is DlmsValue.I32 -> value.value
+    is DlmsValue.U64 -> value.value
+    is DlmsValue.I64 -> value.value
+    is DlmsValue.EnumVal -> value.value.toLong()
+    is DlmsValue.BoolVal -> if (value.value) 1L else 0L
+    else -> null
 }
 
 private fun numericValueOf(value: DlmsValue?): Long? = when (value) {

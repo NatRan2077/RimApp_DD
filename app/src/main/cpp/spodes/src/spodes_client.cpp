@@ -616,6 +616,65 @@ bool SpodesClient::GetRequestFlatAddress (const RequestParams &params, const uin
     return true;
 }
 
+// [Android-патч] см. ActionRequestFlatAddress() в spodes_client.h — тот же принцип сборки
+// кадра, что и у GetRequestFlatAddress() выше (собственный invoke-id, ручной LLC-заголовок
+// вместо FormLLCHeader()/FormHDLCHeader() библиотеки), но service_id=195 (ACTION-request-
+// normal, 0xC3) вместо 192 (GET), и вместо байта "selective access" (0 — не используется у
+// GET) сюда пишется method_invocation_parameters: 00 (параметра нет) либо 01 + тип + значение
+// (параметр есть) — формат подтверждён реальным логом пульта, см. заголовочный комментарий.
+bool SpodesClient::ActionRequestFlatAddress (const RequestParams &params, const bool &has_parameter,
+                                             const uint8_t &parameter_type, const uint8_t &parameter_value,
+                                             const uint8_t &dest_address, const uint8_t &src_address)
+{
+    std::vector<uint8_t> body;
+    ServiceFunctions serv_funcs;
+
+    flat_invoke_id_ = (flat_invoke_id_ % 63) + 1;
+    uint8_t invoke_id_and_priority = flat_invoke_id_ | (1 << 7);
+    body.insert(body.end(), {0xE6, 0xE6, 0, 195, 1, invoke_id_and_priority});
+
+    flat_dest_address_ = dest_address;
+    flat_src_address_ = src_address;
+    if (!serv_funcs.AddAddress(body, params, error_message_)) // params.attribute_id == method-id
+        return false;
+
+    if (has_parameter)
+    {
+        body.push_back(1);
+        body.push_back(parameter_type);
+        body.push_back(parameter_value);
+    }
+    else
+    {
+        body.push_back(0);
+    }
+
+    uint8_t control_field = serv_funcs.CalculateControlField(send_sequence_number_, receive_sequence_number_, 1);
+    std::vector<uint8_t> request = {0x7E, 0, 0, dest_address, src_address, control_field, 0, 0};
+    request.insert(request.end(), body.begin(), body.end());
+    request.push_back(0);
+    request.push_back(0);
+    request.push_back(0x7E);
+
+    uint16_t request_size = static_cast<uint16_t>(request.size()) - 2;
+    uint16_t value = (request_size & 0x07FF) | 0xA000;
+    request[1] = static_cast<uint8_t>((value >> 8) & 0xFF);
+    request[2] = static_cast<uint8_t>(value & 0xFF);
+
+    uint16_t hcs = serv_funcs.CalculateCRC(std::vector<uint8_t>(request.begin(), request.begin() + 6), true);
+    request[6] = hcs & 0xFF;
+    request[7] = (hcs >> 8) & 0xFF;
+
+    uint16_t fcs = serv_funcs.CalculateCRC(std::vector<uint8_t>(request.begin(), request.end() - 2), false);
+    request[request.size() - 3] = fcs & 0xFF;
+    request[request.size() - 2] = (fcs >> 8) & 0xFF;
+
+    if (!SendRequest(request))
+        return false;
+    send_sequence_number_++;
+    return true;
+}
+
 // [Android-патч] см. EstablishConnectionRequestFlatAddress() в spodes_client.h — та же идея,
 // что и в GetRequestFlatAddress(): переиспользуем штатную сборку APDU (SpodesHandler), но
 // оборачиваем в HDLC-заголовок с однобайтовой "плоской" адресацией вместо FormHDLCHeader().

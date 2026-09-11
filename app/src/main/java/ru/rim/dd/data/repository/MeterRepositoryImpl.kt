@@ -11,6 +11,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import ru.rim.dd.core.ble.BleDevice
 import ru.rim.dd.core.ble.MeterBleClient
@@ -19,6 +21,8 @@ import ru.rim.dd.core.dlms.ObisReading
 import ru.rim.dd.core.dlms.decodeCosemDate
 import ru.rim.dd.core.dlms.decodeCosemTime
 import ru.rim.dd.core.dlms.describeDlmsValue
+import ru.rim.dd.core.dlms.longOrBoolValueOf
+import ru.rim.dd.core.dlms.parseActionResponseResult
 import ru.rim.dd.core.dlms.parseGetResponseTariffs
 import ru.rim.dd.core.dlms.parseGetResponseValue
 import ru.rim.dd.core.dlms.textValueOf
@@ -69,6 +73,31 @@ class MeterRepositoryImpl @Inject constructor(
     private val repositoryScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var pumpJob: Job? = null
 
+    /**
+     * [Android-патч] Автообновление показаний/сети/реле по таймеру + возможность обновить
+     * по кнопке (см. startAutoRefresh()/stopAutoRefresh() и refreshReadings()) — job живёт,
+     * пока есть активное соединение, останавливается вместе с pumpJob в stopTransportPump().
+     */
+    private var autoRefreshJob: Job? = null
+
+    /**
+     * [Android-патч] Единственный SpodesClient на соединение НЕ потокобезопасен (собственные
+     * счётчики send/receive sequence number и flat_invoke_id_, общий rx/tx-буфер) — до
+     * автообновления это было не важно (единственный "верхнеуровневый" GET на подключение +
+     * ручное «Обновить», которые пользователь физически не мог нажать одновременно). Теперь,
+     * когда GET/ACTION может прийти из ТРЁХ независимых источников (таймер автообновления,
+     * кнопка «Обновить», кнопки включения/отключения реле), конкурентный вызов гарантированно
+     * собьёт нумерацию HDLC-кадров — та же категория бага, что чинили в PairingViewModel (см.
+     * cancelAndJoin() там) и в BleTransport::ReadData(), только на уровне DLMS-транзакций, а не
+     * BLE-скана. Поэтому весь протокольный обмен (GET основного буфера, GET реле, ACTION реле,
+     * диагностика журналов) сериализуем через этот мьютекс — держим его на всё время одного
+     * "верхнеуровневого" запроса (включая вложенные readRelayState() внутри
+     * readAndApplyMainBuffer()/sendDisconnectControlAction() — они НЕ берут лок повторно,
+     * достаточно захватить его один раз на внешнем вызове, иначе Mutex.withLock не реентерабелен
+     * и мы бы поймали дедлок).
+     */
+    private val protocolMutex = Mutex()
+
     override fun connectionState(): Flow<ConnectionState> = ble.connectionState
 
     override fun scanDevices(): Flow<BleDevice> = ble.scan()
@@ -78,16 +107,21 @@ class MeterRepositoryImpl @Inject constructor(
         spodes.createClient()
         startTransportPump()
         withContext(Dispatchers.IO) { establishHdlcChannel() }
-        val connected = withContext(Dispatchers.IO) { readAndApplyMainBuffer() }
+        val connected = protocolMutex.withLock { withContext(Dispatchers.IO) { readAndApplyMainBuffer() } }
         if (!connected) {
             stopTransportPump()
             ble.disconnect()
             throw IllegalStateException(spodes.lastErrorMessage())
         }
+        // Сбрасываем ПЕРЕД разбором имени — иначе, если разбор не удастся (deviceName == null или
+        // не подходит под формат), activeSerialNumber мог бы остаться от ПРЕДЫДУЩЕГО подключения
+        // (это правилось задним числом — заметил при повторной проверке, до этого было всегда null).
+        activeSerialNumber = null
         applyDeviceNameInfo(deviceName)
         if (remember) {
             deviceStore.rememberDevice(PairedDevice(serialNumber = activeSerialNumber ?: address, bleAddress = address))
         }
+        startAutoRefresh()
     }
 
     /**
@@ -224,8 +258,81 @@ class MeterRepositoryImpl @Inject constructor(
             Log.e(TAG, "GET-response: не удалось разобрать DLMS-данные: ${ex.message}", ex)
         }
 
-        readFirmwareVersion()
+        // [Android-патч] readFirmwareVersion() ВРЕМЕННО не вызывается — этот и любой другой OBIS,
+        // кроме 0.0.21.0.2.255, гарантированно возвращает "object unavailable" без установленной
+        // DLMS-ассоциации (подтверждено диагностикой журналов), а association на этом приборе
+        // пока недоступна (нужен корректный security_level/пароль — см. историю у readFirmwareVersion()
+        // ниже). Раньше это был лишний GET на каждое подключение/обновление без всякой пользы —
+        // убрали, пока проблема с доступом не решится. Сам метод оставлен нетронутым на будущее.
+        readRelayState()
         return true
+    }
+
+    /**
+     * [Android-патч] «Индикация» состояния размыкателя (UC-07) — ПЕРЕД управлением (ACTION/SET на
+     * реле) сначала проверяем безопасное ЧТЕНИЕ, по договорённости: формат ACTION-запроса для
+     * ЭТОГО прибора не сверен с реальным логом пульта (в отличие от GET, который мы каждый раз
+     * сверяли), а отправлять непроверенную команду на физическое силовое оборудование вслепую —
+     * не вариант. GET — безопасная операция, ей рискуем.
+     *
+     * OBIS 0.0.96.3.10.255, класс "Disconnect Control" — найден в паспорте прибора (файл-выгрузка
+     * "RIM1894604314652") с описанием "Размыкатель"; 70 — стандартный DLMS/COSEM class-id для
+     * Disconnect Control (не догадка конкретно под этот прибор, как OBIS-коды, а часть спецификации
+     * DLMS UA 1000-1 — тот же источник, что и class-id=7 для Profile Generic, который на этом
+     * приборе уже подтверждённо работает). Пробуем два атрибута по той же спецификации:
+     * attribute 2 (output_state — Boolean, физическое состояние выхода) и attribute 3
+     * (control_state — Enum: 0=disconnected, 1=connected, 2=ready_for_reconnection). Не знаем
+     * заранее, доступны ли они без ассоциации — весь остальной прибор, кроме 0.0.21.0.2.255, её
+     * требует (подтверждено диагностикой 23 журналов) — поэтому это и есть диагностика: если оба
+     * вернут "object unavailable", будет ясно, что реле упирается в ту же стену, что и журналы.
+     */
+    private fun readRelayState() {
+        val outputState = readDisconnectControlAttribute(attributeId = 2, label = "output_state")
+        val controlState = readDisconnectControlAttribute(attributeId = 3, label = "control_state")
+
+        if (outputState == null && controlState == null) return // оба недоступны — вероятно, снова нет ассоциации
+
+        val prev = _relayState.value
+        val isOn = when {
+            controlState != null -> controlState == 1L // 1 = connected по DLMS Disconnect Control
+            outputState != null -> outputState == 1L
+            else -> prev.isOn
+        }
+        val remoteTurnOnAllowed = controlState == 2L // 2 = ready_for_reconnection
+        _relayState.value = prev.copy(isOn = isOn, remoteTurnOnAllowed = remoteTurnOnAllowed)
+        Log.d(
+            TAG,
+            "Состояние размыкателя: output_state=$outputState, control_state=$controlState → " +
+                    "isOn=$isOn, remoteTurnOnAllowed=$remoteTurnOnAllowed",
+        )
+    }
+
+    private fun readDisconnectControlAttribute(attributeId: Int, label: String): Long? {
+        Log.d(TAG, "GET-request размыкателя (0.0.96.3.10.255, class=70 Disconnect Control, attr=$attributeId \"$label\")")
+        val sent = spodes.getRequestFlatAddress(
+            classId = 70,
+            obisCode = "0.0.96.3.10.255",
+            attributeId = attributeId,
+            destAddress = 0x03,
+            srcAddress = 0x43,
+        )
+        if (!sent) {
+            Log.w(TAG, "Размыкатель ($label, attr=$attributeId): запрос не отправлен (${spodes.lastErrorMessage()})")
+            return null
+        }
+        val raw = spodes.getResponseRawBytes()
+        if (raw.isEmpty()) {
+            Log.w(TAG, "Размыкатель ($label, attr=$attributeId): пустой ответ от транспорта (${spodes.lastErrorMessage()})")
+            return null
+        }
+        return try {
+            val value = parseGetResponseValue(raw)
+            Log.d(TAG, "Размыкатель ($label, attr=$attributeId): УСПЕХ — ${describeDlmsValue(value)}")
+            longOrBoolValueOf(value)
+        } catch (ex: Exception) {
+            Log.w(TAG, "Размыкатель ($label, attr=$attributeId): ${ex.message}")
+            null
+        }
     }
 
     /**
@@ -388,7 +495,7 @@ class MeterRepositoryImpl @Inject constructor(
             Log.w(TAG, "probeAllLogs(): нет активного BLE-соединения")
             return
         }
-        withContext(Dispatchers.IO) { probeAllLogCandidates() }
+        protocolMutex.withLock { withContext(Dispatchers.IO) { probeAllLogCandidates() } }
     }
 
     /**
@@ -448,15 +555,40 @@ class MeterRepositoryImpl @Inject constructor(
             val time = decodeCosemTime(timeBytes)
             if (date != null && time != null) LocalDateTime.of(date, time) else null
         } else null
-        if (temperatureC != null || backupVoltageV != null || deviceClock != null) {
+
+        // [Android-патч] Версия ПО — НЕ хардкодим "у этой модели её тут нет": пользователь
+        // обнаружил, что на ДРУГОМ счётчике этой же линейки первый сегмент буфера крупнее и,
+        // судя по всему, содержит версию ПО прямо внутри "публичного" профиля индикации — то
+        // есть без отдельного GET и без ассоциации (readFirmwareVersion() ниже по-прежнему не
+        // вызывается — она требует ассоциацию, которой у нас нет). Раз состав буфера отличается
+        // от модели к модели, сначала проверяем ИЗВЕСТНЫЙ по паспорту OBIS версии ПО
+        // (0.0.96.1.2.255 — стандартный "Device ID 2", подтверждён паспортом РиМ 040.40), а
+        // затем логируем ЛЮБЫЕ другие текстовые поля буфера — если версия ПО на новом приборе
+        // лежит под другим OBIS, это будет видно в логе и код можно будет расширить, не гадая.
+        val textReadings = all.filter { it.textValue != null }
+        if (textReadings.isNotEmpty()) {
+            Log.d(TAG, "В буфере найдены текстовые поля: ${textReadings.joinToString { "${it.obisCode}=\"${it.textValue}\"" }}")
+        }
+        val firmwareVersion = FIRMWARE_VERSION_OBIS_CANDIDATES.firstNotNullOfOrNull { obis -> find(obis)?.textValue }
+        // [Android-патч] см. FIRMWARE_VERSION_OBIS_CANDIDATES — тот же буфер на проверенном
+        // втором счётчике (модель 189.40) содержит ещё и человекочитаемое имя модели прямо
+        // текстом ("RIM 189.40" под OBIS 0.0.96.1.1.255, "Device ID 1") — надёжнее, чем парсинг
+        // BLE-имени по формату "13 цифр" (applyDeviceNameInfo), который вообще может не подойти
+        // для другой линейки счётчиков. Берём из буфера, когда есть; парсинг имени остаётся как
+        // запасной вариант (см. applyDeviceNameInfo) на случай, если в буфере этого поля нет.
+        val modelName = MODEL_NAME_OBIS_CANDIDATES.firstNotNullOfOrNull { obis -> find(obis)?.textValue }
+
+        if (temperatureC != null || backupVoltageV != null || deviceClock != null || firmwareVersion != null || modelName != null) {
             val prev = _meterInfo.value
             _meterInfo.value = (
                     prev ?: MeterInfo(model = "—", serialNumber = activeSerialNumber ?: "—", firmwareVersion = "—")
                     ).copy(
+                    model = modelName ?: prev?.model ?: "—",
                     temperatureC = temperatureC,
                     backupVoltageV = backupVoltageV,
                     deviceClock = deviceClock,
                     lastSeenAt = Instant.now(),
+                    firmwareVersion = firmwareVersion ?: prev?.firmwareVersion ?: "—",
                 )
         }
     }
@@ -514,7 +646,7 @@ class MeterRepositoryImpl @Inject constructor(
         spodes.createClient()
         startTransportPump()
         withContext(Dispatchers.IO) { establishHdlcChannel() }
-        val connected = withContext(Dispatchers.IO) { readAndApplyMainBuffer() }
+        val connected = protocolMutex.withLock { withContext(Dispatchers.IO) { readAndApplyMainBuffer() } }
         if (!connected) {
             stopTransportPump()
             ble.disconnect()
@@ -529,6 +661,7 @@ class MeterRepositoryImpl @Inject constructor(
         if (remember) {
             deviceStore.rememberDevice(PairedDevice(serialNumber = activeSerialNumber ?: serialNumber, bleAddress = found.address))
         }
+        startAutoRefresh()
     }
 
     /**
@@ -555,6 +688,38 @@ class MeterRepositoryImpl @Inject constructor(
     private fun stopTransportPump() {
         pumpJob?.cancel()
         pumpJob = null
+        stopAutoRefresh()
+    }
+
+    /**
+     * [Android-патч] Автообновление по таймеру — запускается после УСПЕШНОГО первого чтения
+     * при подключении (см. connectByAddress()/connectBySerialNumber()), останавливается вместе
+     * с "насосом" в stopTransportPump() (т.е. при любом разрыве/переподключении/forgetDevice()).
+     * Переиспользует readAndApplyMainBuffer() — тот же код, что и кнопка «Обновить»
+     * (refreshReadings()) и что обновляет разом показания/сеть/инфо/состояние реле
+     * (readRelayState() вызывается внутри неё же). Захватываем protocolMutex на каждой
+     * итерации — если в этот момент пользователь нажал «Обновить» или включает/отключает реле,
+     * просто ждём своей очереди, а не шлём кадр поверх чужого запроса.
+     *
+     * Интервал — 5 секунд: полный цикл (основной буфер, обычно 7+ HDLC-сегментов, + 2 GET на
+     * состояние реле) в логах занимает заметно меньше секунды на сегмент, так что запас большой;
+     * это самое начало настройки — если 5 c окажется слишком часто/редко для реального
+     * использования, интервал стоит вынести в настройки, а не подбирать на глаз здесь.
+     */
+    private fun startAutoRefresh() {
+        stopAutoRefresh()
+        autoRefreshJob = repositoryScope.launch {
+            while (true) {
+                delay(AUTO_REFRESH_INTERVAL_MS)
+                val ok = protocolMutex.withLock { withContext(Dispatchers.IO) { readAndApplyMainBuffer() } }
+                if (!ok) Log.w(TAG, "Автообновление: GET-запрос не удался (${spodes.lastErrorMessage()})")
+            }
+        }
+    }
+
+    private fun stopAutoRefresh() {
+        autoRefreshJob?.cancel()
+        autoRefreshJob = null
     }
 
     override fun readings(): Flow<List<Reading>> = _readings.asStateFlow()
@@ -574,9 +739,11 @@ class MeterRepositoryImpl @Inject constructor(
             Log.w(TAG, "refreshReadings(): нет активного BLE-соединения — обновлять нечего")
             return
         }
-        withContext(Dispatchers.IO) {
-            val ok = readAndApplyMainBuffer()
-            if (!ok) Log.w(TAG, "refreshReadings(): GET-запрос не удался (${spodes.lastErrorMessage()})")
+        protocolMutex.withLock {
+            withContext(Dispatchers.IO) {
+                val ok = readAndApplyMainBuffer()
+                if (!ok) Log.w(TAG, "refreshReadings(): GET-запрос не удался (${spodes.lastErrorMessage()})")
+            }
         }
     }
 
@@ -594,13 +761,102 @@ class MeterRepositoryImpl @Inject constructor(
 
     override fun relayState(): Flow<RelayState> = _relayState.asStateFlow()
 
+    /**
+     * [Android-патч] UC-08 — включение реле: ACTION method 2 ("remote_reconnect") на объекте
+     * Disconnect Control (0.0.96.3.10.255). Формат ПОДТВЕРЖДЁН реальным логом пульта РиМ 040.40
+     * (сам пульт пометил этот обмен как "DLMS - Recive Relay Connect"): параметр метода
+     * присутствует (choice=1), тип Integer8 (0x0F), значение 0 — см. sendDisconnectControlAction().
+     *
+     * 60-секундный обратный отсчёт перед вызовом — на стороне ViewModel (NetworkViewModel.
+     * turnRelayOn()), здесь только сама команда.
+     */
     override suspend fun turnRelayOn() {
-        // TODO(sprint 4): UC-08 — проверка remoteTurnOnAllowed, 60-секундный
-        //  обратный отсчёт на стороне ViewModel, затем SET/ACTION через spodes.
+        sendDisconnectControlAction(methodId = 2, label = "remote_reconnect/включение")
     }
 
+    /**
+     * [Android-патч] UC-08 — немедленное отключение реле: ACTION method 1 ("remote_disconnect").
+     * В ОТЛИЧИЕ от turnRelayOn(), формат ЗДЕСЬ НЕ ПОДТВЕРЖДЁН реальным логом — в захваченном
+     * логе пульта нашлась только команда включения. Параметр собран по аналогии с методом 2
+     * (тот же Integer8=0) — это ПРЕДПОЛОЖЕНИЕ по симметрии, а не проверенный факт. Если на
+     * реальном приборе это вернёт ошибку (Action-Result ≠ 0) вместо успеха — первое, что стоит
+     * попробовать: вызвать метод 1 БЕЗ параметра (по базовой спецификации DLMS UA 1000-1 у
+     * remote_disconnect параметров нет вообще; параметр у remote_reconnect в логе пульта мог
+     * быть особенностью конкретно этой прошивки/устройства, а не общим правилом для обоих
+     * методов). Работаем "вслепую" по явной договорённости с заказчиком.
+     */
     override suspend fun turnRelayOff() {
-        // TODO(sprint 4): немедленная команда отключения через spodes (ACTION).
+        sendDisconnectControlAction(methodId = 1, label = "remote_disconnect/отключение")
+    }
+
+    /**
+     * [Android-патч] Общий код turnRelayOn()/turnRelayOff() — ACTION-запрос к Disconnect
+     * Control той же "плоской" адресацией, что и GET (см. readDisconnectControlAttribute()).
+     * После успешного Action-Result (0) переспрашиваем состояние реле через readRelayState() —
+     * ACTION-response сам по себе новое состояние не возвращает (см. parseActionResponseResult()
+     * в GetResponseParser.kt), поэтому UI обновляем РЕАЛЬНЫМ значением, а не оптимистично.
+     */
+    private suspend fun sendDisconnectControlAction(methodId: Int, label: String) {
+        if (pumpJob?.isActive != true) {
+            Log.w(TAG, "Размыкатель ($label): нет активного BLE-соединения — команда не отправлена")
+            return
+        }
+        protocolMutex.withLock { withContext(Dispatchers.IO) {
+            Log.d(TAG, "ACTION-запрос размыкателя (0.0.96.3.10.255, class=70 Disconnect Control, method=$methodId \"$label\")")
+            val sent = spodes.actionRequestFlatAddress(
+                classId = 70,
+                obisCode = "0.0.96.3.10.255",
+                methodId = methodId,
+                hasParameter = true,
+                parameterType = 0x0F, // Integer8 — как в подтверждённом логе пульта (метод 2)
+                parameterValue = 0,
+                destAddress = 0x03,
+                srcAddress = 0x43,
+            )
+            if (!sent) {
+                Log.w(TAG, "Размыкатель ($label): запрос не отправлен (${spodes.lastErrorMessage()})")
+                return@withContext
+            }
+            val raw = spodes.getResponseRawBytes()
+            if (raw.isEmpty()) {
+                Log.w(TAG, "Размыкатель ($label): пустой ответ от транспорта (${spodes.lastErrorMessage()})")
+                return@withContext
+            }
+            val result = parseActionResponseResult(raw)
+            when {
+                result == null -> Log.w(TAG, "Размыкатель ($label): не удалось разобрать ACTION-response")
+                result != 0 -> Log.w(
+                    TAG,
+                    "Размыкатель ($label): сервер вернул Action-Result код 0x%02X (%d) — команда НЕ выполнена"
+                        .format(result, result),
+                )
+                else -> {
+                    Log.d(TAG, "Размыкатель ($label): УСПЕХ (Action-Result=0)")
+                    // [Android-патч] НАЙДЕНА причина "индикация реле всегда ОТКЛЮЧЕНО": GET на
+                    // ОБА атрибута Disconnect Control (output_state/control_state) у этого
+                    // прибора без ассоциации возвращает data-access-result (control_state —
+                    // подтверждено логом, код 0x0D "scope-of-access-violated"; output_state,
+                    // судя по симптому, тоже) — то есть readRelayState() ниже практически
+                    // никогда не может обновить _relayState настоящими данными, а она и не
+                    // должна в этом случае: readRelayState() специально ничего не трогает,
+                    // если ОБА чтения не удались (см. её комментарий), — так что UI застревал
+                    // на значении по умолчанию (isOn=false) НАВСЕГДА, даже после успешного
+                    // включения. Но ACTION при этом РАБОТАЕТ (право вызвать метод и право
+                    // прочитать атрибут — это РАЗНЫЕ проверки доступа в DLMS) — раз сервер
+                    // вернул Action-Result=0, он ТОЧНО выполнил именно ту команду, которую мы
+                    // просили. Поэтому обновляем UI ОПТИМИСТИЧНО по самому факту успеха
+                    // команды (какой метод вызывали — такое и состояние), а не ждём
+                    // подтверждения через GET, которого может не случиться вовсе.
+                    val prev = _relayState.value
+                    _relayState.value = prev.copy(isOn = methodId == 2, source = RelaySource.REMOTE_CONTROL)
+                    // Всё равно пробуем переспросить: если хоть один атрибут когда-нибудь
+                    // окажется доступен, readRelayState() перезапишет это НАСТОЯЩИМ значением
+                    // (в т.ч. remoteTurnOnAllowed из control_state) — а если нет, она не
+                    // трогает _relayState, и наше оптимистичное значение останется как есть.
+                    readRelayState()
+                }
+            }
+        } }
     }
 
     override fun history(serialNumber: String): Flow<List<Reading>> =
@@ -635,5 +891,30 @@ class MeterRepositoryImpl @Inject constructor(
         private const val HDLC_PHYSICAL_ADDRESS = 1
 
         private const val TAG = "MeterRepository"
+
+        /** [Android-патч] Интервал автообновления — см. startAutoRefresh(). */
+        private const val AUTO_REFRESH_INTERVAL_MS = 40_000L
+
+        /**
+         * [Android-патч] см. applyDecodedBuffer() — кандидаты OBIS для версии ПО, если она
+         * встретится ПРЯМО в буфере 0.0.21.0.2.255 (без отдельного GET/ассоциации). Первый —
+         * 0.0.96.1.2.255, подтверждён паспортом РиМ 040.40 ("Device ID 2"); остальные — другие
+         * стандартные "Device ID" регистры того же класса (0.0.96.1.x), которые на других
+         * моделях этой линейки МОГУТ использоваться вместо второго. Список расширять по факту
+         * логов с реальных приборов (см. "В буфере найдены текстовые поля" в логе), а не гадая.
+         */
+        private val FIRMWARE_VERSION_OBIS_CANDIDATES = listOf(
+            "0.0.96.1.2.255",
+            "0.0.96.1.0.255",
+            "0.0.96.1.1.255",
+        )
+
+        /**
+         * [Android-патч] см. applyDecodedBuffer() — 0.0.96.1.1.255 ("Device ID 1") подтверждён
+         * логом реального счётчика (модель 189.40, значение "RIM 189.40" прямо текстом).
+         */
+        private val MODEL_NAME_OBIS_CANDIDATES = listOf(
+            "0.0.96.1.1.255",
+        )
     }
 }

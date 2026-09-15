@@ -25,6 +25,11 @@ import ru.rim.dd.core.dlms.longOrBoolValueOf
 import ru.rim.dd.core.dlms.parseActionResponseResult
 import ru.rim.dd.core.dlms.parseGetResponseTariffs
 import ru.rim.dd.core.dlms.parseGetResponseValue
+import ru.rim.dd.core.dlms.RELAY_CONTROL_STATE_OBIS
+import ru.rim.dd.core.dlms.CURRENT_TARIFF_OBIS
+import ru.rim.dd.core.dlms.DD_PHASE_DISPLAY_OBIS
+import ru.rim.dd.core.dlms.CLOCK_STATUS_OBIS
+import ru.rim.dd.core.dlms.isClockStatusValid
 import ru.rim.dd.core.dlms.textValueOf
 import ru.rim.dd.core.model.ConnectionState
 import ru.rim.dd.core.model.MeterInfo
@@ -34,6 +39,8 @@ import ru.rim.dd.core.model.PhaseValues
 import ru.rim.dd.core.model.Reading
 import ru.rim.dd.core.model.RelayState
 import ru.rim.dd.core.model.RelaySource
+import ru.rim.dd.core.model.TamperState
+import ru.rim.dd.core.dlms.TAMPER_STATUS_OBIS
 import ru.rim.dd.data.local.DeviceStore
 import ru.rim.dd.data.local.ReadingDao
 import java.time.Instant
@@ -63,6 +70,10 @@ class MeterRepositoryImpl @Inject constructor(
     private val _relayState = MutableStateFlow(
         RelayState(isOn = false, powerLimitKw = 0.0, source = RelaySource.UNKNOWN)
     )
+    // [Android-патч] см. TAMPER_STATUS_OBIS в GetResponseParser.kt и TamperState.kt —
+    // состояние пломб/магнита/СВЧ/батареи, декодированное из того же буфера индикации,
+    // что и control_state реле (_relayState выше) — без отдельного запроса и ассоциации.
+    private val _tamperState = MutableStateFlow(TamperState.UNKNOWN)
     private val _networkParams = MutableStateFlow<NetworkParams?>(null)
     private val _meterInfo = MutableStateFlow<MeterInfo?>(null)
     private val _readings = MutableStateFlow<List<Reading>>(emptyList())
@@ -99,6 +110,9 @@ class MeterRepositoryImpl @Inject constructor(
     private val protocolMutex = Mutex()
 
     override fun connectionState(): Flow<ConnectionState> = ble.connectionState
+
+    // [Android-патч] см. signalStrengthDbm() в MeterRepository.kt.
+    override fun signalStrengthDbm(): Flow<Int?> = ble.signalStrengthDbm
 
     override fun scanDevices(): Flow<BleDevice> = ble.scan()
 
@@ -264,7 +278,15 @@ class MeterRepositoryImpl @Inject constructor(
         // пока недоступна (нужен корректный security_level/пароль — см. историю у readFirmwareVersion()
         // ниже). Раньше это был лишний GET на каждое подключение/обновление без всякой пользы —
         // убрали, пока проблема с доступом не решится. Сам метод оставлен нетронутым на будущее.
-        readRelayState()
+        //
+        // [Android-патч] readRelayState() ТОЖЕ больше не вызывается здесь — по той же причине:
+        // оба её GET-запроса (output_state/control_state как отдельные атрибуты объекта Disconnect
+        // Control) гарантированно возвращают 0x0D без ассоциации. НАСТОЯЩЕЕ состояние реле теперь
+        // приходит САМО, без единого лишнего запроса — см. RELAY_CONTROL_STATE_OBIS в
+        // GetResponseParser.kt и применение в applyDecodedBuffer() (вызван строкой выше): оно
+        // читается как обычное поле буфера 0.0.21.0.2.255, который мы и так только что разобрали.
+        // Метод readRelayState() оставлен нетронутым на случай, если ассоциация всё же появится —
+        // тогда чтение по прямому OBIS снова станет иметь смысл (как резервный/более точный путь).
         return true
     }
 
@@ -514,6 +536,34 @@ class MeterRepositoryImpl @Inject constructor(
     private fun applyDecodedBuffer(all: List<ObisReading>) {
         fun find(obis: String) = all.firstOrNull { it.obisCode == obis }
 
+        // ---- Состояние размыкателя (control_state) → _relayState ----
+        // [Android-патч] см. RELAY_CONTROL_STATE_OBIS в GetResponseParser.kt: то самое поле,
+        // которое при ПРЯМОМ чтении объекта Disconnect Control (0.0.96.3.10.255, attr=3) даёт
+        // отказ доступа 0x0D — оказывается, приходит внутри ЭТОГО буфера каждый цикл, безо
+        // всякой ассоциации (подтверждено логами реального пульта — см. историю диагностики).
+        // Значения control_state по DLMS Disconnect Control: 0=disconnected, 1=connected,
+        // 2=ready_for_reconnection (см. readRelayState() ниже — та же семантика).
+        val controlState = find(RELAY_CONTROL_STATE_OBIS)?.rawValue
+        if (controlState != null) {
+            val prev = _relayState.value
+            _relayState.value = prev.copy(
+                isOn = controlState == 1L,
+                remoteTurnOnAllowed = controlState == 2L,
+                source = RelaySource.METER_READ,
+            )
+        }
+
+        // ---- Пломбы/датчики внешних воздействий → _tamperState ----
+        // [Android-патч] см. TAMPER_STATUS_OBIS в GetResponseParser.kt и TamperState.kt —
+        // раскладка бит 1:1 расшифрована из исходников прошивки самого пульта РиМ 040.40
+        // (thread_dataRequest.c::read_status()). Как и с реле, это НЕ отдельный GET на объекты
+        // СТО 34.01-5.1-006 (0.0.96.51.x — почти наверняка отказ доступа без ассоциации), а то
+        // же самое позиционное поле "Значки ДД" внутри ЭТОГО буфера, которое пульт уже читает.
+        val tamperStatus = find(TAMPER_STATUS_OBIS)?.rawValue
+        if (tamperStatus != null) {
+            _tamperState.value = TamperState.decode(tamperStatus)
+        }
+
         // ---- Энергия по категориям и тарифам (текущий период) → _readings ----
         val energyReadings = all.filter { r ->
             val g = r.obisCode.split(".")
@@ -578,7 +628,25 @@ class MeterRepositoryImpl @Inject constructor(
         // запасной вариант (см. applyDeviceNameInfo) на случай, если в буфере этого поля нет.
         val modelName = MODEL_NAME_OBIS_CANDIDATES.firstNotNullOfOrNull { obis -> find(obis)?.textValue }
 
-        if (temperatureC != null || backupVoltageV != null || deviceClock != null || firmwareVersion != null || modelName != null) {
+        // [Android-патч] см. CURRENT_TARIFF_OBIS в GetResponseParser.kt — до этого патча
+        // позиционное поле буфера с номером текущего тарифа молча терялось.
+        val currentTariff = find(CURRENT_TARIFF_OBIS)?.rawValue?.toInt()
+        // [Android-патч] см. CLOCK_STATUS_OBIS/isClockStatusValid() в GetResponseParser.kt.
+        val clockValid = find(CLOCK_STATUS_OBIS)?.rawValue?.let { isClockStatusValid(it) }
+
+        // [Android-патч] см. DD_PHASE_DISPLAY_OBIS в GetResponseParser.kt — смысл поля НЕ
+        // расшифрован (в отличие от TAMPER_STATUS_OBIS, в исходниках прошивки ДД не встретился
+        // под этим именем), поэтому пока только логируем сырое значение — если оно окажется
+        // информативным (например, будет меняться в логах с многофазных счётчиков), на основе
+        // этого лога можно будет добавить полноценную расшифровку, не гадая вслепую.
+        val phaseDisplayRaw = find(DD_PHASE_DISPLAY_OBIS)?.rawValue
+        if (phaseDisplayRaw != null) {
+            Log.d(TAG, "Буфер: \"Отображение фаз ДД\" ($DD_PHASE_DISPLAY_OBIS) = $phaseDisplayRaw (смысл поля пока не расшифрован)")
+        }
+
+        if (temperatureC != null || backupVoltageV != null || deviceClock != null || firmwareVersion != null ||
+            modelName != null || currentTariff != null || clockValid != null
+        ) {
             val prev = _meterInfo.value
             _meterInfo.value = (
                     prev ?: MeterInfo(model = "—", serialNumber = activeSerialNumber ?: "—", firmwareVersion = "—")
@@ -589,6 +657,8 @@ class MeterRepositoryImpl @Inject constructor(
                     deviceClock = deviceClock,
                     lastSeenAt = Instant.now(),
                     firmwareVersion = firmwareVersion ?: prev?.firmwareVersion ?: "—",
+                    currentTariff = currentTariff ?: prev?.currentTariff,
+                    clockValid = clockValid ?: prev?.clockValid,
                 )
         }
     }
@@ -708,11 +778,16 @@ class MeterRepositoryImpl @Inject constructor(
      */
     private fun startAutoRefresh() {
         stopAutoRefresh()
+        ble.requestRssiRead() // [Android-патч] см. signalStrengthDbm() — сразу первое значение, не ждём 5 с.
         autoRefreshJob = repositoryScope.launch {
             while (true) {
                 delay(AUTO_REFRESH_INTERVAL_MS)
                 val ok = protocolMutex.withLock { withContext(Dispatchers.IO) { readAndApplyMainBuffer() } }
                 if (!ok) Log.w(TAG, "Автообновление: GET-запрос не удался (${spodes.lastErrorMessage()})")
+                // [Android-патч] см. signalStrengthDbm() в MeterRepository.kt — попутно, тем же
+                // циклом (отдельный таймер не нужен): читаем RSSI активного соединения, чтобы
+                // экран «Настройки» показывал живой уровень сигнала, а не значение со сканирования.
+                ble.requestRssiRead()
             }
         }
     }
@@ -760,6 +835,9 @@ class MeterRepositoryImpl @Inject constructor(
     }
 
     override fun relayState(): Flow<RelayState> = _relayState.asStateFlow()
+
+    // [Android-патч] см. _tamperState/applyDecodedBuffer() выше и TamperState.kt.
+    override fun tamperState(): Flow<TamperState> = _tamperState.asStateFlow()
 
     /**
      * [Android-патч] UC-08 — включение реле: ACTION method 2 ("remote_reconnect") на объекте
@@ -849,11 +927,12 @@ class MeterRepositoryImpl @Inject constructor(
                     // подтверждения через GET, которого может не случиться вовсе.
                     val prev = _relayState.value
                     _relayState.value = prev.copy(isOn = methodId == 2, source = RelaySource.REMOTE_CONTROL)
-                    // Всё равно пробуем переспросить: если хоть один атрибут когда-нибудь
-                    // окажется доступен, readRelayState() перезапишет это НАСТОЯЩИМ значением
-                    // (в т.ч. remoteTurnOnAllowed из control_state) — а если нет, она не
-                    // трогает _relayState, и наше оптимистичное значение останется как есть.
-                    readRelayState()
+                    // [Android-патч] readRelayState() здесь больше не вызывается — она всё равно
+                    // упёрлась бы в тот же 0x0D. Реальное подтверждение придёт само на следующем
+                    // цикле автообновления (не позже AUTO_REFRESH_INTERVAL_MS) через control_state
+                    // из буфера индикации (см. applyDecodedBuffer()/RELAY_CONTROL_STATE_OBIS) и
+                    // перезапишет это оптимистичное значение настоящим — включая
+                    // remoteTurnOnAllowed для состояния "готов ко включению".
                 }
             }
         } }
@@ -881,6 +960,16 @@ class MeterRepositoryImpl @Inject constructor(
         }
     }
 
+    // [Android-патч] см. disconnect() в MeterRepository.kt — то же самое, что и внутри
+    // forgetDevice() выше (останавливаем "насос"/автообновление, уничтожаем DLMS-клиент,
+    // рвём BLE-соединение), но БЕЗ deviceStore.forget() — прибор остаётся сопряжённым.
+    override suspend fun disconnect() {
+        stopTransportPump()
+        spodes.destroyClient()
+        ble.disconnect()
+        activeSerialNumber = null
+    }
+
     companion object {
         /** Пульты РиМ 040.40 рекламируются в эфире как "RIM ..." — фильтр скана/поиска по имени. */
         private const val BLE_NAME_PREFIX = "RIM"
@@ -893,7 +982,7 @@ class MeterRepositoryImpl @Inject constructor(
         private const val TAG = "MeterRepository"
 
         /** [Android-патч] Интервал автообновления — см. startAutoRefresh(). */
-        private const val AUTO_REFRESH_INTERVAL_MS = 40_000L
+        private const val AUTO_REFRESH_INTERVAL_MS = 5_000L
 
         /**
          * [Android-патч] см. applyDecodedBuffer() — кандидаты OBIS для версии ПО, если она

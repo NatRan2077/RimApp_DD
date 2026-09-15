@@ -8,6 +8,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import ru.rim.dd.core.model.MeterInfo
+import ru.rim.dd.core.model.TamperState
 import ru.rim.dd.data.repository.MeterRepository
 import javax.inject.Inject
 
@@ -19,6 +20,14 @@ class InfoViewModel @Inject constructor(
 
     val meterInfo: StateFlow<MeterInfo?> = repository.meterInfo()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
+
+    // [Android-патч] см. TamperState.kt — пломбы/магнит/СВЧ/батарея/лимит мощности. Раньше жило
+    // на экране «Сеть» рядом с реле — перенесено сюда: по смыслу это диагностика/безопасность
+    // прибора (та же категория, что температура/резервное питание/часы прибора выше), а не
+    // параметр сети. Декодируется из того же буфера, что и остальное здесь — без отдельного
+    // запроса и без DLMS-ассоциации.
+    val tamperState: StateFlow<TamperState> = repository.tamperState()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), TamperState.UNKNOWN)
 
     /** Кнопка «Обновить» — переспрашивает тот же буфер счётчика, что обновляет и «Показания». */
     fun refresh() {

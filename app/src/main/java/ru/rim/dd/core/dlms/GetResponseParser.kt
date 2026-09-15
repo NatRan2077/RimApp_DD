@@ -50,6 +50,81 @@ data class ObisReading(
 
 private const val UNIT_WH = 30
 
+/**
+ * [Android-патч] см. collectReadings() — control_state размыкателя (0.0.96.3.10.255, класс 70
+ * Disconnect Control, атрибут 3) НЕ читается отдельным GET (счётчик отвечает 0x0D — см. историю
+ * диагностики readDisconnectControlAttribute() в MeterRepositoryImpl), а приходит ВНУТРИ обычного
+ * буфера индикации (0.0.21.0.2.255), который мы и так опрашиваем каждый цикл. Подтверждено двумя
+ * независимыми способами: (1) диагностика capture_objects этого буфера (лог "2_8") явно показала
+ * элемент [1] = Struct(класс=70, OBIS=0.0.96.3.10.255, атрибут=3) — сразу после элемента [0] =
+ * Struct(класс=8 Clock, атрибут=4 "status"); (2) байт-перечисление (Enum) на этой позиции реально
+ * меняет значение в момент подтверждённой команды включения реле (лог Text_Document_13: 0x02
+ * стабильно во всех циклах ДО команды → 0x01 сразу ПОСЛЕ подтверждённого ACTION-Result=0). Позиция
+ * подтверждена на ДВУХ разных моделях счётчика (РиМ 040.40 и 189.40) — совпадает, поэтому не
+ * хардкод под одну модель.
+ */
+const val RELAY_CONTROL_STATE_OBIS = "0.0.96.3.10.255"
+
+/**
+ * [Android-патч] см. TamperState.kt и collectReadings() — состояние пломб (корпуса, клеммника),
+ * магнитного поля, СВЧ, батареи и превышения лимита мощности НЕ читается отдельными GET на
+ * объекты СТО 34.01-5.1-006 (0.0.96.51.0/1/3/4/5.255 — на этом приборе без DLMS-ассоциации это
+ * почти наверняка отказ доступа, как и всё остальное, кроме буфера индикации), а приходит
+ * ВНУТРИ ТОГО ЖЕ буфера 0.0.21.0.2.255, третьим по счёту позиционным (без обёртки в OBIS) полем
+ * ПОСЛЕ control_state размыкателя. OBIS 0.0.96.50.170.255 в этой константе — не код для GET (сам
+ * элемент не читается отдельно), а просто "паспортный" адрес этого же значения для справки: имя
+ * "Значки ДД" и OBIS подтверждены паспортом объектов прибора (файл-выгрузка объектов, лист
+ * Sheet1: строка "Data | 0.0.96.50.170.255 | 0 | Значки ДД"). Битовая раскладка ПОЛНОСТЬЮ
+ * расшифрована из исходников прошивки самого пульта РиМ 040.40 — thread_dataRequest.c,
+ * функция read_status() (проект RiM_040_40_v1.1.41, ветка "версия ЖКИ 1", реально
+ * наблюдаемая в логах: byte1 бит6 = 1 → (byte1&0xC0)>>6 = версия 1). Комментарий прошивки
+ * дословно: "байт 1: сборка бит - статус пломб + версия ЖКИ: бит 0 Tamper_Cover.State (замок 2),
+ * бит 1 Tamper_Meter.State (замок 1), бит 2 Tamper_Magnet.State, бит 3 Tamper_Battery.State
+ * (замок 3), бит 4 СВЧ, бит 5 статус диагностики, биты 6-7 версия ЖКИ; байт 2: те же биты —
+ * но "было, сейчас не активно" (FLAG), бит 7 — превышение лимита мощности". Подробный разбор —
+ * см. TamperState.decode(). Подтверждено на реальном логе (Text_Document_13, тот же сеанс, что
+ * и для control_state реле): сырое значение поля было 0x00410100 → байт1=0x41 → бит0=1
+ * (Tamper_Cover=ACTIVE) и биты6-7=01 (версия ЖКИ=1) — правдоподобно для стендового испытания
+ * с не до конца закрытым/опломбированным корпусом.
+ */
+const val TAMPER_STATUS_OBIS = "0.0.96.50.170.255"
+
+/**
+ * [Android-патч] Текущий тариф (1..N) — тоже позиционное (без обёртки в OBIS) поле буфера,
+ * третье по счёту после control_state реле (см. collectReadings()), ИДЁТ ПЕРЕД
+ * TAMPER_STATUS_OBIS. Название и OBIS подтверждены паспортом объектов прибора ("Data |
+ * 0.0.96.14.0.255 | 0 | Текущий тариф"). До этого патча значение молча отбрасывалось (общий
+ * цикл лишь использовал его форму — OctetString не 6 байт — чтобы не спутать с OBIS-кодом, и
+ * пропускал дальше).
+ */
+const val CURRENT_TARIFF_OBIS = "0.0.96.14.0.255"
+
+/**
+ * [Android-патч] Второе позиционное поле буфера (сразу после control_state реле, ПЕРЕД
+ * текущим тарифом) — по паспорту объектов прибора: "Data | 1.0.96.50.0.255 | 0 | Отображение
+ * фаз ДД". Смысл в точности не расшифрован (не встретился в исходниках прошивки, в отличие от
+ * TAMPER_STATUS_OBIS) — предположительно битовая маска "какие фазы пульт умеет/должен
+ * отображать" у многофазных приборов; сохраняем как есть, чтобы не терять и разобраться позже
+ * по мере накопления логов с других (многофазных) счётчиков.
+ */
+const val DD_PHASE_DISPLAY_OBIS = "1.0.96.50.0.255"
+
+/**
+ * [Android-патч] Статус часов реального времени прибора (Clock, class=8, attribute=4) — самое
+ * первое позиционное поле буфера (см. collectReadings()), OBIS подтверждён capture_objects
+ * буфера ("Struct(class=8, OBIS=0.0.1.0.0.255, attr=4)"). До этого патча значение читалось
+ * ТОЛЬКО чтобы отличить "это правда начало буфера" (форма Int8/U8 + Enum), а само число никуда
+ * не попадало. Смысл битов — из комментария прошивки ДД (thread_dataRequest.c) и совпадает со
+ * стандартным Clock.status по DLMS: биты 0 (invalid value), 1 (doubtful value) и 3 (invalid
+ * clock status) — часы недостоверны, если ЛЮБОЙ из них установлен (маска 0x0B, см.
+ * isClockStatusValid() ниже). Бит 2 (другая база времени) в прошивке ДД сознательно НЕ
+ * считается ошибкой.
+ */
+const val CLOCK_STATUS_OBIS = "0.0.1.0.0.255"
+
+/** См. CLOCK_STATUS_OBIS — true, если часы прибора достоверны (как считает прошивка ДД). */
+fun isClockStatusValid(rawStatus: Long): Boolean = (rawStatus and 0x0B) == 0L
+
 /** Подмножество таблицы единиц измерения IEC 62056-6-2, реально встречающееся у этого счётчика. */
 fun unitLabelOf(unit: Int?): String? = when (unit) {
     4 -> "сут"
@@ -208,6 +283,49 @@ private fun collectReadings(value: DlmsValue, out: MutableList<ObisReading>) {
     }
 
     var i = 0
+    // [Android-патч] см. RELAY_CONTROL_STATE_OBIS выше — специальный случай ДО общего цикла по
+    // тройкам {OBIS, значение, scaler-unit}: главная строка буфера (это Struct размером под 90
+    // элементов — на порядок больше, чем у ЛЮБОЙ scaler-unit-структуры вида {Integer, Enum},
+    // которая встречается ниже per-элементно и всегда размером ровно 2 — условие items.size > 2
+    // отсекает именно её и не даёт спутать со строкой буфера) начинается с пары [Int8 (статус
+    // часов, class=8 Clock attr=4), Enum (control_state размыкателя)] БЕЗ обёртки в OBIS-код —
+    // именно поэтому раньше это значение молча терялось (общий цикл ищет только тройки/пары,
+    // начинающиеся с OctetString(6)=OBIS, и просто перешагивал через оба элемента по одному).
+    if (items.size > 2 && (items[0] is DlmsValue.I8 || items[0] is DlmsValue.U8) && items.getOrNull(1) is DlmsValue.EnumVal) {
+        // [Android-патч] см. CLOCK_STATUS_OBIS выше — раньше items[0] проверялся только на
+        // форму (Int8/U8), а само значение никуда не сохранялось.
+        val clockStatus = numericValueOf(items[0])
+        if (clockStatus != null) out.add(ObisReading(CLOCK_STATUS_OBIS, clockStatus, 0, null))
+        val controlState = (items[1] as DlmsValue.EnumVal).value
+        out.add(ObisReading(RELAY_CONTROL_STATE_OBIS, controlState.toLong(), 0, null))
+        i = 2
+        // [Android-патч] см. TAMPER_STATUS_OBIS выше — сразу следом идут ЕЩЁ ТРИ позиционных
+        // (без OBIS-обёртки) поля: [2]=Int8 статус фаз ДД, [3]=OctetString(1 байт) текущий
+        // тариф (0.0.96.14.0.255), [4]=UInt32 "Значки ДД"/статус пломб (0.0.96.50.170.255).
+        // Раньше общий цикл ниже эти три значения молча "проглатывал" по одному (перешагивал,
+        // не найдя в них OBIS-код), НЕ ломаясь и НЕ теряя синхронизацию с остальным буфером
+        // (см. resync ниже: неопознанный элемент просто пропускается по одному) — но и не
+        // извлекая ничего. Проверяем всю тройку СТРОГО по форме (Int8/U8, затем OctetString
+        // длиной НЕ 6 — то есть заведомо не OBIS-код, затем ровно U32) и продвигаемся дальше
+        // ТОЛЬКО если форма совпала целиком — иначе (другая модель счётчика/прошивки) просто
+        // остаёмся на i=2, и общий цикл ниже сам безопасно доберёт синхронизацию как раньше.
+        val phaseItem = items.getOrNull(2)
+        val tariffItem = items.getOrNull(3)
+        val statusItem = items.getOrNull(4)
+        if ((phaseItem is DlmsValue.I8 || phaseItem is DlmsValue.U8) &&
+            tariffItem is DlmsValue.OctetStr && tariffItem.bytes.size != 6 &&
+            statusItem is DlmsValue.U32
+        ) {
+            val phaseValue = numericValueOf(phaseItem)
+            if (phaseValue != null) out.add(ObisReading(DD_PHASE_DISPLAY_OBIS, phaseValue, 0, null))
+            val tariffValue = tariffItem.bytes.firstOrNull()?.let { (it.toInt() and 0xFF).toLong() }
+            if (tariffValue != null) {
+                out.add(ObisReading(CURRENT_TARIFF_OBIS, tariffValue, 0, null, octetValue = tariffItem.bytes))
+            }
+            out.add(ObisReading(TAMPER_STATUS_OBIS, statusItem.value, 0, null))
+            i = 5
+        }
+    }
     while (i < items.size) {
         val obisItem = items[i]
         if (obisItem is DlmsValue.OctetStr && obisItem.bytes.size == 6) {

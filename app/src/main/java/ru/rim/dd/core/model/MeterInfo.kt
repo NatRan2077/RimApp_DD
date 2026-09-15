@@ -3,17 +3,27 @@ package ru.rim.dd.core.model
 import java.time.Instant
 import java.time.LocalDateTime
 
+// [Android-патч] Поле signalLevelDbm (уровень сигнала) отсюда УБРАНО — оно никогда не
+// заполнялось (мёртвое поле) и по смыслу принадлежит не "информации о приборе", а активному
+// BLE-соединению: теперь это MeterBleClient.signalStrengthDbm / MeterRepository.signalStrengthDbm()
+// — живое значение (обновляется на каждом цикле автообновления), показывается на экране
+// «Настройки» рядом с кнопкой «Отключиться».
 data class MeterInfo(
     val model: String,             // напр. "РиМ 189.46"
     val serialNumber: String,
     val firmwareVersion: String,
-    val signalLevelDbm: Int? = null,
     val lastSeenAt: Instant? = null,
     // Найдены в реальном буфере счётчика (см. историю диагностики) — статусные OBIS 0.0.96.x
     // и служебные часы устройства (0.0.0.9.1.255 время / 0.0.0.9.2.255 дата).
     val temperatureC: Double? = null,      // OBIS 0.0.96.9.0.255 — внутренняя температура прибора
     val backupVoltageV: Double? = null,    // OBIS 0.0.96.6.3.255 — напряжение резервного питания
     val deviceClock: LocalDateTime? = null, // часы самого счётчика (не время телефона!)
+    // [Android-патч] см. CURRENT_TARIFF_OBIS в GetResponseParser.kt — до этого патча значение
+    // молча терялось (позиционное поле буфера без обёртки в OBIS-код).
+    val currentTariff: Int? = null,        // OBIS 0.0.96.14.0.255 — активный тариф прямо сейчас
+    // [Android-патч] см. CLOCK_STATUS_OBIS/isClockStatusValid() в GetResponseParser.kt — null,
+    // пока не пришёл ни один успешный цикл (честное "не знаем", как и RelaySource.UNKNOWN).
+    val clockValid: Boolean? = null,       // OBIS 0.0.1.0.0.255 — достоверность часов прибора
 )
 
 data class PairedDevice(

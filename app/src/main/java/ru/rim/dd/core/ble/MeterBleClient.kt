@@ -20,6 +20,7 @@ import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withTimeoutOrNull
 import no.nordicsemi.android.ble.BleManager
+import no.nordicsemi.android.ble.observer.ConnectionObserver
 import ru.rim.dd.core.model.ConnectionState
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -51,6 +52,15 @@ class MeterBleClient @Inject constructor(
 
     private val _connectionState = MutableStateFlow<ConnectionState>(ConnectionState.Idle)
     val connectionState: StateFlow<ConnectionState> = _connectionState
+
+    // [Android-патч] Уровень сигнала (RSSI) АКТИВНОГО соединения — для экрана «Настройки».
+    // BleDevice.rssi выше — это RSSI, пойманный ПРИ СКАНИРОВАНИИ (UC-01/UC-02), он теряет
+    // смысл сразу после подключения. Здесь — отдельное значение, которое обновляется по
+    // requestRssiRead() (см. ниже), пока есть активное GATT-соединение; сбрасывается в null
+    // при disconnect(), чтобы не показывать пользователю уровень сигнала от УЖЕ разорванного
+    // соединения как актуальный.
+    private val _signalStrengthDbm = MutableStateFlow<Int?>(null)
+    val signalStrengthDbm: StateFlow<Int?> = _signalStrengthDbm
 
     private var gattManager: MeterGattManager? = null
 
@@ -93,7 +103,11 @@ class MeterBleClient @Inject constructor(
     @SuppressLint("MissingPermission")
     suspend fun connect(device: BluetoothDevice) {
         _connectionState.value = ConnectionState.Connecting(device.address)
-        val manager = MeterGattManager(context) { state -> _connectionState.value = state }
+        val manager = MeterGattManager(
+            context,
+            onStateChanged = { state -> _connectionState.value = state },
+            onRssiRead = { rssi -> _signalStrengthDbm.value = rssi },
+        )
         gattManager = manager
         manager.connect(device)
             .retry(3, 200)
@@ -146,11 +160,31 @@ class MeterBleClient @Inject constructor(
     fun incomingBytes(): Flow<ByteArray> = gattManager?.incomingBytes
         ?: throw IllegalStateException("Not connected — call connect() first")
 
+    /**
+     * [Android-патч] Асинхронный запрос текущего RSSI активного GATT-соединения (см.
+     * signalStrengthDbm выше) — результат приходит в onRssiRead()/_signalStrengthDbm не сразу,
+     * а отдельным callback'ом от Nordic BLE library (как и остальные операции очереди GATT —
+     * writeRxCharacteristic() и т.п.). Ничего не делает, если сейчас нет соединения (gattManager
+     * == null) — вызывающий код (MeterRepositoryImpl) дёргает это на каждом цикле автообновления
+     * "на всякий случай", без проверки состояния связи.
+     */
+    @SuppressLint("MissingPermission")
+    fun requestRssiRead() {
+        // [Android-патч] readRssi() у самого BleManager (Nordic BLE library) — protected,
+        // наружу (сюда, в MeterBleClient) не виден — компилятор ругался "Cannot access
+        // 'readRssi': it is protected in 'MeterGattManager'". Поэтому дёргаем не его
+        // напрямую, а публичную обёртку requestRssi() ниже, которая живёт ВНУТРИ
+        // MeterGattManager (там protected-метод базового класса доступен) и репортит
+        // результат наружу через колбэк — тем же способом, что и onStateChanged.
+        gattManager?.requestRssi()
+    }
+
     @SuppressLint("MissingPermission")
     fun disconnect() {
         gattManager?.disconnect()?.enqueue()
         gattManager = null
         _connectionState.value = ConnectionState.Idle
+        _signalStrengthDbm.value = null
     }
 }
 
@@ -163,12 +197,76 @@ class MeterBleClient @Inject constructor(
 private class MeterGattManager(
     context: Context,
     private val onStateChanged: (ConnectionState) -> Unit,
+    private val onRssiRead: (Int) -> Unit,
 ) : BleManager(context) {
 
     private var rxCharacteristic: BluetoothGattCharacteristic? = null
     private var txCharacteristic: BluetoothGattCharacteristic? = null
 
     val incomingBytes = MutableStateFlow(ByteArray(0)) // TODO: заменить на SharedFlow с буфером при интеграции
+
+    init {
+        // [Android-патч] НАЙДЕН БАГ ("Соединение: Не подключено" при 100% реально рабочей связи):
+        // onStateChanged передавался в конструктор, но НИГДЕ не вызывался — поэтому _connectionState
+        // в MeterBleClient навсегда застревал на значении Connecting(...), выставленном в connect()
+        // ДО того, как GATT-соединение реально поднялось, и никогда не переходил в Connected. Экран
+        // «Настройки» смотрит именно на _connectionState — отсюда ложное "Не подключено", хотя весь
+        // остальной обмен данными (чтение буфера, RSSI и т.д.) на самом деле работает: он идёт
+        // напрямую через gattManager/incomingBytes, минуя _connectionState вовсе, поэтому баг был
+        // незаметен по функциональности — только по индикатору на экране «Настройки».
+        // Исправлено штатным способом Nordic BLE library — ConnectionObserver, который реально
+        // получает события GATT-соединения (в отличие от заглушки, которая просто хранила колбэк).
+        // Идентификатор в ConnectionState.Connected/Connecting — MAC-адрес устройства (device.address),
+        // как и было в исходном connect() — серийный номер счётчика на этот момент ещё не разобран
+        // (см. applyDeviceNameInfo() в MeterRepositoryImpl), а нигде в коде значение
+        // ConnectionState.Connected.serialNumber пока не читается (проверено — только
+        // "is ConnectionState.Connected" в SettingsScreen), так что смена идентификатора безопасна.
+        setConnectionObserver(object : ConnectionObserver {
+            override fun onDeviceConnecting(device: BluetoothDevice) {
+                onStateChanged(ConnectionState.Connecting(device.address))
+            }
+
+            override fun onDeviceConnected(device: BluetoothDevice) {
+                // GATT-уровень подключен, но сервисы/notify ещё не настроены (это делает
+                // initialize() ниже) — по-настоящему готово к обмену данными в onDeviceReady().
+            }
+
+            override fun onDeviceFailedToConnect(device: BluetoothDevice, reason: Int) {
+                Log.w("MeterGattManager", "onDeviceFailedToConnect: reason=$reason")
+                onStateChanged(ConnectionState.Error.Other("Не удалось подключиться (код $reason)"))
+            }
+
+            override fun onDeviceReady(device: BluetoothDevice) {
+                onStateChanged(ConnectionState.Connected(device.address))
+            }
+
+            override fun onDeviceDisconnecting(device: BluetoothDevice) {
+                // Ничего не переключаем здесь — дожидаемся onDeviceDisconnected(reason) ниже,
+                // там же будет и настоящая причина разрыва.
+            }
+
+            override fun onDeviceDisconnected(device: BluetoothDevice, reason: Int) {
+                // [Android-патч] Раньше НЕОЖИДАННЫЙ разрыв связи (устройство выключилось/ушло из
+                // радиуса действия) вообще никак не отражался в _connectionState — состояние так и
+                // оставалось "Connected" до следующего явного disconnect()/connect(). Теперь любой
+                // разрыв (в т.ч. непредвиденный) сразу переводит состояние в Idle.
+                Log.w("MeterGattManager", "onDeviceDisconnected: reason=$reason")
+                onStateChanged(ConnectionState.Idle)
+            }
+        })
+    }
+
+    /**
+     * [Android-патч] Публичная обёртка над readRssi() (см. MeterBleClient.requestRssiRead()) —
+     * сам readRssi() объявлен protected в базовом BleManager (Nordic BLE library) и виден
+     * только отсюда, изнутри подкласса, поэтому наружу его не отдать напрямую.
+     */
+    fun requestRssi() {
+        readRssi()
+            .with { _, rssi -> onRssiRead(rssi) }
+            .fail { _, status -> Log.w("MeterGattManager", "readRssi() не удался, status=$status") }
+            .enqueue()
+    }
 
     override fun log(priority: Int, message: String) {
         // Внутренние логи Nordic BLE library — обычно тут написана точная причина

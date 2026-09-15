@@ -7,6 +7,7 @@ import ru.rim.dd.core.model.MeterInfo
 import ru.rim.dd.core.model.NetworkParams
 import ru.rim.dd.core.model.Reading
 import ru.rim.dd.core.model.RelayState
+import ru.rim.dd.core.model.TamperState
 
 /**
  * Единственная точка доступа к данным ПУ для всего UI (ViewModel'и знают
@@ -15,6 +16,25 @@ import ru.rim.dd.core.model.RelayState
 interface MeterRepository {
 
     fun connectionState(): Flow<ConnectionState>
+
+    /**
+     * [Android-патч] Уровень сигнала (RSSI, дБм) активного BLE-соединения — для экрана
+     * «Настройки». В отличие от BleDevice.rssi (см. scanDevices()), который актуален только
+     * ВО ВРЕМЯ поиска устройства, это значение обновляется, пока соединение установлено (см.
+     * MeterBleClient.requestRssiRead()); null — соединения нет или ни одного успешного чтения
+     * ещё не было.
+     */
+    fun signalStrengthDbm(): Flow<Int?>
+
+    /**
+     * [Android-патч] UC-12 (частично) — закрыть текущее BLE-соединение, НЕ забывая прибор
+     * (в отличие от forgetDevice(), которая ещё и стирает его из DeviceStore). Для кнопки
+     * «Отключиться» на экране «Настройки»: пользователь просто хочет прервать сеанс связи
+     * (например, если пульт остаётся включён где-то поблизости и незачем держать сессию
+     * активной), а не разорвать сопряжение — переподключение потом снова возможно и по
+     * серийному номеру, и по адресу, как обычно.
+     */
+    suspend fun disconnect()
 
     // ---- UC-01 / UC-02 ----
     fun scanDevices(): Flow<BleDevice>
@@ -51,6 +71,14 @@ interface MeterRepository {
     fun relayState(): Flow<RelayState>
     suspend fun turnRelayOn()
     suspend fun turnRelayOff()
+
+    /**
+     * [Android-патч] Состояние пломб корпуса/клеммника, магнитного и СВЧ-датчиков, батареи и
+     * превышения лимита мощности — см. TamperState.kt и TAMPER_STATUS_OBIS в GetResponseParser.kt.
+     * Расшифровано из исходников прошивки самого пульта РиМ 040.40; приходит каждый цикл
+     * автообновления внутри уже читаемого буфера индикации, без отдельного запроса.
+     */
+    fun tamperState(): Flow<TamperState>
 
     // ---- UC-10 ----
     fun history(serialNumber: String): Flow<List<Reading>>

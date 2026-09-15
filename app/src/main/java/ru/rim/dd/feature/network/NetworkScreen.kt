@@ -17,6 +17,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
+import ru.rim.dd.core.model.RelaySource
 
 /**
  * Экран «Сеть» — соответствует макету wf3_network_relay.png из ТЗ. Помимо изначальных
@@ -50,7 +51,24 @@ fun NetworkScreen(viewModel: NetworkViewModel = hiltViewModel()) {
         }
 
         Text("Состояние реле", style = MaterialTheme.typography.titleMedium)
-        Text(if (relay.isOn) "ВКЛЮЧЕНО" else "ОТКЛЮЧЕНО")
+        // [Android-патч] см. историю диагностики: ПРЯМОЙ GET на output_state/control_state
+        // размыкателя (0.0.96.3.10.255) без DLMS-ассоциации возвращает отказ доступа (0x0D) —
+        // подтверждено на ДВУХ разных счётчиках. НО тот же control_state, как выяснилось, заодно
+        // приходит КАЖДЫЙ цикл автообновления внутри обычного буфера индикации (0.0.21.0.2.255,
+        // который мы и так читаем) — без всякой ассоциации (см. RELAY_CONTROL_STATE_OBIS в
+        // GetResponseParser.kt и применение в applyDecodedBuffer()/MeterRepositoryImpl). Поэтому
+        // source становится METER_READ уже на первом же успешном цикле после подключения — это
+        // САМОЕ достоверное значение (то же, которым руководствуется индикация самого пульта).
+        // source==UNKNOWN остаётся честным состоянием экрана ТОЛЬКО до первого такого цикла (или
+        // если сам буфер почему-то не разобрался) — чтобы не показать пользователю ложное
+        // "ОТКЛЮЧЕНО" вместо "мы ещё не знаем", что для силового оборудования недопустимо.
+        Text(
+            when {
+                relay.source == RelaySource.UNKNOWN -> "НЕИЗВЕСТНО (нет доступа на чтение)"
+                relay.isOn -> "ВКЛЮЧЕНО"
+                else -> "ОТКЛЮЧЕНО"
+            }
+        )
         Text("Лимит мощности: ${relay.powerLimitKw} кВт")
 
         countdown?.let { Text("Включение через: $it c") }

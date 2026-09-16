@@ -20,9 +20,17 @@ import ru.rim.dd.core.model.ConnectionState
 fun SettingsScreen(viewModel: SettingsViewModel = hiltViewModel()) {
     val connectionState by viewModel.connectionState.collectAsState()
     val signalStrengthDbm by viewModel.signalStrengthDbm.collectAsState()
-    // [Android-патч] Кнопка «Отключиться» и уровень сигнала имеют смысл, только пока есть
-    // активное BLE-соединение (см. disconnect()/signalStrengthDbm() в SettingsViewModel).
+    // [Android-патч] Уровень сигнала показываем только при реально активном соединении (см.
+    // disconnect()/signalStrengthDbm() в SettingsViewModel).
     val isConnected = connectionState is ConnectionState.Connected
+    // [Android-патч] см. ConnectionState.Reconnecting — механизм переподключения (MeterBleClient/
+    // MeterRepositoryImpl): после неожиданного разрыва связь автоматически восстанавливается сама,
+    // без участия пользователя, поэтому показываем это отдельным статусом, а не просто "Не подключено".
+    val isReconnecting = connectionState is ConnectionState.Reconnecting
+    // [Android-патч] Кнопку «Отключиться» держим доступной и во время Reconnecting — пользователь
+    // должен иметь возможность прервать ожидание автопереподключения и вручную уйти на экран
+    // «Подключение» выбрать другой прибор, а не ждать неопределённое время.
+    val canDisconnect = connectionState !is ConnectionState.Idle
 
     Column(
         modifier = Modifier.fillMaxSize().padding(16.dp),
@@ -37,12 +45,21 @@ fun SettingsScreen(viewModel: SettingsViewModel = hiltViewModel()) {
         //  реальные данные из MeterRepository (UC-10, UC-12).
 
         Text("Соединение", style = MaterialTheme.typography.titleMedium)
-        Text(if (isConnected) "Подключено" else "Не подключено")
+        Text(
+            when {
+                isConnected -> "Подключено"
+                isReconnecting -> "Переподключение..."
+                else -> "Не подключено"
+            }
+        )
         // [Android-патч] см. MeterRepository.signalStrengthDbm() — null, пока нет соединения
         // или ни одного успешного чтения RSSI ещё не было (сразу после подключения).
         if (isConnected) {
             Text(signalStrengthDbm?.let { "Уровень сигнала: $it дБм" } ?: "Уровень сигнала: —")
         }
-        Button(onClick = viewModel::disconnect, enabled = isConnected) { Text("Отключиться") }
+        // [Android-патч] см. canDisconnect выше — доступна и во время Reconnecting (прервать
+        // ожидание автопереподключения). После нажатия приложение само уведёт на экран
+        // «Подключение» (см. AppNavHost/ConnectionWatcherViewModel — реагируют на ConnectionState.Idle).
+        Button(onClick = viewModel::disconnect, enabled = canDisconnect) { Text("Отключиться") }
     }
 }

@@ -564,9 +564,20 @@ private:
 	/**
 	 * @brief Чтение ответа
 	 * @param[out] answer - содержимое ответа
+	 * @param check_raw_response - [Android-патч] см. .cpp — CheckRawResponse() смотрит
+	 *        байт answer[6], предполагая СТАНДАРТНЫЙ (двухбайтовые dest/src) HDLC-заголовок,
+	 *        где на этом месте лежит настоящий байт типа кадра (0x73=UA, 0x1F=DM, 0x97=FRMR).
+	 *        У "плоской" (однобайтовой dest/src) адресации, которую используют
+	 *        *FlatAddress()-методы, на месте answer[6] лежит МЛАДШИЙ БАЙТ HCS (контрольной
+	 *        суммы заголовка) — то есть практически случайное значение, зависящее от длины/
+	 *        адресов/поля control конкретного кадра. Передавайте false из кода, читающего
+	 *        ответ на *FlatAddress()-запрос — иначе примерно раз в 256 кадров (когда HCS
+	 *        случайно совпадёт с 0x1F) метод бросит ЛОЖНОЕ "Received DM message. Server is
+	 *        already disconnected" на совершенно нормальном, реальном ответе счётчика.
+	 *        По умолчанию true — сохраняет прежнее поведение для всех остальных вызовов.
 	 * @return - количество принятых байт
 	 */
-	unsigned long ReadResponse(std::vector<char> &answer);
+	unsigned long ReadResponse(std::vector<char> &answer, bool check_raw_response = true);
 
 	/**
 	 * @brief Отправление запроса на продолжение чтения данных (для длинных ответов)

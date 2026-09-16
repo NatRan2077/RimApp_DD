@@ -109,6 +109,92 @@ class MeterRepositoryImpl @Inject constructor(
      */
     private val protocolMutex = Mutex()
 
+    /**
+     * [Android-патч] Механизм переподключения — true с момента ПЕРВОГО успешного
+     * readAndApplyMainBuffer() (см. установку ниже) и до явного disconnect()/forgetDevice().
+     * Отличает "мы уже поднимали протокольный сеанс на этом устройстве хотя бы раз" от
+     * "только что запустили приложение/ещё не подключались" — нужно коллектору connectionState
+     * ниже, чтобы не пытаться restart-ить сеанс во время ПЕРВОГО подключения (там это уже
+     * делает connectByAddress()/connectBySerialNumber() сама, по порядку) — см. init{} ниже.
+     */
+    private var protocolSessionEstablished = false
+
+    /**
+     * [Android-патч] НАЙДЕНА причина нативного краша (SIGSEGV в SpodesClient::GetErrorMessage(),
+     * см. историю диагностики — "onDeviceDisconnected" сразу перед крашем): readAndApplyMainBuffer()
+     * вызывался ВНУТРИ protocolMutex.withLock, а вот spodes.destroyClient()/spodes.createClient() в
+     * disconnect()/forgetDevice()/reestablishProtocolSession() — СНАРУЖИ этого мьютекса. Если ровно
+     * в тот момент, когда автообновление (уже держащее мьютекс) застряло на блокирующем ЧТЕНИИ
+     * транспорта (см. 3-секундный таймаут в ble_transport.h), пользователь нажимал «Отключиться» —
+     * spodes.destroyClient() успевал обнулить nativeHandle ДО того, как застрявший вызов дочитывал
+     * ответ и обращался к spodes.lastErrorMessage() (или другим native-методам) — обращение шло по
+     * уже уничтоженному handle=0 → SIGSEGV, весь процесс убивало мгновенно (Fatal signal 11).
+     * Кэшируем сообщение об ошибке здесь, а не через повторный spodes.lastErrorMessage() СНАРУЖИ
+     * protocolMutex.withLock (см. вызовы ниже) — это устраняет тот же класс гонки и для читателей
+     * результата readAndApplyMainBuffer().
+     */
+    private var lastProtocolError: String? = null
+
+    /**
+     * [Android-патч] "Пакеты не уходят, а пишется что подключено" — по логам пользователя
+     * обнаружился отдельный, ранее незамеченный сценарий: счётчик отвечает HDLC-кадром DM
+     * ("Server is already disconnected") или байтами без LLC-заголовка ("не удалось разобрать
+     * DLMS-данные... не найден LLC-заголовок сервера") — то есть САМ СЧЁТЧИК считает логическую
+     * DLMS/HDLC-сессию разорванной, хотя физический GATT (и с ним ConnectionState.Connected)
+     * у Android остаётся рабочим сколь угодно долго. Обычный "неожиданный разрыв"
+     * (MeterBleClient.onDeviceDisconnected) в этом случае никогда не наступает сам по себе —
+     * раньше автообновление просто бесконечно долбило в мёртвый канал каждые
+     * AUTO_REFRESH_INTERVAL_MS, а UI всё это время честно (но неправильно по сути) показывал
+     * "Подключено". Считаем подряд идущие неудачные циклы readAndApplyMainBuffer() — и пустой
+     * ответ транспорта, и проваленный разбор DLMS одинаково считаются "неудачей" — а при
+     * достижении MAX_CONSECUTIVE_PROTOCOL_FAILURES принудительно рвём и поднимаем GATT-соединение
+     * заново (см. forceReconnect() в startAutoRefresh() ниже) — тем же путём восстановления, что
+     * и настоящий обрыв связи, с честным "Переподключение..." в UI. Сбрасывается в 0 при ЛЮБОМ
+     * успешно разобранном ответе.
+     */
+    private var consecutiveEmptyOrFailedReads = 0
+
+    /**
+     * [Android-патч] "После 3-х таких сообщений нужно повторять то же, что при самом первом
+     * подключении" — по свежему логу (12+ минут, десятки циклов forceReconnect()) выяснилось,
+     * что ОБЫЧНОЕ forceReconnect() (быстрый разрыв+подъём GATT) почти никогда само по себе не
+     * лечит зависшую DLMS-сессию: счётчик/пульт продолжают отвечать пустышками ИЛИ кадрами без
+     * LLC-заголовка раз за разом, даже сразу после свежего GATT-коннекта — реально успешных
+     * чтений за 12 минут было буквально 4 из полусотни попыток. Похоже, дело не в нашем
+     * GATT-канале (он поднимается за доли секунды), а в том, что радиосессия ПУЛЬТ↔СЧЁТЧИК
+     * (отдельный канал, живущий независимо от нашего BLE, см. собственные логи прошивки пульта
+     * про "Radio Error") не успевает пересобраться за это же время. Считаем, сколько ПОДРЯД
+     * ЦЕЛЫХ циклов forceReconnect() прошло БЕЗ единого успешно разобранного ответа — сбрасывается
+     * в 0 при любом успешном разборе (см. readAndApplyMainBuffer()). После
+     * COLD_RECONNECT_THRESHOLD таких циклов подряд просим MeterBleClient.forceReconnect(cold=true)
+     * — с паузой перед следующим connect(), имитируя более естественный (не мгновенный) разрыв,
+     * который, судя по логам, пульту нужен, чтобы самому переустановить связь со счётчиком.
+     */
+    private var consecutiveForceReconnectsWithoutData = 0
+
+    init {
+        // [Android-патч] Механизм переподключения. GATT-уровень переподключает сам Android BLE
+        // stack (см. MeterBleClient.handleDisconnected() — useAutoConnect(true)) — здесь только
+        // протокольная часть ПОВЕРХ него: как только связь неожиданно оборвалась, останавливаем
+        // "насос"/автообновление (не шлём GET на мёртвый линк), а когда GATT восстановится —
+        // пересобираем DLMS-сеанс с нуля (SpodesClient/HDLC/первое чтение буфера/автообновление),
+        // тем же кодом, что и при первом подключении.
+        repositoryScope.launch {
+            ble.unexpectedDisconnects.collect {
+                Log.w(TAG, "Обнаружен неожиданный разрыв связи — останавливаем протокольный обмен, ждём автопереподключения BLE")
+                stopTransportPump()
+            }
+        }
+        repositoryScope.launch {
+            ble.connectionState.collect { state ->
+                if (state is ConnectionState.Connected && pumpJob?.isActive != true && protocolSessionEstablished) {
+                    Log.d(TAG, "BLE-соединение восстановлено (автопереподключение) — пересобираем протокольный сеанс")
+                    reestablishProtocolSession()
+                }
+            }
+        }
+    }
+
     override fun connectionState(): Flow<ConnectionState> = ble.connectionState
 
     // [Android-патч] см. signalStrengthDbm() в MeterRepository.kt.
@@ -125,7 +211,12 @@ class MeterRepositoryImpl @Inject constructor(
         if (!connected) {
             stopTransportPump()
             ble.disconnect()
-            throw IllegalStateException(spodes.lastErrorMessage())
+            // [Android-патч] см. lastProtocolError выше — берём сообщение, УЖЕ закэшированное
+            // readAndApplyMainBuffer() ПОКА он ещё держал protocolMutex, а не отдельным
+            // spodes.lastErrorMessage() здесь (после stopTransportPump()/ble.disconnect() выше это
+            // было бы обращением к нативному клиенту вне мьютекса — тот же класс гонки, что уронил
+            // процесс, см. комментарий у lastProtocolError).
+            throw IllegalStateException(lastProtocolError ?: "неизвестная ошибка")
         }
         // Сбрасываем ПЕРЕД разбором имени — иначе, если разбор не удастся (deviceName == null или
         // не подходит под формат), activeSerialNumber мог бы остаться от ПРЕДЫДУЩЕГО подключения
@@ -255,21 +346,42 @@ class MeterRepositoryImpl @Inject constructor(
             destAddress = 0x03,
             srcAddress = 0x43,
         )
-        if (!sent) return false
+        if (!sent) {
+            // [Android-патч] см. lastProtocolError выше — читаем сообщение ЗДЕСЬ, пока функция
+            // ещё выполняется внутри protocolMutex.withLock (это гарантирует вызывающий код), а не
+            // отдельным spodes.lastErrorMessage() снаружи лока, где он мог бы попасть на уже
+            // уничтоженный nativeHandle.
+            lastProtocolError = spodes.lastErrorMessage()
+            consecutiveEmptyOrFailedReads++ // см. consecutiveEmptyOrFailedReads выше
+            return false
+        }
 
         val raw = spodes.getResponseRawBytes()
         if (raw.isEmpty()) {
-            Log.w(TAG, "GET-response: пустой ответ от транспорта (${spodes.lastErrorMessage()})")
-            return true // соединение по BLE рабочее, просто нет данных для парсинга — не рвём коннект
+            lastProtocolError = spodes.lastErrorMessage()
+            consecutiveEmptyOrFailedReads++ // см. consecutiveEmptyOrFailedReads выше — например, DM-кадр "Server is already disconnected"
+            Log.w(TAG, "GET-response: пустой ответ от транспорта ($lastProtocolError, подряд неудач: $consecutiveEmptyOrFailedReads)")
+            return true // соединение по BLE рабочее (формально), просто нет данных для парсинга — не рвём коннект ЗДЕСЬ; см. счётчик выше
         }
+        // [Android-патч] см. protocolSessionEstablished выше — отмечаем это ЗДЕСЬ, а не в
+        // connectByAddress()/connectBySerialNumber(), потому что readAndApplyMainBuffer() — общая
+        // точка и для первого подключения, и для восстановления сеанса после переподключения
+        // (см. reestablishProtocolSession() ниже), и именно успешный ответ транспорта (а не что-то
+        // из вызывающего кода) — надёжный признак "сеанс реально поднялся".
+        protocolSessionEstablished = true
         try {
             val all = parseGetResponseTariffs(raw)
             Log.d(TAG, "GET-response: разобрано ${all.size} элементов буфера: $all")
             applyDecodedBuffer(all)
+            consecutiveEmptyOrFailedReads = 0 // см. consecutiveEmptyOrFailedReads выше — реально получили и разобрали данные
+            consecutiveForceReconnectsWithoutData = 0 // см. consecutiveForceReconnectsWithoutData выше — тем же событием: раз данные реально разобрались, "холодная" эскалация больше не нужна
         } catch (ex: Exception) {
             // Не рвём соединение из-за ошибки разбора — само GET-request/response уже сработало,
             // а формат ответа для другого OBIS-кода может отличаться и потребовать доработки парсера.
-            Log.e(TAG, "GET-response: не удалось разобрать DLMS-данные: ${ex.message}", ex)
+            // [Android-патч] но считаем как неудачу для consecutiveEmptyOrFailedReads выше — именно
+            // так на практике выглядит десинхронизация DLMS-сессии ("не найден LLC-заголовок сервера").
+            consecutiveEmptyOrFailedReads++
+            Log.e(TAG, "GET-response: не удалось разобрать DLMS-данные: ${ex.message} (подряд неудач: $consecutiveEmptyOrFailedReads)", ex)
         }
 
         // [Android-патч] readFirmwareVersion() ВРЕМЕННО не вызывается — этот и любой другой OBIS,
@@ -720,7 +832,8 @@ class MeterRepositoryImpl @Inject constructor(
         if (!connected) {
             stopTransportPump()
             ble.disconnect()
-            throw IllegalStateException(spodes.lastErrorMessage())
+            // [Android-патч] см. lastProtocolError выше — тот же приём, что и в connectByAddress().
+            throw IllegalStateException(lastProtocolError ?: "неизвестная ошибка")
         }
         // Реальное имя найденного устройства (found.name) — приоритетнее введённого пользователем
         // serialNumber: из него разбираются и модель, и серийный (см. applyDeviceNameInfo()).
@@ -783,7 +896,42 @@ class MeterRepositoryImpl @Inject constructor(
             while (true) {
                 delay(AUTO_REFRESH_INTERVAL_MS)
                 val ok = protocolMutex.withLock { withContext(Dispatchers.IO) { readAndApplyMainBuffer() } }
-                if (!ok) Log.w(TAG, "Автообновление: GET-запрос не удался (${spodes.lastErrorMessage()})")
+                // [Android-патч] см. lastProtocolError выше — НЕ повторный spodes.lastErrorMessage()
+                // здесь (после освобождения protocolMutex.withLock) — та самая гонка, что уронила
+                // процесс: пока этот вызов ждал ответ, «Отключиться» мог успеть уничтожить нативный
+                // клиент, и повторное обращение к нему упало бы в SIGSEGV.
+                if (!ok) Log.w(TAG, "Автообновление: GET-запрос не удался ($lastProtocolError)")
+                // [Android-патч] см. consecutiveEmptyOrFailedReads выше — "пакеты не уходят, а
+                // пишется что подключено": счётчик мог счесть DLMS/HDLC-сессию мёртвой (DM-кадр
+                // "Server is already disconnected" или ответы без LLC-заголовка), при этом Android
+                // ВСЁ ЕЩЁ считает GATT-соединение рабочим — обычный "неожиданный разрыв" тут сам
+                // по себе никогда не наступит, автообновление так и будет долбить в мёртвый канал
+                // бесконечно. После нескольких подряд неудачных циклов принудительно рвём и заново
+                // поднимаем GATT-соединение — тем же путём восстановления, что и настоящий обрыв
+                // связи (см. MeterBleClient.forceReconnect()), с честным "Переподключение..." в UI.
+                // Останавливаем ЭТОТ ЖЕ job прямо здесь (return@launch), а не ждём, пока
+                // stopTransportPump() из коллектора unexpectedDisconnects в init{} доедет до
+                // отмены — избегаем гонки "автообновление успело послать ещё один GET, пока
+                // разрыв только готовится".
+                if (consecutiveEmptyOrFailedReads >= MAX_CONSECUTIVE_PROTOCOL_FAILURES) {
+                    consecutiveEmptyOrFailedReads = 0
+                    consecutiveForceReconnectsWithoutData++
+                    // [Android-патч] см. consecutiveForceReconnectsWithoutData выше — если и
+                    // ПРЕДЫДУЩИЕ COLD_RECONNECT_THRESHOLD полных цикла forceReconnect() подряд не
+                    // дали ни одного успешно разобранного ответа, обычное (быстрое) переподключение
+                    // явно не помогает — просим MeterBleClient «холодное» переподключение с паузой
+                    // перед следующим connect(), а не долбим GATT ещё быстрее.
+                    val cold = consecutiveForceReconnectsWithoutData >= COLD_RECONNECT_THRESHOLD
+                    if (cold) consecutiveForceReconnectsWithoutData = 0
+                    Log.w(
+                        TAG,
+                        "Автообновление: $MAX_CONSECUTIVE_PROTOCOL_FAILURES неудачных циклов подряд — " +
+                                "считаем DLMS-сессию разорванной при формально рабочем GATT, принудительно " +
+                                "переподключаемся" + if (cold) " (холодное переподключение — обычное не помогало $COLD_RECONNECT_THRESHOLD раз подряд)" else "",
+                    )
+                    ble.forceReconnect(cold = cold)
+                    return@launch
+                }
                 // [Android-патч] см. signalStrengthDbm() в MeterRepository.kt — попутно, тем же
                 // циклом (отдельный таймер не нужен): читаем RSSI активного соединения, чтобы
                 // экран «Настройки» показывал живой уровень сигнала, а не значение со сканирования.
@@ -795,6 +943,87 @@ class MeterRepositoryImpl @Inject constructor(
     private fun stopAutoRefresh() {
         autoRefreshJob?.cancel()
         autoRefreshJob = null
+    }
+
+    /**
+     * [Android-патч] Механизм переподключения — пересборка протокольного сеанса ПОСЛЕ того, как
+     * Android BLE stack сам восстановил GATT-соединение (см. init{}/MeterBleClient.
+     * unexpectedDisconnects выше). Ровно тот же порядок действий, что и в хвосте
+     * connectByAddress()/connectBySerialNumber() при первом подключении, но БЕЗ повторного
+     * BLE-поиска устройства и без повторного разбора имени (модель/серийный уже известны).
+     *
+     * spodes.destroyClient() перед createClient() — как и в disconnect() ниже: счётчик сбрасывает
+     * свою HDLC-нумерацию кадров на новой BLE-сессии (см. комментарий у readFirmwareVersion() про
+     * send/receive sequence number), поэтому и наш клиент не должен тащить состояние старого
+     * DLMS-сеанса поверх нового физического соединения.
+     *
+     * [Android-патч] НАЙДЕНА причина реального нативного краша (SIGSEGV в SpodesClient::
+     * GetErrorMessage(), см. lastProtocolError выше) — destroyClient()/createClient() здесь
+     * раньше вызывались СНАРУЖИ protocolMutex, а autoRefreshJob держит этот же мьютекс всё время
+     * своего readAndApplyMainBuffer() (включая блокирующее ожидание ответа транспорта, до 3 с).
+     * Если разрыв связи происходил прямо в этот момент, spodes.destroyClient() успевал обнулить
+     * nativeHandle ДО того, как застрявший вызов дочитывал ответ и обращался к native-методам —
+     * обращение по уже уничтоженному handle=0 роняло процесс мгновенно. Оборачиваем оба вызова в
+     * тот же protocolMutex.withLock — теперь destroyClient() гарантированно ДОЖДЁТСЯ, пока текущий
+     * (если он есть) readAndApplyMainBuffer() полностью освободит мьютекс, прежде чем уничтожить
+     * клиент из-под него.
+     */
+    private fun reestablishProtocolSession() {
+        repositoryScope.launch {
+            try {
+                // [Android-патч] НАЙДЕНА причина затяжного цикла "переподключились — тут же
+                // снова не найден LLC-заголовок — переподключились — снова..." (по свежим логам:
+                // после forceReconnect()/реального разрыва GATT поднимался почти мгновенно, за
+                // 50-150 мс, но САМЫЙ ПЕРВЫЙ GET сразу после этого почти гарантированно проваливался
+                // — то есть проблема не в скорости GATT-реконнекта, а в том, что счётчик просто ещё
+                // не готов принимать новый SNRM сразу после резкого обрыва предыдущей HDLC-сессии).
+                // Небольшая пауза здесь — до открытия HDLC-канала заново — даёт счётчику время
+                // "остыть" после разрыва; RECONNECT_SETTLE_DELAY_MS подобрана с запасом, но не в
+                // ущерб отзывчивости (пользователь и так уже видит "Переподключение..." в UI).
+                delay(RECONNECT_SETTLE_DELAY_MS)
+                protocolMutex.withLock {
+                    withContext(Dispatchers.IO) {
+                        spodes.destroyClient()
+                        spodes.createClient()
+                    }
+                }
+                startTransportPump()
+                withContext(Dispatchers.IO) { establishHdlcChannel() }
+                val connected = protocolMutex.withLock { withContext(Dispatchers.IO) { readAndApplyMainBuffer() } }
+                // [Android-патч] НАЙДЕНА, похоже, ГЛАВНАЯ причина жалобы "подключено, а данные не
+                // идут" (см. свежий лог: после переподключения счётчик/пульт несколько циклов
+                // подряд отвечает только короткими служебными HDLC-кадрами (RR), без реальных
+                // данных, — readAndApplyMainBuffer() в этом случае всё равно возвращает
+                // connected=true, см. её комментарий про "пустой ответ от транспорта — не рвём
+                // коннект ЗДЕСЬ"). Раньше startAutoRefresh() запускался ТОЛЬКО в ветке
+                // connected == true. Но connected == false здесь означает не "счётчик молчит",
+                // а конкретно "сам getRequestFlatAddress() не смог отправить кадр" (транспорт
+                // мёртв на уровне нативного клиента) — и раньше в этом случае автообновление
+                // НЕ запускалось вообще. То есть если самый первый GET после реконнекта не
+                // ушёл, автообновление больше НИКОГДА не запускалось само — BLE оставался
+                // «подключён», а опрос счётчика останавливался навсегда, до ручного
+                // вмешательства (кнопка «Обновить» или ручное отключение/подключение). Теперь
+                // запускаем автообновление в ОБОИХ случаях: если транспорт всё же жив, но
+                // счётчик пока отвечает только служебными кадрами — автообновление само
+                // подхватит и разберёт данные, как только счётчик отойдёт (это уже наблюдалось
+                // в логах — через один-два цикла по 5 с реальные данные начинали приходить).
+                // Если же транспорт действительно мёртв — тот же MAX_CONSECUTIVE_PROTOCOL_FAILURES
+                // внутри автообновления быстро это увидит и сам вызовет ble.forceReconnect()
+                // заново, вместо вечного "тихого" простоя.
+                startAutoRefresh()
+                if (connected) {
+                    Log.d(TAG, "Протокольный сеанс восстановлен после автопереподключения")
+                } else {
+                    Log.w(
+                        TAG,
+                        "Восстановление сеанса: первый GET-запрос не удался ($lastProtocolError) — " +
+                                "автообновление всё равно запущено и будет повторять попытки",
+                    )
+                }
+            } catch (ex: Exception) {
+                Log.e(TAG, "Восстановление сеанса после автопереподключения не удалось: ${ex.message}", ex)
+            }
+        }
     }
 
     override fun readings(): Flow<List<Reading>> = _readings.asStateFlow()
@@ -817,7 +1046,11 @@ class MeterRepositoryImpl @Inject constructor(
         protocolMutex.withLock {
             withContext(Dispatchers.IO) {
                 val ok = readAndApplyMainBuffer()
-                if (!ok) Log.w(TAG, "refreshReadings(): GET-запрос не удался (${spodes.lastErrorMessage()})")
+                // [Android-патч] см. lastProtocolError выше — тут (в отличие от startAutoRefresh())
+                // повторный spodes.lastErrorMessage() формально ещё был бы безопасен (мы всё ещё
+                // внутри protocolMutex.withLock), но используем закэшированное значение для
+                // единообразия и чтобы не дёргать native лишний раз без необходимости.
+                if (!ok) Log.w(TAG, "refreshReadings(): GET-запрос не удался ($lastProtocolError)")
             }
         }
     }
@@ -950,29 +1183,52 @@ class MeterRepositoryImpl @Inject constructor(
             }
         }
 
+    // [Android-патч] НАЙДЕНА причина реального нативного краша на устройстве пользователя (SIGSEGV
+    // в SpodesClient::GetErrorMessage() сразу после "onDeviceDisconnected" в логе) — spodes.
+    // destroyClient() здесь вызывался СНАРУЖИ protocolMutex, а readAndApplyMainBuffer() (запускается
+    // автообновлением каждые AUTO_REFRESH_INTERVAL_MS) держит этот мьютекс на всё время своего
+    // выполнения, включая блокирующее ожидание ответа транспорта (до 3 с, см. ble_transport.h).
+    // Если пользователь нажимал «Отключиться» ИМЕННО в этот момент, destroyClient() успевал обнулить
+    // nativeHandle ДО того, как застрявший вызов дочитывал ответ и обращался к native-методам —
+    // обращение по уже уничтоженному handle=0 роняло процесс мгновенно (Fatal signal 11, весь
+    // процесс, не просто исключение). См. подробный разбор у lastProtocolError выше. Оборачиваем
+    // destroyClient() в тот же protocolMutex — теперь он гарантированно ДОЖДЁТСЯ, пока текущий (если
+    // он есть) readAndApplyMainBuffer() полностью освободит мьютекс, прежде чем уничтожить клиент
+    // из-под него.
     override suspend fun forgetDevice(serialNumber: String) {
         deviceStore.forget(serialNumber)
         if (activeSerialNumber == serialNumber) {
             stopTransportPump()
-            spodes.destroyClient()
+            protocolMutex.withLock { withContext(Dispatchers.IO) { spodes.destroyClient() } }
             ble.disconnect()
             activeSerialNumber = null
+            protocolSessionEstablished = false
+            consecutiveEmptyOrFailedReads = 0
         }
     }
 
     // [Android-патч] см. disconnect() в MeterRepository.kt — то же самое, что и внутри
     // forgetDevice() выше (останавливаем "насос"/автообновление, уничтожаем DLMS-клиент,
     // рвём BLE-соединение), но БЕЗ deviceStore.forget() — прибор остаётся сопряжённым.
+    // [Android-патч] protocolSessionEstablished = false — иначе коллектор connectionState в init{}
+    // принял бы следующее ЯВНОЕ подключение (уже к другому прибору с экрана «Подключение», см.
+    // AppNavHost/ConnectionWatcherViewModel) за "восстановление после разрыва" и попытался бы
+    // пересобрать сеанс ДВАЖДЫ параллельно с connectByAddress()/connectBySerialNumber().
+    // [Android-патч] см. комментарий у forgetDevice() выше — та же самая гонка/фикс: destroyClient()
+    // теперь ждёт protocolMutex, а не вызывается напрямую поверх ещё выполняющегося
+    // readAndApplyMainBuffer().
     override suspend fun disconnect() {
         stopTransportPump()
-        spodes.destroyClient()
+        protocolMutex.withLock { withContext(Dispatchers.IO) { spodes.destroyClient() } }
         ble.disconnect()
         activeSerialNumber = null
+        protocolSessionEstablished = false
+        consecutiveEmptyOrFailedReads = 0
     }
 
     companion object {
         /** Пульты РиМ 040.40 рекламируются в эфире как "RIM ..." — фильтр скана/поиска по имени. */
-        private const val BLE_NAME_PREFIX = "RIM"
+        private const val BLE_NAME_PREFIX = "AKROS"
 
         // См. комментарий у establishHdlcChannel(): 16 подтверждено кодом, 1/1 — предположение.
         private const val HDLC_SOURCE_ADDRESS = 16
@@ -983,6 +1239,37 @@ class MeterRepositoryImpl @Inject constructor(
 
         /** [Android-патч] Интервал автообновления — см. startAutoRefresh(). */
         private const val AUTO_REFRESH_INTERVAL_MS = 5_000L
+
+        /**
+         * [Android-патч] см. consecutiveEmptyOrFailedReads выше — сколько подряд неудачных циклов
+         * автообновления (пустой ответ ИЛИ ошибка разбора DLMS) считаем признаком того, что
+         * DLMS/HDLC-сессия умерла, хотя GATT формально ещё "подключён". 3 цикла × 5 с = 15 с —
+         * достаточно, чтобы не дёргаться на единичный транспортный сбой (они бывают и сами
+         * проходят), но и не оставлять пользователя надолго с мёртвым "Подключено".
+         */
+        private const val MAX_CONSECUTIVE_PROTOCOL_FAILURES = 3
+
+        /**
+         * [Android-патч] см. consecutiveForceReconnectsWithoutData выше — сколько ПОЛНЫХ циклов
+         * forceReconnect() подряд (каждый — это уже MAX_CONSECUTIVE_PROTOCOL_FAILURES неудач сам
+         * по себе, то есть COLD_RECONNECT_THRESHOLD=3 здесь — это ещё примерно 3×15 с ≈ 45 с
+         * обычных попыток) должны пройти БЕЗ единого успешного чтения, прежде чем просить
+         * MeterBleClient «холодное» переподключение вместо обычного. Само число — по аналогии с
+         * MAX_CONSECUTIVE_PROTOCOL_FAILURES, подбиралось не научно: даёт обычному быстрому
+         * реконнекту разумный шанс сработать (как это иногда и происходило в логах), но не
+         * заставляет пользователя ждать минутами, если обычный способ явно не работает.
+         */
+        private const val COLD_RECONNECT_THRESHOLD = 3
+
+        /**
+         * [Android-патч] см. reestablishProtocolSession() выше — пауза перед пересборкой
+         * DLMS/HDLC-сессии после того, как GATT-соединение восстановилось (переподключение или
+         * forceReconnect()). Даёт счётчику время "остыть" после резкого обрыва предыдущей
+         * HDLC-сессии, прежде чем слать новый SNRM — без неё новый SNRM почти гарантированно
+         * приходил слишком рано и сессия тут же разваливалась опять ("не найден LLC-заголовок"),
+         * см. историю диагностики цикла forceReconnect() каждые ~12-15 с без единого успеха.
+         */
+        private const val RECONNECT_SETTLE_DELAY_MS = 1_500L
 
         /**
          * [Android-патч] см. applyDecodedBuffer() — кандидаты OBIS для версии ПО, если она

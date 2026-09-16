@@ -1,7 +1,6 @@
 package ru.rim.dd.navigation
 
 import androidx.compose.foundation.layout.padding
-import androidx.compose.runtime.getValue
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.List
@@ -12,13 +11,18 @@ import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
+import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.navigation.NavDestination.Companion.hierarchy
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
+import ru.rim.dd.core.model.ConnectionState
 import ru.rim.dd.feature.info.InfoScreen
 import ru.rim.dd.feature.network.NetworkScreen
 import ru.rim.dd.feature.pairing.PairingScreen
@@ -52,6 +56,15 @@ fun AppNavHost() {
     val backStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = backStackEntry?.destination?.route
     val showBottomBar = currentRoute != Routes.PAIRING
+    val connectionWatcher: ConnectionWatcherViewModel = hiltViewModel()
+    val connectionState by connectionWatcher.connectionState.collectAsState()
+    LaunchedEffect(connectionState, currentRoute) {
+        if (connectionState is ConnectionState.Idle && currentRoute != null && currentRoute != Routes.PAIRING) {
+            navController.navigate(Routes.PAIRING) {
+                popUpTo(navController.graph.findStartDestination().id) { inclusive = true }
+            }
+        }
+    }
 
     Scaffold(
         bottomBar = {

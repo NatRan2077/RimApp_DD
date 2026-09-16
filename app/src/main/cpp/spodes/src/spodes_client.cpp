@@ -147,7 +147,7 @@ bool SpodesClient::SetNormalResponseMode (const ConnectionAddresses &addr, const
     return true;
 }
 
-unsigned long SpodesClient::ReadResponse (std::vector<char> &answer)
+unsigned long SpodesClient::ReadResponse (std::vector<char> &answer, bool check_raw_response)
 {
     unsigned long result_size = transport_->ReadData(answer.data(), max_length_);
     std::vector<uint8_t> message(answer.begin(), answer.begin() + result_size);
@@ -172,7 +172,11 @@ unsigned long SpodesClient::ReadResponse (std::vector<char> &answer)
     if (result_size > 0)
         ++receive_sequence_number_;
     ServiceFunctions serv_funcs;
-    serv_funcs.CheckRawResponse(result_size, answer);
+    // [Android-патч] см. объяснение параметра в spodes_client.h — при "плоской" адресации
+    // answer[6] НЕ является байтом типа кадра, поэтому вызывающий код (GetResponseRaw() и
+    // её цикл дочитывания сегментов) передаёт check_raw_response=false.
+    if (check_raw_response)
+        serv_funcs.CheckRawResponse(result_size, answer);
     return result_size;
 }
 
@@ -741,7 +745,10 @@ bool SpodesClient::EstablishConnectionResponseRaw (std::vector<uint8_t> &respons
     std::vector<char> answer(max_length_, 0);
     try
     {
-        unsigned long result_size = ReadResponse(answer);
+        // [Android-патч] check_raw_response=false — ответ на EstablishConnectionRequestFlatAddress()
+        // тоже использует "плоскую" (однобайтовую) адресацию, см. объяснение у ReadResponse()
+        // в spodes_client.h и у GetResponseRaw() выше.
+        unsigned long result_size = ReadResponse(answer, false);
         response.resize(result_size);
         for (unsigned long i = 0; i < result_size; i++)
             response[i] = static_cast<uint8_t>(answer[i]);
@@ -759,7 +766,14 @@ bool SpodesClient::GetResponseRaw (std::vector<uint8_t> &response)
     std::vector<char> answer(max_length_, 0);
     try
     {
-        unsigned long result_size = ReadResponse(answer);
+        // [Android-патч] check_raw_response=false — см. подробное объяснение в
+        // spodes_client.h у ReadResponse(). У "плоской" адресации answer[6] — это младший
+        // байт HCS, а не байт типа кадра; без этого флага CheckRawResponse() примерно
+        // раз в 256 РЕАЛЬНЫХ, корректных ответов счётчика ложно бросал "Received DM
+        // message. Server is already disconnected" только потому, что HCS случайно
+        // совпал с 0x1F — именно это, судя по всему, было источником заметной части
+        // "разрывов", из-за которых включался forceReconnect().
+        unsigned long result_size = ReadResponse(answer, false);
         if (result_size == 0)
         {
             // Пустой ответ от транспорта (таймаут) — отдаём как есть, без фиктивного "хвоста"
@@ -804,7 +818,9 @@ bool SpodesClient::GetResponseRaw (std::vector<uint8_t> &response)
             if (!SendReadyToReceiveFlatAddress())
                 break;
             std::vector<char> next(max_length_, 0);
-            unsigned long next_size = ReadResponse(next);
+            // [Android-патч] check_raw_response=false — тот же сегмент "плоского" ответа,
+            // та же причина, что и у первого ReadResponse() выше в этом методе.
+            unsigned long next_size = ReadResponse(next, false);
             if (next_size < 11)
                 break;
             std::vector<uint8_t> segment(next_size);

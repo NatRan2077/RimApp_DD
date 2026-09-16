@@ -15,6 +15,14 @@ import ru.rim.dd.core.model.TamperState
  */
 interface MeterRepository {
 
+    /**
+     * [Android-патч] см. ConnectionState.Reconnecting — после НЕОЖИДАННОГО разрыва связи (прибор
+     * вне радиуса действия/выключен) эмитит Reconnecting, пока Android BLE stack сам не восстановит
+     * GATT-соединение (autoConnect=true, см. MeterBleClient) и не пересоберётся протокольный сеанс
+     * (см. MeterRepositoryImpl.reestablishProtocolSession()) — без участия пользователя. А вот
+     * переход в Idle (явное disconnect() ниже) — сигнал для AppNavHost/ConnectionWatcherViewModel
+     * увести пользователя на экран «Подключение».
+     */
     fun connectionState(): Flow<ConnectionState>
 
     /**

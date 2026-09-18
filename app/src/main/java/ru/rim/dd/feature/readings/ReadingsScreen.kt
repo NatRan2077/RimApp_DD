@@ -19,6 +19,7 @@ import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import ru.rim.dd.core.model.EnergyCategory
 import ru.rim.dd.core.model.Reading
+import ru.rim.dd.feature.common.ObisCaption
 
 /** Порядок карточек на экране — активная энергия сначала, реактивная и «прочее» — следом. */
 private val CATEGORY_ORDER = listOf(
@@ -77,7 +78,12 @@ fun ReadingsScreen(viewModel: ReadingsViewModel = hiltViewModel()) {
 @Composable
 private fun EnergyCategoryCard(category: EnergyCategory, items: List<Reading>) {
     val unit = categoryUnit(category)
-    val total = items.firstOrNull { it.tariff == null }?.valueKwh ?: items.sumOf { it.valueKwh }
+    // [Android-патч] см. ObisCaption — теперь нужно не только значение суммы, но и сам объект,
+    // из которого она взята, чтобы подписать его OBIS-кодом. Поэтому суммарное показание
+    // ищется как Reading (а не просто число): если «итогового» объекта (тариф = 0) в буфере
+    // нет, подписывать нечего — тогда, как и раньше, показываем сумму по тарифам без подписи.
+    val totalReading = items.firstOrNull { it.tariff == null }
+    val total = totalReading?.valueKwh ?: items.sumOf { it.valueKwh }
     val byTariff = items.filter { it.tariff != null }.sortedBy { it.tariff }
 
     Card(modifier = Modifier.fillMaxWidth()) {
@@ -87,8 +93,10 @@ private fun EnergyCategoryCard(category: EnergyCategory, items: List<Reading>) {
         ) {
             Text(categoryTitle(category), style = MaterialTheme.typography.titleMedium)
             Text("Всего: ${"%.3f".format(total)} $unit", style = MaterialTheme.typography.titleLarge)
+            totalReading?.let { ObisCaption(it.obisId) }
             byTariff.forEach { r ->
                 Text("Т${r.tariff}: ${"%.3f".format(r.valueKwh)} $unit", style = MaterialTheme.typography.bodyMedium)
+                ObisCaption(r.obisId)
             }
         }
     }

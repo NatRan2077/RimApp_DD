@@ -17,7 +17,20 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
+import ru.rim.dd.core.dlms.RELAY_CONTROL_STATE_OBIS
 import ru.rim.dd.core.model.RelaySource
+import ru.rim.dd.feature.common.ObisCaption
+
+// [Android-патч] OBIS-коды показываемых здесь величин — ровно те, по которым значения
+// читаются в MeterRepositoryImpl.applyDecodedBuffer(). Вынесены в константы, чтобы подпись
+// на экране и источник данных нельзя было случайно рассинхронизировать.
+private const val OBIS_VOLTAGE = "1.0.12.7.0.255"
+private const val OBIS_CURRENT = "1.0.11.7.0.255"
+private const val OBIS_NEUTRAL_CURRENT = "1.0.91.7.0.255"
+private const val OBIS_ACTIVE_POWER = "1.0.1.7.0.255"
+private const val OBIS_REACTIVE_POWER = "1.0.3.7.0.255"
+private const val OBIS_APPARENT_POWER = "1.0.9.7.0.255"
+private const val OBIS_FREQUENCY = "1.0.14.7.0.255"
 
 /**
  * Экран «Сеть» — соответствует макету wf3_network_relay.png из ТЗ. Помимо изначальных
@@ -38,15 +51,37 @@ fun NetworkScreen(viewModel: NetworkViewModel = hiltViewModel()) {
         Text("Параметры сети", style = MaterialTheme.typography.headlineSmall)
         Button(onClick = { viewModel.refresh() }) { Text("Обновить") }
 
+        // [Android-патч] см. ObisCaption — под каждой величиной её объект из паспорта прибора
+        // и точный OBIS-код. Коды здесь не «по стандарту», а те самые, по которым значение
+        // реально достаётся из буфера индикации в MeterRepositoryImpl.applyDecodedBuffer():
+        // напряжение и ток у этого прибора лежат под НЕСТАНДАРТНЫМИ кодами (1.0.12.7.0.255 и
+        // 1.0.11.7.0.255 вместо привычных 1.0.32.7.0.255 / 1.0.31.7.0.255), поэтому коды
+        // продублированы здесь как константы рядом с местом показа — если в applyDecodedBuffer()
+        // источник когда-нибудь поменяется, подпись обязана поменяться вместе с ним.
         Card(modifier = Modifier.fillMaxWidth()) {
             Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text("Напряжение: ${"%.2f".format(params.voltage.total)} В")
+                ObisCaption(OBIS_VOLTAGE)
                 Text("Ток: ${"%.3f".format(params.current.total)} А")
-                params.neutralCurrentA?.let { Text("Ток нейтрали: ${"%.3f".format(it)} А") }
+                ObisCaption(OBIS_CURRENT)
+                params.neutralCurrentA?.let {
+                    Text("Ток нейтрали: ${"%.3f".format(it)} А")
+                    ObisCaption(OBIS_NEUTRAL_CURRENT)
+                }
                 Text("Активная мощность: ${"%.3f".format(params.power.total)} кВт")
-                params.reactivePowerKvar?.let { Text("Реактивная мощность: ${"%.3f".format(it)} квар") }
-                params.apparentPowerKva?.let { Text("Полная мощность: ${"%.3f".format(it)} кВА") }
-                params.frequencyHz?.let { Text("Частота: ${"%.2f".format(it)} Гц") }
+                ObisCaption(OBIS_ACTIVE_POWER)
+                params.reactivePowerKvar?.let {
+                    Text("Реактивная мощность: ${"%.3f".format(it)} квар")
+                    ObisCaption(OBIS_REACTIVE_POWER)
+                }
+                params.apparentPowerKva?.let {
+                    Text("Полная мощность: ${"%.3f".format(it)} кВА")
+                    ObisCaption(OBIS_APPARENT_POWER)
+                }
+                params.frequencyHz?.let {
+                    Text("Частота: ${"%.2f".format(it)} Гц")
+                    ObisCaption(OBIS_FREQUENCY)
+                }
             }
         }
 
@@ -69,6 +104,10 @@ fun NetworkScreen(viewModel: NetworkViewModel = hiltViewModel()) {
                 else -> "ОТКЛЮЧЕНО"
             }
         )
+        // [Android-патч] см. RELAY_CONTROL_STATE_OBIS — в паспорте прибора этот объект назван
+        // «Размыкатель» (класс Disconnect Control), значение берётся из поля control_state,
+        // приходящего внутри того же буфера индикации.
+        ObisCaption(RELAY_CONTROL_STATE_OBIS)
         Text("Лимит мощности: ${relay.powerLimitKw} кВт")
 
         countdown?.let { Text("Включение через: $it c") }

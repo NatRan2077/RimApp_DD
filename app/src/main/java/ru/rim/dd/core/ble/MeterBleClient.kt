@@ -33,6 +33,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 import no.nordicsemi.android.ble.BleManager
 import no.nordicsemi.android.ble.observer.ConnectionObserver
 import ru.rim.dd.core.model.ConnectionState
+import ru.rim.dd.core.model.MeterDeviceName
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -332,12 +333,58 @@ class MeterBleClient @Inject constructor(
      * (см. parseModelAndSerialFromDeviceName()), а введённый пользователем номер — это лишь
      * фильтр поиска.
      */
+    @Deprecated(
+        "Подключается к ПЕРВОМУ прибору с подходящим префиксом имени — при двух приборах рядом " +
+                "это подключение к случайному из них (реальная ошибка, см. connectBySerialNumber ниже). " +
+                "Для подключения по номеру ПУ используйте connectBySerialNumber().",
+        ReplaceWith("connectBySerialNumber(serialNumber)"),
+    )
     suspend fun connectByNamePrefix(namePrefix: String, timeoutMs: Long = 10_000): BleDevice {
         val found = withTimeoutOrNull(timeoutMs) {
             scan().first { it.name?.startsWith(namePrefix, ignoreCase = true) == true }
         } ?: throw IllegalStateException(
             "Устройство с именем на \"$namePrefix\" не найдено за ${timeoutMs / 1000} с — убедитесь, что пульт включён и рядом"
         )
+        val device = adapter?.getRemoteDevice(found.address)
+            ?: throw IllegalStateException("Bluetooth недоступен на этом устройстве")
+        connect(device)
+        return found
+    }
+
+    /**
+     * [Android-патч] Подключение к КОНКРЕТНОМУ прибору учёта по его номеру (UC-02).
+     *
+     * ИСПРАВЛЯЕТ РЕАЛЬНУЮ ОШИБКУ: раньше этот сценарий шёл через connectByNamePrefix() выше —
+     * то есть номер ПУ, который ввёл пользователь, В ПОИСКЕ ВООБЩЕ НЕ УЧАСТВОВАЛ (в коде на
+     * этом месте так и стоял TODO). Фильтром был только префикс имени "RIM", и приложение
+     * подключалось к ПЕРВОМУ откликнувшемуся прибору. Пока рядом один счётчик, это незаметно;
+     * как только в радиусе есть второй — подключение превращается в лотерею, и пользователь
+     * молча смотрит показания ЧУЖОГО прибора, будучи уверен, что открыл свой. Для работы с
+     * силовым оборудованием (тот же размыкатель на экране «Сеть») это недопустимо: команда
+     * ушла бы не туда.
+     *
+     * Теперь из эфира берётся только устройство, чей серийный номер в имени ТОЧНО совпадает с
+     * запрошенным (см. MeterDeviceName.matches — сравнение полное, без совпадений по
+     * подстроке). Если такого прибора в эфире нет — честная ошибка вместо подключения к
+     * «похожему»: лучше не подключиться совсем, чем подключиться не к тому.
+     *
+     * Таймаут больше, чем у поиска по префиксу (15 с против 10 с): нужное устройство может
+     * оказаться не первым в эфире, и мы обязаны дослушать, а не хвататься за ближайшее.
+     */
+    suspend fun connectBySerialNumber(serialNumber: String, timeoutMs: Long = SCAN_BY_SERIAL_TIMEOUT_MS): BleDevice {
+        val wanted = MeterDeviceName.normalizeSerial(serialNumber)
+            ?: throw IllegalArgumentException(
+                "\"$serialNumber\" не похож на номер прибора учёта — ожидается до " +
+                        "${MeterDeviceName.SERIAL_DIGITS} цифр (номер со счётчика) либо 13 цифр из имени устройства"
+            )
+        Log.d("MeterBleClient", "Поиск прибора учёта № $wanted в эфире (таймаут ${timeoutMs}мс)")
+        val found = withTimeoutOrNull(timeoutMs) {
+            scan().first { MeterDeviceName.matches(it.name, wanted) }
+        } ?: throw IllegalStateException(
+            "Прибор учёта № $wanted не найден за ${timeoutMs / 1000} с. Проверьте номер и " +
+                    "убедитесь, что прибор включён и находится рядом"
+        )
+        Log.i("MeterBleClient", "Найден прибор учёта № $wanted: \"${found.name}\" (${found.address})")
         val device = adapter?.getRemoteDevice(found.address)
             ?: throw IllegalStateException("Bluetooth недоступен на этом устройстве")
         connect(device)
@@ -414,6 +461,14 @@ class MeterBleClient @Inject constructor(
          * радиосессию со счётчиком, которая живёт независимо от нашего BLE-соединения.
          */
         const val COLD_RECONNECT_COOLDOWN_MS = 5_000L
+
+        /**
+         * [Android-патч] см. connectBySerialNumber() — сколько слушаем эфир в поисках прибора с
+         * ТОЧНО запрошенным номером. Больше, чем таймаут поиска по префиксу: там годилось первое
+         * попавшееся устройство, а здесь нужное может откликнуться не первым, и оборвать поиск
+         * раньше времени означало бы сказать «прибор не найден» про прибор, который рядом.
+         */
+        const val SCAN_BY_SERIAL_TIMEOUT_MS = 15_000L
     }
 }
 

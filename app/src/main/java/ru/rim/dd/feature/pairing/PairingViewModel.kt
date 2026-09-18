@@ -35,16 +35,28 @@ class PairingViewModel @Inject constructor(
 
     fun scan() {
         scanJob?.cancel()
-        _uiState.value = _uiState.value.copy(isScanning = true, foundDevices = emptyList(), errorMessage = null)
+        _uiState.value = _uiState.value.copy(
+            isScanning = true,
+            foundDevices = emptyList(),
+            errorMessage = null
+        )
+
         scanJob = viewModelScope.launch {
             repository.scanDevices()
-                // Пульты РиМ 040.40 рекламируются в эфире как "RIM ..." — показываем в списке
-                // только их, а не все BLE-устройства вокруг.
-                .filter { it.name?.startsWith(NAME_PREFIX, ignoreCase = true) == true }
+                // Пульты РиМ 040.40 рекламируются в эфире как "RIM ..." или "AKROS ..."
+                .filter { device ->
+                    device.name?.let { name ->
+                        NAME_PREFIXES.any { prefix ->
+                            name.startsWith(prefix, ignoreCase = true)
+                        }
+                    } == true
+                }
                 .collect { device ->
                     val current = _uiState.value.foundDevices
                     if (current.none { it.address == device.address }) {
-                        _uiState.value = _uiState.value.copy(foundDevices = current + device)
+                        _uiState.value = _uiState.value.copy(
+                            foundDevices = current + device
+                        )
                     }
                 }
         }
@@ -69,7 +81,7 @@ class PairingViewModel @Inject constructor(
      * notify, обрезанные кадры), и именно это, похоже, портило ПЕРВЫЙ буфер после подключения
      * ЧЕРЕЗ СПИСОК (а дальше "не удалось разобрать DLMS-данные" тянулось на каждое "Обновить",
      * потому что нативный rx-буфер, скорее всего, остался с "хвостом" от повреждённого кадра).
-     * Подключение по номеру (connectBySerialNumber → ble.connectByNamePrefix()) НЕ страдало этим,
+     * Подключение по номеру (connectBySerialNumber → ble.connectBySerialNumber()) НЕ страдало этим,
      * потому что там скан честно suspend-запущенный: scan().first{} не возвращает управление,
      * пока сам скан не остановлен ПОЛНОСТЬЮ (включая awaitClose) — гонки просто не возникает.
      *
@@ -109,6 +121,6 @@ class PairingViewModel @Inject constructor(
 
     private companion object {
         /** Пульты РиМ 040.40 рекламируются в эфире как "RIM ..." */
-        const val NAME_PREFIX = "RIM"
+        val NAME_PREFIXES = setOf("RIM", "AKROS")
     }
 }

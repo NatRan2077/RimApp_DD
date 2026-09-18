@@ -32,6 +32,7 @@ import ru.rim.dd.core.dlms.CLOCK_STATUS_OBIS
 import ru.rim.dd.core.dlms.isClockStatusValid
 import ru.rim.dd.core.dlms.textValueOf
 import ru.rim.dd.core.model.ConnectionState
+import ru.rim.dd.core.model.MeterDeviceName
 import ru.rim.dd.core.model.MeterInfo
 import ru.rim.dd.core.model.NetworkParams
 import ru.rim.dd.core.model.PairedDevice
@@ -79,6 +80,19 @@ class MeterRepositoryImpl @Inject constructor(
     private val _readings = MutableStateFlow<List<Reading>>(emptyList())
 
     private var activeSerialNumber: String? = null
+
+    /**
+     * [Android-патч] Серийный номер, который сообщил САМ прибор — объект 0.0.96.1.0.255
+     * («Серийный номер» по паспорту), приходит текстом внутри обычного буфера индикации, без
+     * ассоциации и без отдельного запроса (подтверждено логом: 0.0.96.1.0.255="05000112" при
+     * BLE-имени "RIM1894005000112" — совпадает с точностью до цифры).
+     *
+     * Это САМЫЙ достоверный источник: [activeSerialNumber] разбирается из имени, которое прибор
+     * рекламирует в эфире, а здесь номер пришёл по протоколу от самого счётчика. Именно по нему
+     * connectBySerialNumber() проверяет, что подключился к ТОМУ прибору, номер которого ввёл
+     * пользователь (см. там же) — и рвёт связь, если это оказался другой.
+     */
+    private var meterReportedSerial: String? = null
 
     /** Собственный скоуп для «насоса» — живёт, пока есть активное BLE-соединение. */
     private val repositoryScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -203,6 +217,11 @@ class MeterRepositoryImpl @Inject constructor(
     override fun scanDevices(): Flow<BleDevice> = ble.scan()
 
     override suspend fun connectByAddress(address: String, pin: String, remember: Boolean, deviceName: String?) {
+        // [Android-патч] см. meterReportedSerial — номер, сообщённый прибором, относится к
+        // КОНКРЕТНОМУ сеансу. Обнуляем ДО чтения буфера, иначе при подключении к другому прибору
+        // (а по адресу это ровно тот случай — пользователь выбрал устройство из списка) в поле
+        // могло бы остаться значение с прошлого подключения, пока новый прибор не пришлёт своё.
+        meterReportedSerial = null
         withContext(Dispatchers.IO) { ble.connectByAddress(address) }
         spodes.createClient()
         startTransportPump()
@@ -222,9 +241,19 @@ class MeterRepositoryImpl @Inject constructor(
         // не подходит под формат), activeSerialNumber мог бы остаться от ПРЕДЫДУЩЕГО подключения
         // (это правилось задним числом — заметил при повторной проверке, до этого было всегда null).
         activeSerialNumber = null
+        // [Android-патч] meterReportedSerial НЕ сбрасываем: к этому моменту readAndApplyMainBuffer()
+        // выше уже мог получить номер от самого прибора, и он достовернее разбора имени ниже.
         applyDeviceNameInfo(deviceName)
         if (remember) {
-            deviceStore.rememberDevice(PairedDevice(serialNumber = activeSerialNumber ?: address, bleAddress = address))
+            // [Android-патч] см. meterReportedSerial — номер от самого прибора надёжнее разобранного
+            // из имени: сопряжение сохраняем под ним, тогда и «Настройки»/автоподключение будут
+            // опознавать прибор по тому же номеру, который потом сверяется при подключении.
+            deviceStore.rememberDevice(
+                PairedDevice(
+                    serialNumber = meterReportedSerial ?: activeSerialNumber ?: address,
+                    bleAddress = address,
+                ),
+            )
         }
         startAutoRefresh()
     }
@@ -240,12 +269,12 @@ class MeterRepositoryImpl @Inject constructor(
      * догадаться модель/серийный из имени нестандартного формата.
      */
     private fun parseModelAndSerialFromDeviceName(name: String?): Pair<String, String>? {
-        val digits = name?.filter { it.isDigit() } ?: return null
-        if (digits.length != 13) return null
-        val modelDigits = digits.substring(0, 5)
-        val serial = digits.substring(5)
-        val model = "${modelDigits.substring(0, 3)}.${modelDigits.substring(3)}"
-        return model to serial
+        // [Android-патч] Сам разбор переехал в MeterDeviceName (core/model) — ТУ ЖЕ логику
+        // использует поиск прибора по номеру ПУ в MeterBleClient.connectBySerialNumber(). Держать
+        // две копии нельзя: разойдись они хоть на символ — и фильтр поиска начал бы считать
+        // «нашим» не тот прибор, который потом опознаёт этот метод.
+        val parsed = MeterDeviceName.parse(name) ?: return null
+        return parsed.model to parsed.serialNumber
     }
 
     /** Разбирает [name] через [parseModelAndSerialFromDeviceName] и применяет к _meterInfo/activeSerialNumber. */
@@ -731,14 +760,34 @@ class MeterRepositoryImpl @Inject constructor(
         if (textReadings.isNotEmpty()) {
             Log.d(TAG, "В буфере найдены текстовые поля: ${textReadings.joinToString { "${it.obisCode}=\"${it.textValue}\"" }}")
         }
-        val firmwareVersion = FIRMWARE_VERSION_OBIS_CANDIDATES.firstNotNullOfOrNull { obis -> find(obis)?.textValue }
+        // [Android-патч] см. MeterInfo.firmwareVersionObis — запоминаем не только САМО значение,
+        // но и OBIS-код кандидата, который его дал: экран «Инфо» подписывает величину её
+        // объектом из паспорта, и подпись обязана соответствовать реальному источнику, а не
+        // первому коду из списка кандидатов.
+        val firmwareEntry = FIRMWARE_VERSION_OBIS_CANDIDATES
+            .firstNotNullOfOrNull { obis -> find(obis)?.textValue?.let { obis to it } }
+        val firmwareVersion = firmwareEntry?.second
         // [Android-патч] см. FIRMWARE_VERSION_OBIS_CANDIDATES — тот же буфер на проверенном
         // втором счётчике (модель 189.40) содержит ещё и человекочитаемое имя модели прямо
         // текстом ("RIM 189.40" под OBIS 0.0.96.1.1.255, "Device ID 1") — надёжнее, чем парсинг
         // BLE-имени по формату "13 цифр" (applyDeviceNameInfo), который вообще может не подойти
         // для другой линейки счётчиков. Берём из буфера, когда есть; парсинг имени остаётся как
         // запасной вариант (см. applyDeviceNameInfo) на случай, если в буфере этого поля нет.
-        val modelName = MODEL_NAME_OBIS_CANDIDATES.firstNotNullOfOrNull { obis -> find(obis)?.textValue }
+        // [Android-патч] см. MeterInfo.modelObis — та же причина, что и у версии ПО выше:
+        // если модель пришла из буфера, подписываем её этим OBIS; если буфер её не содержит и
+        // название осталось от разбора BLE-имени, modelObis останется null и подписи не будет.
+        val modelEntry = MODEL_NAME_OBIS_CANDIDATES
+            .firstNotNullOfOrNull { obis -> find(obis)?.textValue?.let { obis to it } }
+        val modelName = modelEntry?.second
+
+        // [Android-патч] см. meterReportedSerial выше — серийный номер САМОГО прибора из буфера.
+        // Это и подпись на экране «Инфо» (теперь честный OBIS вместо «из имени BLE-устройства»),
+        // и — главное — то, чем connectBySerialNumber() проверяет, что подключился к нужному ПУ.
+        val serialFromBuffer = find(SERIAL_NUMBER_OBIS)?.textValue?.trim()?.takeIf { it.isNotEmpty() }
+        if (serialFromBuffer != null && serialFromBuffer != meterReportedSerial) {
+            Log.d(TAG, "Прибор сообщил свой серийный номер ($SERIAL_NUMBER_OBIS): \"$serialFromBuffer\"")
+        }
+        if (serialFromBuffer != null) meterReportedSerial = serialFromBuffer
 
         // [Android-патч] см. CURRENT_TARIFF_OBIS в GetResponseParser.kt — до этого патча
         // позиционное поле буфера с номером текущего тарифа молча терялось.
@@ -757,13 +806,17 @@ class MeterRepositoryImpl @Inject constructor(
         }
 
         if (temperatureC != null || backupVoltageV != null || deviceClock != null || firmwareVersion != null ||
-            modelName != null || currentTariff != null || clockValid != null
+            modelName != null || currentTariff != null || clockValid != null || serialFromBuffer != null
         ) {
             val prev = _meterInfo.value
             _meterInfo.value = (
                     prev ?: MeterInfo(model = "—", serialNumber = activeSerialNumber ?: "—", firmwareVersion = "—")
                     ).copy(
                     model = modelName ?: prev?.model ?: "—",
+                    // [Android-патч] см. meterReportedSerial выше — номер от самого прибора важнее
+                    // разобранного из BLE-имени: имя — это то, как прибор себя рекламирует, а здесь
+                    // он ответил по протоколу. К имени откатываемся, только если в буфере номера нет.
+                    serialNumber = serialFromBuffer ?: activeSerialNumber ?: prev?.serialNumber ?: "—",
                     temperatureC = temperatureC,
                     backupVoltageV = backupVoltageV,
                     deviceClock = deviceClock,
@@ -771,6 +824,12 @@ class MeterRepositoryImpl @Inject constructor(
                     firmwareVersion = firmwareVersion ?: prev?.firmwareVersion ?: "—",
                     currentTariff = currentTariff ?: prev?.currentTariff,
                     clockValid = clockValid ?: prev?.clockValid,
+                    // [Android-патч] см. MeterInfo.modelObis/firmwareVersionObis — источник подписи
+                    // идёт вместе со значением: если в этом цикле значение не пришло, сохраняем
+                    // прежнюю пару «значение + его OBIS», чтобы подпись не отвязалась от числа.
+                    modelObis = modelEntry?.first ?: prev?.modelObis,
+                    firmwareVersionObis = firmwareEntry?.first ?: prev?.firmwareVersionObis,
+                    serialNumberObis = if (serialFromBuffer != null) SERIAL_NUMBER_OBIS else prev?.serialNumberObis,
                 )
         }
     }
@@ -819,12 +878,33 @@ class MeterRepositoryImpl @Inject constructor(
         // Ожидание UA убрано — см. комментарий выше: 3 секунды впустую на каждое подключение.
     }
 
+    /**
+     * [Android-патч] ИСПРАВЛЕНА СЕРЬЁЗНАЯ ОШИБКА: «ввожу номер ПУ, а подключаюсь иногда к другому
+     * прибору». Здесь стоял TODO, и он был не про удобство — введённый номер В ПОИСКЕ ВООБЩЕ НЕ
+     * УЧАСТВОВАЛ: вызывался connectByNamePrefix("RIM"), то есть бралось ПЕРВОЕ попавшееся
+     * устройство с подходящим префиксом имени. С одним счётчиком рядом это незаметно, с двумя —
+     * лотерея, причём молчаливая: пользователь смотрит показания чужого прибора, будучи уверен,
+     * что открыл свой, а на экране «Сеть» может ещё и скомандовать чужим размыкателем.
+     *
+     * Теперь защита двойная, и вторая ступень — главная:
+     *
+     * 1. ПОИСК. ble.connectBySerialNumber() берёт из эфира только прибор, чей серийный номер в
+     *    рекламируемом имени ТОЧНО равен запрошенному (см. MeterDeviceName). Нет такого в эфире —
+     *    честная ошибка «прибор не найден», а не подключение к «похожему».
+     *
+     * 2. ПРОВЕРКА ПОСЛЕ ПОДКЛЮЧЕНИЯ. Имя в эфире — это то, как прибор себя НАЗЫВАЕТ; доверять
+     *    только ему нельзя. Поэтому после первого же успешного чтения буфера сверяем номер,
+     *    который сообщил САМ прибор по протоколу (объект 0.0.96.1.0.255, см. meterReportedSerial),
+     *    с тем, что ввёл пользователь. Не совпало — немедленно рвём связь и сообщаем об этом
+     *    прямо, вместо того чтобы показывать чужие показания.
+     *
+     * Если прибор номер не сообщил (в буфере его нет — на других моделях линейки состав буфера
+     * отличается), вторая ступень пропускается: тогда единственная гарантия — фильтр поиска,
+     * и это честно пишется в лог, чтобы при разборе было видно, какой ступенью всё держалось.
+     */
     override suspend fun connectBySerialNumber(serialNumber: String, pin: String, remember: Boolean) {
-        // TODO: серийный номер счётчика пока не участвует в поиске самого пульта —
-        //  фильтруем только по префиксу имени пульта в эфире ("RIM ..."), к первому
-        //  найденному и подключаемся. Как только известно, что именно пульт рекламирует
-        //  в имени (сам serial или что-то ещё), фильтр можно сузить.
-        val found = withContext(Dispatchers.IO) { ble.connectByNamePrefix(BLE_NAME_PREFIX) }
+        meterReportedSerial = null // см. ниже — проверять нужно номер ИЗ ЭТОГО сеанса, а не с прошлого подключения
+        val found = withContext(Dispatchers.IO) { ble.connectBySerialNumber(serialNumber) }
         spodes.createClient()
         startTransportPump()
         withContext(Dispatchers.IO) { establishHdlcChannel() }
@@ -835,6 +915,31 @@ class MeterRepositoryImpl @Inject constructor(
             // [Android-патч] см. lastProtocolError выше — тот же приём, что и в connectByAddress().
             throw IllegalStateException(lastProtocolError ?: "неизвестная ошибка")
         }
+
+        // Ступень 2 — сверка с номером, который прибор сообщил о себе сам (см. комментарий выше).
+        val reported = meterReportedSerial
+        if (reported != null && !MeterDeviceName.serialsEqual(reported, serialNumber)) {
+            Log.e(
+                TAG,
+                "ПОДКЛЮЧИЛИСЬ НЕ К ТОМУ ПРИБОРУ: запрошен № $serialNumber, а прибор " +
+                        "(\"${found.name}\", ${found.address}) сообщил о себе № $reported — разрываем связь",
+            )
+            stopTransportPump()
+            ble.disconnect()
+            throw IllegalStateException(
+                "Подключение отменено: найденный прибор сообщил номер $reported вместо запрошенного " +
+                        "$serialNumber. Проверьте номер ПУ"
+            )
+        }
+        if (reported == null) {
+            Log.w(
+                TAG,
+                "Прибор не сообщил свой серийный номер ($SERIAL_NUMBER_OBIS) — сверить подключение " +
+                        "по протоколу не с чем, полагаемся только на совпадение номера в имени устройства " +
+                        "(\"${found.name}\")",
+            )
+        }
+
         // Реальное имя найденного устройства (found.name) — приоритетнее введённого пользователем
         // serialNumber: из него разбираются и модель, и серийный (см. applyDeviceNameInfo()).
         // Если разбор не удался (нестандартное имя), activeSerialNumber останется null здесь —
@@ -842,7 +947,14 @@ class MeterRepositoryImpl @Inject constructor(
         applyDeviceNameInfo(found.name)
         if (activeSerialNumber == null) activeSerialNumber = serialNumber
         if (remember) {
-            deviceStore.rememberDevice(PairedDevice(serialNumber = activeSerialNumber ?: serialNumber, bleAddress = found.address))
+            deviceStore.rememberDevice(
+                // [Android-патч] запоминаем номер от самого прибора, если он есть — именно по нему
+                // сопряжение потом опознаётся однозначно (см. meterReportedSerial выше).
+                PairedDevice(
+                    serialNumber = reported ?: activeSerialNumber ?: serialNumber,
+                    bleAddress = found.address,
+                ),
+            )
         }
         startAutoRefresh()
     }
@@ -1202,6 +1314,7 @@ class MeterRepositoryImpl @Inject constructor(
             protocolMutex.withLock { withContext(Dispatchers.IO) { spodes.destroyClient() } }
             ble.disconnect()
             activeSerialNumber = null
+            meterReportedSerial = null // [Android-патч] см. meterReportedSerial — номер прибора относится к КОНКРЕТНОМУ сеансу
             protocolSessionEstablished = false
             consecutiveEmptyOrFailedReads = 0
         }
@@ -1222,13 +1335,19 @@ class MeterRepositoryImpl @Inject constructor(
         protocolMutex.withLock { withContext(Dispatchers.IO) { spodes.destroyClient() } }
         ble.disconnect()
         activeSerialNumber = null
+        meterReportedSerial = null // [Android-патч] см. meterReportedSerial — номер прибора относится к КОНКРЕТНОМУ сеансу
         protocolSessionEstablished = false
         consecutiveEmptyOrFailedReads = 0
     }
 
     companion object {
         /** Пульты РиМ 040.40 рекламируются в эфире как "RIM ..." — фильтр скана/поиска по имени. */
-        private const val BLE_NAME_PREFIX = "AKROS"
+        // [Android-патч] BLE_NAME_PREFIX ("RIM") УДАЛЁН вместе с последним его потребителем —
+        // connectBySerialNumber() больше не ищет «первый попавшийся прибор с именем на RIM», а
+        // требует точного совпадения номера ПУ (см. MeterDeviceName). Фильтр по префиксу тут и
+        // не нужен: разбор имени и так требует строго 13 цифр нужной структуры, а сама прошивка
+        // пульта РиМ 040.40 фильтрует эфир ровно так же — только по номеру счётчика, без проверки
+        // буквенного префикса (см. app_ble.c: SCAN_FILTER_BY_NAME_MASK + numMeterStr).
 
         // См. комментарий у establishHdlcChannel(): 16 подтверждено кодом, 1/1 — предположение.
         private const val HDLC_SOURCE_ADDRESS = 16
@@ -1272,18 +1391,29 @@ class MeterRepositoryImpl @Inject constructor(
         private const val RECONNECT_SETTLE_DELAY_MS = 1_500L
 
         /**
-         * [Android-патч] см. applyDecodedBuffer() — кандидаты OBIS для версии ПО, если она
-         * встретится ПРЯМО в буфере 0.0.21.0.2.255 (без отдельного GET/ассоциации). Первый —
-         * 0.0.96.1.2.255, подтверждён паспортом РиМ 040.40 ("Device ID 2"); остальные — другие
-         * стандартные "Device ID" регистры того же класса (0.0.96.1.x), которые на других
-         * моделях этой линейки МОГУТ использоваться вместо второго. Список расширять по факту
-         * логов с реальных приборов (см. "В буфере найдены текстовые поля" в логе), а не гадая.
+         * [Android-патч] см. applyDecodedBuffer() — OBIS версии ПО в буфере 0.0.21.0.2.255
+         * (без отдельного GET/ассоциации).
+         *
+         * ИСПРАВЛЕНО ПО ПАСПОРТУ ПРИБОРА: раньше в списке кандидатов, кроме верного
+         * 0.0.96.1.2.255, стояли ещё 0.0.96.1.0.255 и 0.0.96.1.1.255 — «другие Device ID того же
+         * класса, вдруг на какой-то модели версия лежит там». Выгрузка объектов прибора это
+         * опровергла: 0.0.96.1.0.255 — это «Серийный номер», 0.0.96.1.1.255 — «Тип прибора», и
+         * оба реально приходят в буфере (в логе: 0.0.96.1.0.255="05000112",
+         * 0.0.96.1.1.255="RIM 189.40", 0.0.96.1.2.255="1.58"). На приборе, где версии ПО в буфере
+         * нет, перебор дошёл бы до них и показал бы пользователю в поле «Версия ПО» серийный
+         * номер — тихо и правдоподобно. Оставлен единственный код, подтверждённый паспортом;
+         * серийный номер и модель читаются отдельно, каждый по своему объекту.
          */
         private val FIRMWARE_VERSION_OBIS_CANDIDATES = listOf(
             "0.0.96.1.2.255",
-            "0.0.96.1.0.255",
-            "0.0.96.1.1.255",
         )
+
+        /**
+         * [Android-патч] см. meterReportedSerial/connectBySerialNumber() — серийный номер, который
+         * прибор сообщает о себе сам. По паспорту это «Серийный номер», приходит текстом в том же
+         * буфере индикации; именно по нему проверяется, что подключились к запрошенному ПУ.
+         */
+        private const val SERIAL_NUMBER_OBIS = "0.0.96.1.0.255"
 
         /**
          * [Android-патч] см. applyDecodedBuffer() — 0.0.96.1.1.255 ("Device ID 1") подтверждён

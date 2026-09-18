@@ -4,6 +4,8 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -32,8 +34,13 @@ fun SettingsScreen(viewModel: SettingsViewModel = hiltViewModel()) {
     // «Подключение» выбрать другой прибор, а не ждать неопределённое время.
     val canDisconnect = connectionState !is ConnectionState.Idle
 
+    // [Android-патч] verticalScroll — по той же причине, что и на экране «Инфо» (см.
+    // комментарий там): Column без скролла не прокручивается, а молча обрезает всё, что не
+    // влезло по высоте. Здесь содержимое пока короткое и на обычном экране помещается, но при
+    // крупном системном шрифте или на маленьком устройстве нижние строки (статус соединения,
+    // уровень сигнала, кнопка «Отключиться») точно так же оказались бы недоступны.
     Column(
-        modifier = Modifier.fillMaxSize().padding(16.dp),
+        modifier = Modifier.fillMaxSize().padding(16.dp).verticalScroll(rememberScrollState()),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         Text("Настройки", style = MaterialTheme.typography.headlineSmall)

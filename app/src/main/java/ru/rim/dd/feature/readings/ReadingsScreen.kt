@@ -77,7 +77,11 @@ fun ReadingsScreen(viewModel: ReadingsViewModel = hiltViewModel()) {
 
 @Composable
 private fun EnergyCategoryCard(category: EnergyCategory, items: List<Reading>) {
-    val unit = categoryUnit(category)
+    // [Android-патч] см. Reading.unitLabel — единицу берём ТУ, ЧТО СООБЩИЛ ПРИБОР (у AKROS она
+    // читается из scaler_unit объекта), и только если он её не сообщил, подставляем подпись по
+    // категории энергии. Раньше подпись всегда бралась из категории — то есть была догадкой,
+    // верной ровно до первого прибора, считающего в других единицах.
+    val unit = items.firstNotNullOfOrNull { it.unitLabel } ?: categoryUnit(category)
     // [Android-патч] см. ObisCaption — теперь нужно не только значение суммы, но и сам объект,
     // из которого она взята, чтобы подписать его OBIS-кодом. Поэтому суммарное показание
     // ищется как Reading (а не просто число): если «итогового» объекта (тариф = 0) в буфере

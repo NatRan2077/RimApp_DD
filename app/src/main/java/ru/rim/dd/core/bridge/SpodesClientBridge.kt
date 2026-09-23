@@ -57,6 +57,45 @@ class SpodesClientBridge @Inject constructor() {
     fun setNormalResponseMode(sourceAddress: Int, logicalAddress: Int, physicalAddress: Int): Boolean =
         nativeSetNormalResponseMode(nativeHandle, sourceAddress, logicalAddress, physicalAddress)
 
+    /**
+     * [Android-патч] SNRM, собранный СТРОГО по стандарту — для приборов, которые этот кадр
+     * реально обрабатывают и отвечают UA (проверено на AKROS).
+     *
+     * Кадр, который отправляет setNormalResponseMode() выше, оказался испорчен: лишний
+     * LLC-заголовок E6 E6 00 внутри U-кадра, неверное поле длины и несошедшаяся FCS (подробный
+     * разбор — в комментарии к SetNormalResponseModeStandard в spodes_client.h). Приборы РиМ
+     * этого не замечали, потому что на SNRM не отвечают вовсе, а AKROS отбрасывал кадр молча —
+     * и ожидание UA уходило в таймаут.
+     *
+     * Старый метод оставлен нетронутым: приборы РиМ получают ровно те же байты, что и раньше.
+     */
+    fun setNormalResponseModeStandard(
+        sourceAddress: Int,
+        logicalAddress: Int,
+        physicalAddress: Int,
+        maxInfoTransmit: Int = 128,
+        maxInfoReceive: Int = 128,
+    ): Boolean = nativeSetNormalResponseModeStandard(
+        nativeHandle,
+        sourceAddress,
+        logicalAddress,
+        physicalAddress,
+        maxInfoTransmit,
+        maxInfoReceive,
+    )
+
+    /**
+     * [Android-патч] Запрашивает СЛЕДУЮЩИЙ блок ответа, разбитого прибором на части
+     * (get-response-with-datablock). [blockNumber] — номер уже полученного блока.
+     *
+     * Нужен, когда ответ не помещается в один кадр: у AKROS согласованный размер
+     * информационного поля — 128 байт, а описание колонок буфера (capture_objects) занимает
+     * больше 250, и прибор штатно отдаёт его блоками. Без этого запроса приходил только первый
+     * блок, а разбор видел обрывок и молча выдавал «0 колонок».
+     */
+    fun sendReadyToReceive(blockNumber: Int): Boolean =
+        nativeSendReadyToReceive(nativeHandle, blockNumber)
+
     /** Ждёт UA-ответ на SNRM. 0 — ошибка/таймаут, 1 — успех, 2 — сервер уже разорвал связь (DM). */
     fun receiveUnnumberedAcknowledge(): Int = nativeReceiveUnnumberedAcknowledge(nativeHandle)
 
@@ -88,6 +127,25 @@ class SpodesClientBridge @Inject constructor() {
     /** Запрос чтения атрибута (сервис GET). obisCode — "1.0.1.8.0.255" и т.п. из ObisCatalog. */
     fun getRequest(classId: Int, obisCode: String, attributeId: Int): Boolean =
         nativeGetRequest(nativeHandle, classId, obisCode, attributeId)
+
+    /**
+     * [Android-патч] Устанавливает ШИФРОВАННУЮ (высокоуровневую) ассоциацию с AKROS —
+     * HLS с механизмом GMAC (AES-128-GCM). Вызывать после успешных
+     * setNormalResponseModeStandard()+receiveUnnumberedAcknowledge()==1. key — пароль-ключ
+     * ровно из 16 ASCII-символов (напр. "SettingRiM_AKROS"). После успеха все getRequestCiphered()
+     * шифруются, а getResponseRawBytes() расшифровывается автоматически. Подробности и побайтовая
+     * сверка с логом реального приложения — в spodes_ciphered.hpp.
+     */
+    fun establishCipheredConnection(key: String): Boolean =
+        nativeEstablishCipheredConnection(nativeHandle, key)
+
+    /**
+     * [Android-патч] GET внутри шифрованной ассоциации (см. establishCipheredConnection).
+     * Ответ читать обычным getResponseRawBytes() — он расшифровывается на нативной стороне,
+     * поэтому все разборщики DLMS (в т.ч. блочная сборка) работают без изменений.
+     */
+    fun getRequestCiphered(classId: Int, obisCode: String, attributeId: Int): Boolean =
+        nativeGetRequestCiphered(nativeHandle, classId, obisCode, attributeId)
 
     /**
      * [Android-патч] GET-запрос с "плоской" однобайтовой HDLC-адресацией и
@@ -144,11 +202,22 @@ class SpodesClientBridge @Inject constructor() {
     private external fun nativePullOutgoing(handle: Long): ByteArray
     private external fun nativePushIncoming(handle: Long, bytes: ByteArray)
     private external fun nativeSetNormalResponseMode(handle: Long, sourceAddress: Int, logicalAddress: Int, physicalAddress: Int): Boolean
+    private external fun nativeSetNormalResponseModeStandard(
+        handle: Long,
+        sourceAddress: Int,
+        logicalAddress: Int,
+        physicalAddress: Int,
+        maxInfoTransmit: Int,
+        maxInfoReceive: Int,
+    ): Boolean
     private external fun nativeReceiveUnnumberedAcknowledge(handle: Long): Int
+    private external fun nativeSendReadyToReceive(handle: Long, blockNumber: Int): Boolean
     private external fun nativeEstablishConnection(handle: Long, securityLevel: Int, password: String?): Boolean
     private external fun nativeEstablishConnectionFlatAddress(handle: Long, securityLevel: Int, password: String?, destAddress: Int, srcAddress: Int): Boolean
     private external fun nativeEstablishConnectionResponseRaw(handle: Long): ByteArray
     private external fun nativeGetRequest(handle: Long, classId: Int, obisCode: String, attributeId: Int): Boolean
+    private external fun nativeEstablishCipheredConnection(handle: Long, key: String): Boolean
+    private external fun nativeGetRequestCiphered(handle: Long, classId: Int, obisCode: String, attributeId: Int): Boolean
     private external fun nativeGetRequestFlatAddress(handle: Long, classId: Int, obisCode: String, attributeId: Int, destAddress: Int, srcAddress: Int): Boolean
     private external fun nativeActionRequestFlatAddress(
         handle: Long, classId: Int, obisCode: String, methodId: Int, hasParameter: Boolean,

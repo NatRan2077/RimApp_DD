@@ -161,7 +161,14 @@ class MeterBleClient @Inject constructor(
                 trySend(
                     BleDevice(
                         address = result.device.address,
-                        name = result.device.name,
+                        // [Android-патч] Имя берём СНАЧАЛА из рекламного пакета
+                        // (scanRecord.deviceName) и только потом из device.name. Второе — это
+                        // кэш Bluetooth-стека Android: у прибора, который телефон видит впервые
+                        // и с которым не сопряжён, оно нередко приходит null. А раз список
+                        // приборов и поиск по номеру ПУ работают ИМЕННО по имени, такое
+                        // устройство просто не появлялось на экране — при том что в эфире оно
+                        // есть и имя в рекламе передаёт.
+                        name = result.scanRecord?.deviceName ?: result.device.name,
                         rssi = result.rssi,
                     )
                 )
@@ -192,7 +199,7 @@ class MeterBleClient @Inject constructor(
             context,
             onStateChanged = { state -> _connectionState.value = state },
             onRssiRead = { rssi -> _signalStrengthDbm.value = rssi },
-            onDisconnected = { handleDisconnected(device) },
+            onDisconnected = { reason -> handleDisconnected(device, reason) },
         )
         gattManager = manager
         manager.connect(device)
@@ -217,9 +224,27 @@ class MeterBleClient @Inject constructor(
      * знаем адрес счётчика и просто хотим держаться того же устройства.
      */
     @SuppressLint("MissingPermission")
-    private fun handleDisconnected(device: BluetoothDevice) {
+    private fun handleDisconnected(device: BluetoothDevice, reason: Int) {
         if (userInitiatedDisconnect) {
             _connectionState.value = ConnectionState.Idle
+            return
+        }
+        // [Android-патч] REASON_NOT_SUPPORTED — это НЕ разрыв связи: так библиотека сообщает, что
+        // наш же isRequiredServiceSupported() отверг прибор (нужного профиля обмена на нём нет).
+        // Переподключаться тут бессмысленно — от повторной попытки у прибора не появятся другие
+        // сервисы, — а цикл это делал: в логе с AKROS видно бесконечную череду «Попытка
+        // переподключения #1 не удалась (Request failed with status -2)». Останавливаемся сразу и
+        // честно показываем ошибку, чтобы пользователь понял, что дело в самом приборе.
+        if (reason == ConnectionObserver.REASON_NOT_SUPPORTED) {
+            Log.e(
+                "MeterBleClient",
+                "Прибор $device не поддерживается: ни один известный профиль обмена не найден " +
+                        "(см. isRequiredServiceSupported). Переподключение НЕ запускаем — оно ничего не изменит",
+            )
+            reconnectJob?.cancel()
+            _connectionState.value = ConnectionState.Error.Other(
+                "Прибор не поддерживается: на нём нет ожидаемого сервиса обмена данными"
+            )
             return
         }
         Log.w(
@@ -482,7 +507,7 @@ private class MeterGattManager(
     context: Context,
     private val onStateChanged: (ConnectionState) -> Unit,
     private val onRssiRead: (Int) -> Unit,
-    private val onDisconnected: () -> Unit,
+    private val onDisconnected: (reason: Int) -> Unit,
 ) : BleManager(context) {
 
     private var rxCharacteristic: BluetoothGattCharacteristic? = null
@@ -575,7 +600,10 @@ private class MeterGattManager(
 
             override fun onDeviceDisconnected(device: BluetoothDevice, reason: Int) {
                 Log.w("MeterGattManager", "onDeviceDisconnected: reason=$reason")
-                onDisconnected()
+                // [Android-патч] причину передаём наружу — см. handleDisconnected(): на
+                // REASON_NOT_SUPPORTED переподключаться бессмысленно, прибор не станет
+                // поддерживаемым от повторной попытки.
+                onDisconnected(reason)
             }
         })
     }
@@ -598,21 +626,49 @@ private class MeterGattManager(
         Log.println(priority, "MeterGattManager", message)
     }
 
+    /**
+     * [Android-патч] Перебираем ВСЕ известные наборы UUID (см. GattUuids.ALL), а не один
+     * зашитый FFE0. Из-за жёсткой привязки к FFE0 счётчик AKROS отвергался на этом самом месте:
+     * GATT поднимался, сервисы обнаруживались, а дальше приложение само рвало связь — в логе это
+     * видно как «onDeviceDisconnected: reason=4» (REASON_NOT_SUPPORTED). У AKROS тот же профиль
+     * «прозрачного UART», но под альтернативными UUID ABF0/ABF1/ABF2 — они, к слову, лежат
+     * закомментированными в прошивке самого пульта РиМ.
+     *
+     * Подходящим считается набор, у которого есть И сервис, И ОБЕ характеристики: прибор с
+     * «половиной» профиля работать всё равно не сможет, и честнее это увидеть здесь, чем позже
+     * на непонятном молчании в эфире.
+     */
     override fun isRequiredServiceSupported(gatt: BluetoothGatt): Boolean {
-        val service = gatt.getService(GattUuids.SERVICE)
-        if (service == null) {
-            Log.e("MeterGattManager", "Сервис ${GattUuids.SERVICE} не найден на устройстве")
-            return false
+        for (profile in GattUuids.ALL) {
+            val service = gatt.getService(profile.service) ?: continue
+            val rx = service.getCharacteristic(profile.rxWrite)
+            val tx = service.getCharacteristic(profile.txNotify)
+            if (rx == null || tx == null) {
+                Log.w(
+                    "MeterGattManager",
+                    "Набор ${profile.label}: сервис есть, но характеристики неполные " +
+                            "(RX=${rx?.uuid}, TX=${tx?.uuid}) — пробуем следующий",
+                )
+                continue
+            }
+            rxCharacteristic = rx
+            txCharacteristic = tx
+            Log.i("MeterGattManager", "Профиль обмена: ${profile.label}")
+            Log.d(
+                "MeterGattManager",
+                "RX(write)=${rx.uuid}, props=${rx.properties}; " +
+                        "TX(notify)=${tx.uuid}, props=${tx.properties}, " +
+                        "descriptors=${tx.descriptors.map { it.uuid }}",
+            )
+            return true
         }
-        rxCharacteristic = service.getCharacteristic(GattUuids.CHAR_RX_WRITE)
-        txCharacteristic = service.getCharacteristic(GattUuids.CHAR_TX_NOTIFY)
-        Log.d(
+        Log.e(
             "MeterGattManager",
-            "RX(write)=${rxCharacteristic?.uuid}, props=${rxCharacteristic?.properties}; " +
-                    "TX(notify)=${txCharacteristic?.uuid}, props=${txCharacteristic?.properties}, " +
-                    "descriptors=${txCharacteristic?.descriptors?.map { it.uuid }}",
+            "Ни один из известных профилей обмена не найден на устройстве " +
+                    "(искали: ${GattUuids.ALL.joinToString { it.label }}). Сервисы прибора: " +
+                    gatt.services.joinToString { it.uuid.toString() },
         )
-        return rxCharacteristic != null && txCharacteristic != null
+        return false
     }
 
     override fun initialize() {

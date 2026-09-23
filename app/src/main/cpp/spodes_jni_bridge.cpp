@@ -84,6 +84,27 @@ Java_ru_rim_dd_core_bridge_SpodesClientBridge_nativeSetNormalResponseMode(
     return client->SetNormalResponseMode(addr, &params) ? JNI_TRUE : JNI_FALSE;
 }
 
+// [Android-патч] см. SetNormalResponseModeStandard() в spodes_client.h — SNRM строго по
+// стандарту, для приборов, которые на него реально отвечают UA (AKROS). Отдельный метод, чтобы
+// кадр, уходящий приборам РиМ, не изменился ни на бит.
+JNIEXPORT jboolean JNICALL
+Java_ru_rim_dd_core_bridge_SpodesClientBridge_nativeSetNormalResponseModeStandard(
+        JNIEnv* /*env*/, jobject /*thiz*/, jlong handle,
+        jint sourceAddress, jint logicalAddress, jint physicalAddress,
+        jint maxInfoTransmit, jint maxInfoReceive) {
+    SpodesClient* client = AsClient(handle);
+
+    SpodesClient::ConnectionAddresses addr{};
+    addr.source_address = static_cast<uint8_t>(sourceAddress);
+    addr.logical_address = static_cast<uint8_t>(logicalAddress);
+    addr.physical_address = static_cast<uint8_t>(physicalAddress);
+
+    return client->SetNormalResponseModeStandard(
+            addr,
+            static_cast<uint16_t>(maxInfoTransmit),
+            static_cast<uint16_t>(maxInfoReceive)) ? JNI_TRUE : JNI_FALSE;
+}
+
 JNIEXPORT jint JNICALL
 Java_ru_rim_dd_core_bridge_SpodesClientBridge_nativeReceiveUnnumberedAcknowledge(
         JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
@@ -181,6 +202,36 @@ Java_ru_rim_dd_core_bridge_SpodesClientBridge_nativeGetRequest(
     return client->GetRequest(params, nullptr, 0) ? JNI_TRUE : JNI_FALSE;
 }
 
+// [Android-патч] Установление ШИФРОВАННОЙ (высокоуровневой) ассоциации AKROS (HLS-GMAC).
+// key — ASCII-байты пароля (16 байт), напр. "SettingRiM_AKROS". Вызывать после SNRM/UA.
+JNIEXPORT jboolean JNICALL
+Java_ru_rim_dd_core_bridge_SpodesClientBridge_nativeEstablishCipheredConnection(
+        JNIEnv* env, jobject /*thiz*/, jlong handle, jstring key) {
+    SpodesClient* client = AsClient(handle);
+    const char* key_chars = key ? env->GetStringUTFChars(key, nullptr) : nullptr;
+    jsize key_len = key ? env->GetStringUTFLength(key) : 0;
+    bool ok = key_chars && client->EstablishCipheredConnection(key_chars, static_cast<uint8_t>(key_len));
+    if (key_chars) env->ReleaseStringUTFChars(key, key_chars);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+// [Android-патч] GET внутри шифрованной ассоциации AKROS. Ответ читать обычным
+// nativeGetResponseRaw — он расшифровывается автоматически (см. GetResponseRaw()).
+JNIEXPORT jboolean JNICALL
+Java_ru_rim_dd_core_bridge_SpodesClientBridge_nativeGetRequestCiphered(
+        JNIEnv* env, jobject /*thiz*/, jlong handle, jint classId, jstring obisCode,
+        jint attributeId) {
+    SpodesClient* client = AsClient(handle);
+    const char* obis_chars = env->GetStringUTFChars(obisCode, nullptr);
+    SpodesClient::RequestParams params{};
+    params.class_id = static_cast<uint16_t>(classId);
+    params.instance_id = std::string(obis_chars);
+    params.attribute_id = static_cast<uint8_t>(attributeId);
+    params.retry = false;
+    env->ReleaseStringUTFChars(obisCode, obis_chars);
+    return client->GetRequestCiphered(params) ? JNI_TRUE : JNI_FALSE;
+}
+
 JNIEXPORT jboolean JNICALL
 Java_ru_rim_dd_core_bridge_SpodesClientBridge_nativeGetRequestFlatAddress(
         JNIEnv* env, jobject /*thiz*/, jlong handle, jint classId, jstring obisCode,
@@ -219,6 +270,18 @@ Java_ru_rim_dd_core_bridge_SpodesClientBridge_nativeActionRequestFlatAddress(
                                             static_cast<uint8_t>(parameterValue),
                                             static_cast<uint8_t>(destAddress),
                                             static_cast<uint8_t>(srcAddress)) ? JNI_TRUE : JNI_FALSE;
+}
+
+// [Android-патч] Запрос СЛЕДУЮЩЕГО блока ответа (get-request-next, C0 02) — нужен, когда
+// прибор не может уместить ответ в один кадр и переходит на блочную передачу. Так отвечает
+// AKROS на чтение capture_objects: при согласованном размере информационного поля 128 байт
+// описание 14 колонок (больше 250 байт) физически не помещается в один кадр.
+JNIEXPORT jboolean JNICALL
+Java_ru_rim_dd_core_bridge_SpodesClientBridge_nativeSendReadyToReceive(
+        JNIEnv* /*env*/, jobject /*thiz*/, jlong handle, jint blockNumber) {
+    // SendReadyToReceiveBlock(), а не SendReadyToReceive(): сам метод объявлен в приватной
+    // секции SpodesClient, снаружи класса он недоступен — см. обёртку в spodes_client.h.
+    return AsClient(handle)->SendReadyToReceiveBlock(static_cast<int8_t>(blockNumber)) ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT jbyteArray JNICALL

@@ -11,6 +11,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.launch
 import ru.rim.dd.core.ble.BleDevice
+import ru.rim.dd.core.model.MeterDeviceName
 import ru.rim.dd.data.repository.MeterRepository
 import javax.inject.Inject
 
@@ -35,28 +36,20 @@ class PairingViewModel @Inject constructor(
 
     fun scan() {
         scanJob?.cancel()
-        _uiState.value = _uiState.value.copy(
-            isScanning = true,
-            foundDevices = emptyList(),
-            errorMessage = null
-        )
-
+        _uiState.value = _uiState.value.copy(isScanning = true, foundDevices = emptyList(), errorMessage = null)
         scanJob = viewModelScope.launch {
             repository.scanDevices()
-                // Пульты РиМ 040.40 рекламируются в эфире как "RIM ..." или "AKROS ..."
-                .filter { device ->
-                    device.name?.let { name ->
-                        NAME_PREFIXES.any { prefix ->
-                            name.startsWith(prefix, ignoreCase = true)
-                        }
-                    } == true
-                }
+                // [Android-патч] Раньше фильтр был жёстко по префиксу "RIM" — и счётчик AKROS
+                // (тоже прибор РиМ, но с именем вида "AKROS-07200090") в список вообще не
+                // попадал: выбрать его было физически нельзя. Теперь решение принимает
+                // MeterDeviceName.looksLikeMeter() — оно пропускает и приборы с разобранным
+                // именем любого известного формата, и просто знакомые префиксы. Смысл фильтра
+                // прежний: показывать приборы, а не все BLE-устройства вокруг.
+                .filter { MeterDeviceName.looksLikeMeter(it.name) }
                 .collect { device ->
                     val current = _uiState.value.foundDevices
                     if (current.none { it.address == device.address }) {
-                        _uiState.value = _uiState.value.copy(
-                            foundDevices = current + device
-                        )
+                        _uiState.value = _uiState.value.copy(foundDevices = current + device)
                     }
                 }
         }
@@ -119,8 +112,5 @@ class PairingViewModel @Inject constructor(
         }
     }
 
-    private companion object {
-        /** Пульты РиМ 040.40 рекламируются в эфире как "RIM ..." */
-        val NAME_PREFIXES = setOf("RIM", "AKROS")
-    }
+
 }

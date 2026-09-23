@@ -17,7 +17,18 @@ import kotlinx.coroutines.withContext
 import ru.rim.dd.core.ble.BleDevice
 import ru.rim.dd.core.ble.MeterBleClient
 import ru.rim.dd.core.bridge.SpodesClientBridge
+import ru.rim.dd.core.dlms.CaptureColumn
+import ru.rim.dd.core.dlms.ObisCatalog
 import ru.rim.dd.core.dlms.ObisReading
+import ru.rim.dd.core.dlms.captureColumnsOf
+import ru.rim.dd.core.dlms.ScalerUnit
+import ru.rim.dd.core.dlms.compactReadingsOf
+import ru.rim.dd.core.dlms.DlmsValue
+import ru.rim.dd.core.dlms.parseGetResponseBlock
+import ru.rim.dd.core.dlms.decodeDlmsValue
+import ru.rim.dd.core.dlms.scalerUnitOf
+import ru.rim.dd.core.dlms.kiloUnitLabelOf
+import ru.rim.dd.core.dlms.unitLabelOf
 import ru.rim.dd.core.dlms.decodeCosemDate
 import ru.rim.dd.core.dlms.decodeCosemTime
 import ru.rim.dd.core.dlms.describeDlmsValue
@@ -34,6 +45,7 @@ import ru.rim.dd.core.dlms.textValueOf
 import ru.rim.dd.core.model.ConnectionState
 import ru.rim.dd.core.model.MeterDeviceName
 import ru.rim.dd.core.model.MeterInfo
+import ru.rim.dd.core.model.MeterProtocolProfile
 import ru.rim.dd.core.model.NetworkParams
 import ru.rim.dd.core.model.PairedDevice
 import ru.rim.dd.core.model.PhaseValues
@@ -93,6 +105,39 @@ class MeterRepositoryImpl @Inject constructor(
      * пользователь (см. там же) — и рвёт связь, если это оказался другой.
      */
     private var meterReportedSerial: String? = null
+
+    /**
+     * [Android-патч] Диалект, на котором говорит подключённый прибор (см. MeterProtocolProfile).
+     * Определяется по имени устройства ОДИН раз при подключении и дальше используется и при
+     * первом чтении, и при восстановлении сеанса после переподключения — важно, чтобы после
+     * разрыва связи сеанс пересобирался ТЕМ ЖЕ способом, которым был установлен, иначе к AKROS
+     * мы вернулись бы уже без ассоциации и он перестал бы отдавать данные.
+     */
+    private var activeProfile: MeterProtocolProfile = MeterProtocolProfile.RIM_FLAT
+
+    /**
+     * [Android-патч] Описание колонок буфера индикации AKROS — см. readAkrosCaptureObjects().
+     * Список OBIS-кодов в том порядке, в котором прибор присылает значения; null на месте
+     * колонки означает, что её OBIS-код разобрать не удалось (значение такой колонки
+     * пропускается, но порядок остальных не сдвигается). Заполняется один раз за сеанс и
+     * очищается при каждом новом подключении — состав буфера у разных приборов разный.
+     */
+    private var akrosCaptureObis: List<CaptureColumn?> = emptyList()
+
+    /**
+     * [Android-патч] Точные единицы измерения колонок буфера AKROS — см. readAkrosScalerUnits().
+     * Ключ — OBIS-код колонки, значение — прочитанная у прибора пара {множитель, код единицы}.
+     * Заполняется один раз за сеанс вместе с описанием колонок.
+     */
+    private var akrosScalerUnits: Map<String, ScalerUnit> = emptyMap()
+
+    /**
+     * [Android-патч] Установлена ли с AKROS ШИФРОВАННАЯ (высокоуровневая) ассоциация HLS-GMAC —
+     * см. establishAkrosSession() и SpodesClientBridge.establishCipheredConnection(). Пока true,
+     * все GET к прибору идут зашифрованными (akrosGetRequest → getRequestCiphered), а ответы
+     * расшифровываются на нативной стороне. Сбрасывается при каждом новом подключении.
+     */
+    private var akrosCiphered: Boolean = false
 
     /** Собственный скоуп для «насоса» — живёт, пока есть активное BLE-соединение. */
     private val repositoryScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -222,6 +267,10 @@ class MeterRepositoryImpl @Inject constructor(
         // (а по адресу это ровно тот случай — пользователь выбрал устройство из списка) в поле
         // могло бы остаться значение с прошлого подключения, пока новый прибор не пришлёт своё.
         meterReportedSerial = null
+        // [Android-патч] см. activeProfile — диалект выбираем ДО создания клиента и открытия
+        // канала: от него зависит и порядок установления сеанса, и адресация запросов.
+        activeProfile = MeterProtocolProfile.forDeviceName(deviceName)
+        Log.i(TAG, "Профиль обмена для \"$deviceName\": $activeProfile")
         withContext(Dispatchers.IO) { ble.connectByAddress(address) }
         spodes.createClient()
         startTransportPump()
@@ -367,14 +416,30 @@ class MeterRepositoryImpl @Inject constructor(
      * достаточно одной функции, вызываемой и при коннекте, и по требованию пользователя.
      */
     private fun readAndApplyMainBuffer(): Boolean {
-        Log.d(TAG, "GET-request через GetRequestFlatAddress (плоская адресация, invoke-id=0x81, как у пульта)")
-        val sent = spodes.getRequestFlatAddress(
-            classId = 7,
-            obisCode = "0.0.21.0.2.255",
-            attributeId = 2,
-            destAddress = 0x03,
-            srcAddress = 0x43,
-        )
+        // [Android-патч] см. MeterProtocolProfile — адресация запроса зависит от прибора.
+        // У AKROS адреса стандартные (клиент 32 / сервер 1:16), и их уже держит внутри себя
+        // сам SpodesClient после SNRM (connection_addr_), поэтому идёт штатный getRequest();
+        // у РиМ — «плоская» однобайтовая адресация, которую библиотека сама не умеет, отсюда
+        // отдельный getRequestFlatAddress(). Запрашиваемый объект в обоих случаях ОДИН И ТОТ ЖЕ:
+        // буфер индикации 0.0.21.0.2.255 (класс 7) — по паспорту AKROS он у него тоже есть
+        // («Profile | Индикация»), так что разбор ответа и все экраны остаются общими.
+        val sent = if (activeProfile == MeterProtocolProfile.AKROS_STANDARD) {
+            Log.d(TAG, "GET-request буфера AKROS (${if (akrosCiphered) "шифрованный" else "открытый"})")
+            akrosGetRequest(
+                classId = MAIN_BUFFER_CLASS_ID,
+                obisCode = MAIN_BUFFER_OBIS,
+                attributeId = 2,
+            )
+        } else {
+            Log.d(TAG, "GET-request через GetRequestFlatAddress (плоская адресация, invoke-id=0x81, как у пульта)")
+            spodes.getRequestFlatAddress(
+                classId = MAIN_BUFFER_CLASS_ID,
+                obisCode = MAIN_BUFFER_OBIS,
+                attributeId = 2,
+                destAddress = 0x03,
+                srcAddress = 0x43,
+            )
+        }
         if (!sent) {
             // [Android-патч] см. lastProtocolError выше — читаем сообщение ЗДЕСЬ, пока функция
             // ещё выполняется внутри protocolMutex.withLock (это гарантирует вызывающий код), а не
@@ -399,7 +464,29 @@ class MeterRepositoryImpl @Inject constructor(
         // из вызывающего кода) — надёжный признак "сеанс реально поднялся".
         protocolSessionEstablished = true
         try {
-            val all = parseGetResponseTariffs(raw)
+            // [Android-патч] см. readAkrosCaptureObjects() — буфер AKROS «компактный»: значения
+            // идут подряд, без OBIS-кодов, и смысл колонок берётся из описания, прочитанного при
+            // установлении сеанса. Разбор буфера РиМ (тройки {OBIS, значение, scaler+unit}) для
+            // него не годится — именно поэтому раньше выходило «разобрано 0 элементов».
+            val all = if (activeProfile == MeterProtocolProfile.AKROS_STANDARD) {
+                // Буфер AKROS тоже приходит блоками — см. assembleDlmsValue(): четырнадцать
+                // колонок с датой-временем и строкой версии ПО в 128 байт не помещаются.
+                // Дочитываем блоки СРАЗУ, до всего остального: пока ответ не забран из канала
+                // целиком, любой следующий запрос попадёт на «хвост» этого — и разъедется весь
+                // дальнейший обмен.
+                val buffer = assembleDlmsValue(raw, "буфер индикации")
+                if (akrosCaptureObis.isEmpty()) {
+                    // Описание колонок не получено — пробуем ещё раз: без него значения буфера
+                    // сопоставить не с чем, а сеанс к этому моменту уже живой. Сами значения
+                    // этого цикла пропадают, но следующее автообновление (через несколько секунд)
+                    // разберёт буфер уже полностью.
+                    Log.w(TAG, "AKROS: описания буфера ещё нет — запрашиваем capture_objects повторно")
+                    readAkrosCaptureObjects()
+                }
+                buffer?.let { compactReadingsOf(it, akrosCaptureObis, akrosScalerUnits) } ?: emptyList()
+            } else {
+                parseGetResponseTariffs(raw)
+            }
             Log.d(TAG, "GET-response: разобрано ${all.size} элементов буфера: $all")
             applyDecodedBuffer(all)
             consecutiveEmptyOrFailedReads = 0 // см. consecutiveEmptyOrFailedReads выше — реально получили и разобрали данные
@@ -677,6 +764,21 @@ class MeterRepositoryImpl @Inject constructor(
     private fun applyDecodedBuffer(all: List<ObisReading>) {
         fun find(obis: String) = all.firstOrNull { it.obisCode == obis }
 
+        // [Android-патч] Текст поля буфера. РАНЬШЕ версия ПО/модель/серийник искались ТОЛЬКО в
+        // textValue (VisibleString, тег 0x0A) — так их отдаёт РиМ. Но AKROS присылает эти же
+        // поля OCTET-STRING'ом (тег 0x09): в логе 0.0.96.1.2.255 приходит как байты
+        // [49,46,48,50] = "1.02", при этом textValue=null — и поле «Версия ПО» молча оставалось
+        // пустым, хотя значение реально пришло. Теперь берём textValue, а если его нет —
+        // декодируем octetValue как ASCII (только если все байты печатные, иначе это не текст,
+        // а, например, дата-время, и подставлять её в «Версия ПО» нельзя).
+        fun readingText(r: ObisReading?): String? {
+            r ?: return null
+            r.textValue?.let { return it }
+            val bytes = r.octetValue ?: return null
+            if (bytes.isEmpty() || bytes.any { (it.toInt() and 0xFF) !in 0x20..0x7E }) return null
+            return String(bytes, Charsets.US_ASCII).trim().takeIf { it.isNotEmpty() }
+        }
+
         // ---- Состояние размыкателя (control_state) → _relayState ----
         // [Android-патч] см. RELAY_CONTROL_STATE_OBIS в GetResponseParser.kt: то самое поле,
         // которое при ПРЯМОМ чтении объекта Disconnect Control (0.0.96.3.10.255, attr=3) даёт
@@ -712,26 +814,58 @@ class MeterRepositoryImpl @Inject constructor(
         }
         if (energyReadings.isNotEmpty()) {
             _readings.value = energyReadings.map {
-                Reading(obisId = it.obisCode, tariff = it.tariff, valueKwh = it.valueKwh, timestamp = Instant.now())
+                Reading(
+                    obisId = it.obisCode,
+                    tariff = it.tariff,
+                    valueKwh = it.valueKwh,
+                    timestamp = Instant.now(),
+                    // [Android-патч] см. Reading.unitLabel — единица от самого прибора, если он её
+                    // сообщил. valueKwh делит на 1000, поэтому и подпись переводим в «кило»:
+                    // прибор отдаёт Вт·ч, на экране — кВт·ч.
+                    unitLabel = kiloUnitLabelOf(it.unit),
+                )
             }
         }
 
         // ---- Мгновенные параметры сети → _networkParams ----
-        val activePowerW = find("1.0.1.7.0.255")?.value
-        val reactivePowerVar = find("1.0.3.7.0.255")?.value
-        val apparentPowerVa = find("1.0.9.7.0.255")?.value
-        val voltageV = find("1.0.12.7.0.255")?.value
-        val currentA = find("1.0.11.7.0.255")?.value
+        // [Android-патч] ПОДДЕРЖКА ТРЁХФАЗНЫХ ПРИБОРОВ (напр. РиМ 489). У однофазных (189.xx,
+        // AKROS) мгновенные величины лежат под «суммарными» OBIS: напряжение 1.0.12.7.0.255,
+        // ток 1.0.11.7.0.255. У трёхфазного 489 таких кодов НЕТ — вместо них пофазные (это и
+        // видно в его буфере: напряжение 1.0.32.7 / 1.0.52.7 / 1.0.72.7 ≈ 143 В, частота
+        // 1.0.14.7 ≈ 50 Гц). Раньше мы читали только суммарные коды, поэтому на 489 напряжение
+        // и ток показывались нулями, хотя прибор под нагрузкой и реально их отдаёт. Теперь берём
+        // и суммарные, и пофазные; PhaseValues.total для трёхфазного — L1 (чтобы поле не пустовало),
+        // а l1/l2/l3 заполняются для пофазного отображения на экране «Сеть».
+        // OBIS по стандарту COSEM: фаза A = *.(2x).7, фаза B = *.(4x).7, фаза C = *.(6x).7.
+        fun phase(total: String, l1: String, l2: String, l3: String, divide: Double = 1.0): PhaseValues? {
+            val t = find(total)?.value
+            val a = find(l1)?.value
+            val b = find(l2)?.value
+            val c = find(l3)?.value
+            if (t == null && a == null && b == null && c == null) return null
+            return PhaseValues(
+                total = (t ?: a ?: 0.0) / divide,
+                l1 = a?.div(divide),
+                l2 = b?.div(divide),
+                l3 = c?.div(divide),
+            )
+        }
+        val voltage = phase("1.0.12.7.0.255", "1.0.32.7.0.255", "1.0.52.7.0.255", "1.0.72.7.0.255")
+        val current = phase("1.0.11.7.0.255", "1.0.31.7.0.255", "1.0.51.7.0.255", "1.0.71.7.0.255")
+        // Мощности — в кВт/квар/кВА, поэтому делим на 1000 (прибор отдаёт в Вт/вар/ВА).
+        val power = phase("1.0.1.7.0.255", "1.0.21.7.0.255", "1.0.41.7.0.255", "1.0.61.7.0.255", divide = 1000.0)
+        val reactivePower = phase("1.0.3.7.0.255", "1.0.23.7.0.255", "1.0.43.7.0.255", "1.0.63.7.0.255", divide = 1000.0)
+        val apparentPower = phase("1.0.9.7.0.255", "1.0.29.7.0.255", "1.0.49.7.0.255", "1.0.69.7.0.255", divide = 1000.0)
         val neutralCurrentA = find("1.0.91.7.0.255")?.value
         val frequencyHz = find("1.0.14.7.0.255")?.value
-        if (voltageV != null || currentA != null || activePowerW != null) {
+        if (voltage != null || current != null || power != null) {
             _networkParams.value = NetworkParams(
-                voltage = PhaseValues(total = voltageV ?: 0.0),
-                current = PhaseValues(total = currentA ?: 0.0),
-                power = PhaseValues(total = (activePowerW ?: 0.0) / 1000.0),
+                voltage = voltage ?: PhaseValues(total = 0.0),
+                current = current ?: PhaseValues(total = 0.0),
+                power = power ?: PhaseValues(total = 0.0),
                 frequencyHz = frequencyHz,
-                reactivePowerKvar = reactivePowerVar?.div(1000.0),
-                apparentPowerKva = apparentPowerVa?.div(1000.0),
+                reactivePowerKvar = reactivePower?.total,
+                apparentPowerKva = apparentPower?.total,
                 neutralCurrentA = neutralCurrentA,
             )
         }
@@ -765,7 +899,7 @@ class MeterRepositoryImpl @Inject constructor(
         // объектом из паспорта, и подпись обязана соответствовать реальному источнику, а не
         // первому коду из списка кандидатов.
         val firmwareEntry = FIRMWARE_VERSION_OBIS_CANDIDATES
-            .firstNotNullOfOrNull { obis -> find(obis)?.textValue?.let { obis to it } }
+            .firstNotNullOfOrNull { obis -> readingText(find(obis))?.let { obis to it } }
         val firmwareVersion = firmwareEntry?.second
         // [Android-патч] см. FIRMWARE_VERSION_OBIS_CANDIDATES — тот же буфер на проверенном
         // втором счётчике (модель 189.40) содержит ещё и человекочитаемое имя модели прямо
@@ -777,13 +911,13 @@ class MeterRepositoryImpl @Inject constructor(
         // если модель пришла из буфера, подписываем её этим OBIS; если буфер её не содержит и
         // название осталось от разбора BLE-имени, modelObis останется null и подписи не будет.
         val modelEntry = MODEL_NAME_OBIS_CANDIDATES
-            .firstNotNullOfOrNull { obis -> find(obis)?.textValue?.let { obis to it } }
+            .firstNotNullOfOrNull { obis -> readingText(find(obis))?.let { obis to it } }
         val modelName = modelEntry?.second
 
         // [Android-патч] см. meterReportedSerial выше — серийный номер САМОГО прибора из буфера.
         // Это и подпись на экране «Инфо» (теперь честный OBIS вместо «из имени BLE-устройства»),
         // и — главное — то, чем connectBySerialNumber() проверяет, что подключился к нужному ПУ.
-        val serialFromBuffer = find(SERIAL_NUMBER_OBIS)?.textValue?.trim()?.takeIf { it.isNotEmpty() }
+        val serialFromBuffer = readingText(find(SERIAL_NUMBER_OBIS))?.trim()?.takeIf { it.isNotEmpty() }
         if (serialFromBuffer != null && serialFromBuffer != meterReportedSerial) {
             Log.d(TAG, "Прибор сообщил свой серийный номер ($SERIAL_NUMBER_OBIS): \"$serialFromBuffer\"")
         }
@@ -863,6 +997,12 @@ class MeterRepositoryImpl @Inject constructor(
      * совпадает с тем, что видно в реальных кадрах (адрес счётчика = 1).
      */
     private fun establishHdlcChannel() {
+        // [Android-патч] см. MeterProtocolProfile — у AKROS принципиально другой порядок
+        // установления сеанса, поэтому здесь развилка, а не общий код с оговорками.
+        if (activeProfile == MeterProtocolProfile.AKROS_STANDARD) {
+            establishAkrosSession()
+            return
+        }
         Log.d(TAG, "SNRM: отправляем (source=$HDLC_SOURCE_ADDRESS, logical=$HDLC_LOGICAL_ADDRESS, physical=$HDLC_PHYSICAL_ADDRESS)")
         val snrmOk = spodes.setNormalResponseMode(
             sourceAddress = HDLC_SOURCE_ADDRESS,
@@ -876,6 +1016,334 @@ class MeterRepositoryImpl @Inject constructor(
             throw IllegalStateException("Не удалось сформировать SNRM-кадр: ${spodes.lastErrorMessage()}")
         }
         // Ожидание UA убрано — см. комментарий выше: 3 секунды впустую на каждое подключение.
+    }
+
+    /**
+     * [Android-патч] Установление сеанса с AKROS — полноценное, в отличие от РиМ.
+     *
+     * Порядок вычитан из эталонного лога обмена штатной утилиты с прибором (границы полей в
+     * кадрах проверены пересчётом HCS/FCS, а не «на глаз»):
+     *
+     *  1. SNRM с адресами клиент 32 / сервер логический 1, физический 16 — в эфире это
+     *     байты 0x41 и 0x02 0x21. Здесь важно, что библиотека кодирует адреса ровно так же
+     *     (AppendBit: 32→0x41, 1→0x02, 16→0x21), то есть штатный путь SpodesClient — это в
+     *     точности то, что ждёт AKROS, и городить свою сборку кадров не нужно.
+     *  2. ДОЖИДАЕМСЯ UA. У РиМ этот шаг убран (прибор молчит, и ожидание тратило 3 секунды
+     *     впустую), а AKROS отвечает — в его UA приходят согласованные max-info 128/128 и
+     *     размер окна 1, и без этого шага размеры кадров останутся несогласованными.
+     *  3. АССОЦИАЦИЯ AARQ/AARE с низким уровнем безопасности (LLS) и паролем. Для РиМ мы от
+     *     ассоциации отказались — она ломала прибор до конца сессии; для AKROS она,
+     *     наоборот, обязательна: в эталонном логе AARE приходит с result=0 (accepted), и
+     *     только после этого идут запросы данных.
+     */
+    private fun establishAkrosSession() {
+        Log.d(
+            TAG,
+            "AKROS: SNRM (клиент=$AKROS_CLIENT_ADDRESS, сервер логич.=$AKROS_LOGICAL_ADDRESS, " +
+                    "физич.=$AKROS_PHYSICAL_ADDRESS)",
+        )
+        // [Android-патч] ИМЕННО setNormalResponseModeStandard, а не обычный setNormalResponseMode:
+        // тот отправляет испорченный кадр (лишний LLC-заголовок внутри U-кадра, неверное поле
+        // длины и несошедшаяся FCS — разбор в spodes_client.h). Приборы РиМ это прощали, потому
+        // что на SNRM не отвечают вовсе, а AKROS кадр с битой контрольной суммой молча
+        // отбрасывал — в логе это и выглядело как «не дождались UA».
+        val snrmOk = spodes.setNormalResponseModeStandard(
+            sourceAddress = AKROS_CLIENT_ADDRESS,
+            logicalAddress = AKROS_LOGICAL_ADDRESS,
+            physicalAddress = AKROS_PHYSICAL_ADDRESS,
+        )
+        if (!snrmOk) {
+            stopTransportPump()
+            ble.disconnect()
+            throw IllegalStateException("AKROS: не удалось сформировать SNRM-кадр: ${spodes.lastErrorMessage()}")
+        }
+
+        // Ответ на SNRM: 1 — пришёл UA (сеанс открыт), 2 — прибор ответил DM («уже отключён»),
+        // 0 — ошибка/таймаут. Разделяем случаи явно: по одному этому коду в логе сразу видно,
+        // дошёл ли до прибора сам SNRM, — а это первое, что нужно знать при разборе.
+        val ua = spodes.receiveUnnumberedAcknowledge()
+        Log.d(TAG, "AKROS: ответ на SNRM = $ua (1=UA, 2=DM, 0=ошибка/таймаут)")
+        if (ua != 1) {
+            stopTransportPump()
+            ble.disconnect()
+            throw IllegalStateException(
+                if (ua == 2) "AKROS: прибор ответил DM — сеанс не открыт"
+                else "AKROS: не дождались UA на SNRM (${spodes.lastErrorMessage()})"
+            )
+        }
+
+        // [Android-патч] РАБОЧИЙ РЕЖИМ — НИЗКОУРОВНЕВАЯ ассоциация (LLS, пароль "Reader").
+        // Её достаточно: версия ПО, параметры сети, энергия, тарифы, время — всё лежит в
+        // публичном буфере индикации и читается на низком уровне (проверено логом).
+        //
+        // Высокоуровневая (шифрованная HLS-GMAC) ассоциация ОСТАВЛЕНА в коде, но по умолчанию
+        // ВЫКЛЮЧЕНА флагом AKROS_TRY_HLS. Её схема побайтово сверена с эталонным логом
+        // (см. spodes_ciphered.hpp и тест), однако конкретный прибор на стенде отвергает её с
+        // «authentication-failure» даже при заведомо большом счётчике вызовов — то есть дело не
+        // в защите от повтора, а либо в другом GMAC-ключе этого экземпляра, либо в требовании
+        // прочитать текущий frame-counter прибора перед ассоциацией. Как только появится точный
+        // ключ или свежий лог УСПЕШНОГО высокоуровневого обмена штатной программы с этим
+        // прибором — достаточно вернуть AKROS_TRY_HLS = true (и, при необходимости, поправить
+        // засев счётчика/ключ), весь остальной код уже готов.
+        akrosCiphered = false
+        if (AKROS_TRY_HLS) {
+            Log.d(TAG, "AKROS: AARQ (шифрованная ассоциация, HLS-GMAC)")
+            if (spodes.establishCipheredConnection(AKROS_HLS_PASSWORD)) {
+                akrosCiphered = true
+                Log.i(TAG, "AKROS: шифрованная ассоциация установлена — доступны все объекты")
+            } else {
+                Log.w(
+                    TAG,
+                    "AKROS: шифрованная ассоциация не удалась (${spodes.lastErrorMessage()}) — " +
+                            "откатываемся на низкоуровневую (LLS, пароль \"$AKROS_ASSOCIATION_PASSWORD\")",
+                )
+            }
+        }
+        if (!akrosCiphered) {
+            Log.d(TAG, "AKROS: AARQ (низкоуровневая ассоциация, LLS, пароль \"$AKROS_ASSOCIATION_PASSWORD\")")
+            val aarqOk = spodes.establishConnection(
+                securityLevel = AKROS_SECURITY_LEVEL_LOW,
+                password = AKROS_ASSOCIATION_PASSWORD,
+            )
+            if (!aarqOk) {
+                stopTransportPump()
+                ble.disconnect()
+                throw IllegalStateException("AKROS: ассоциация не установлена: ${spodes.lastErrorMessage()}")
+            }
+        }
+        Log.i(TAG, "AKROS: ассоциация установлена, можно читать данные")
+        readAkrosCaptureObjects()
+        if (akrosCiphered) readAkrosSoftwareVersion()
+    }
+
+    /**
+     * [Android-патч] GET к AKROS: в шифрованной ассоциации — зашифрованный (getRequestCiphered),
+     * иначе обычный. Единая точка, чтобы все чтения AKROS (описание буфера, единицы, сам буфер,
+     * версия ПО) автоматически шли правильным способом и не расходились.
+     */
+    private fun akrosGetRequest(classId: Int, obisCode: String, attributeId: Int): Boolean =
+        if (akrosCiphered) spodes.getRequestCiphered(classId, obisCode, attributeId)
+        else spodes.getRequest(classId, obisCode, attributeId)
+
+    /**
+     * [Android-патч] Читает версию ПО и имя устройства ПО ЗАПРОСУ — не из рекламного имени BLE,
+     * а прямым чтением объектов прибора (доступно только внутри шифрованной ассоциации, см.
+     * establishAkrosSession). Имя устройства (0.0.42.0.0.255, class 1) в эталонном логе приходит
+     * как "RIMAKROS07200090" и читается гарантированно; версию ПО пробуем по стандартным
+     * OBIS-кандидатам и берём первый успешный ответ. Ошибка на отдельном объекте не фатальна:
+     * связь и ассоциация остаются, просто соответствующее поле не обновится.
+     */
+    private fun readAkrosSoftwareVersion() {
+        // Имя устройства (COSEM logical device name) — подтверждено логом.
+        readAkrosStringObject(AKROS_DEVICE_NAME_CLASS_ID, AKROS_DEVICE_NAME_OBIS, "имя устройства")
+            ?.let { name ->
+                Log.i(TAG, "AKROS: имя устройства ($AKROS_DEVICE_NAME_OBIS) = \"$name\"")
+                val prev = _meterInfo.value
+                _meterInfo.value = (prev ?: MeterInfo(model = "—", serialNumber = activeSerialNumber ?: "—", firmwareVersion = "—"))
+                    .copy(model = name, modelObis = AKROS_DEVICE_NAME_OBIS)
+            }
+        // Версия ПО — перебор стандартных кандидатов, берём первый непустой.
+        for (obis in AKROS_FIRMWARE_OBIS_CANDIDATES) {
+            val version = readAkrosStringObject(classId = 1, obisCode = obis, label = "версия ПО")
+            if (!version.isNullOrBlank()) {
+                Log.i(TAG, "AKROS: версия ПО ($obis) = \"$version\"")
+                val prev = _meterInfo.value
+                _meterInfo.value = (prev ?: MeterInfo(model = "—", serialNumber = activeSerialNumber ?: "—", firmwareVersion = "—"))
+                    .copy(firmwareVersion = version, firmwareVersionObis = obis)
+                break
+            }
+        }
+    }
+
+    /**
+     * [Android-патч] Читает один атрибут как строку/октет-строку (версия ПО, имя устройства).
+     * Возвращает текст либо null, если объект недоступен/ответ не разобрался. Ответ приходит
+     * одним кадром (эти объекты малы), поэтому дочитывание блоков не нужно — но на всякий
+     * случай пропускаем через тот же readDlmsValueWithBlocks(), который обрабатывает и обычный,
+     * и блочный ответ.
+     */
+    private fun readAkrosStringObject(classId: Int, obisCode: String, label: String): String? {
+        if (!akrosGetRequest(classId, obisCode, attributeId = 2)) {
+            Log.w(TAG, "AKROS: запрос \"$label\" ($obisCode) не ушёл: ${spodes.lastErrorMessage()}")
+            return null
+        }
+        val value = readDlmsValueWithBlocks(label) ?: return null
+        return textValueOf(value).trim().takeIf { it.isNotEmpty() }
+    }
+
+    /**
+     * [Android-патч] Читает ответ на уже отправленный GET-запрос и, если прибор разбил его на
+     * части, ДОЧИТЫВАЕТ остальные и склеивает — только после этого разбирает значение.
+     *
+     * ЗАЧЕМ ЭТО ПОНАДОБИЛОСЬ. При установлении сеанса AKROS соглашается на информационное поле
+     * в 128 байт. Описание колонок буфера (capture_objects — 14 записей по 18 байт) и сам буфер
+     * в такой кадр не помещаются, и DLMS штатно переходит на блочную передачу: вместо обычного
+     * ответа «C4 01» прибор присылает «C4 02» с флагом «последний блок», номером блока и куском
+     * данных, а клиент обязан запрашивать следующие блоки, пока флаг не станет единицей.
+     *
+     * Пока этого цикла не было, приложение брало ПЕРВЫЙ блок за целый ответ. В логе это выглядело
+     * особенно обманчиво: разбор промахивался мимо границ полей на пару байт, упирался в нулевой
+     * байт номера блока, декодировал его как «пустое значение» — и честно сообщал «описание
+     * буфера получено, 0 колонок» при полностью исправном ответе прибора. Отсюда же росли и
+     * «данных нет» на экранах: без описания колонок значения буфера сопоставить не с чем.
+     *
+     * Обычный (неблочный) ответ проходит здесь насквозь, поэтому вызывать метод безопасно для
+     * любого GET — блочность определяется по самому ответу, а не по тому, какой атрибут мы
+     * запросили (у одного и того же объекта короткий scaler_unit придёт одним кадром, а длинный
+     * буфер — блоками).
+     *
+     * Ограничитель на [MAX_DLMS_BLOCKS] блоков — защита от зацикливания: если прибор из-за
+     * рассинхронизации перестанет ставить флаг последнего блока, лучше выйти с записью в лог,
+     * чем крутить обмен по BLE бесконечно. Неполный ответ НЕ разбираем: обрывок данных
+     * декодировался бы «успешно», но в неправильные значения — это хуже, чем честный null.
+     */
+    private fun readDlmsValueWithBlocks(label: String): DlmsValue? {
+        val first = spodes.getResponseRawBytes()
+        if (first.isEmpty()) {
+            Log.w(TAG, "AKROS: пустой ответ на $label (${spodes.lastErrorMessage()})")
+            return null
+        }
+        return assembleDlmsValue(first, label)
+    }
+
+    /**
+     * [Android-патч] То же, что [readDlmsValueWithBlocks], но для случая, когда первый кадр
+     * ответа УЖЕ прочитан вызывающим кодом (см. readAndApplyMainBuffer(): там тот же кадр нужен
+     * ещё и разбору буфера РиМ, который работает с «сырым» кадром, а не со значением).
+     */
+    private fun assembleDlmsValue(first: ByteArray, label: String): DlmsValue? {
+        var block = parseGetResponseBlock(first)
+            ?: return runCatching { parseGetResponseValue(first) }
+                .onFailure { Log.w(TAG, "AKROS: ответ на $label не разобран: ${it.message}") }
+                .getOrNull()
+
+        val data = java.io.ByteArrayOutputStream()
+        data.write(block.data)
+        var blocks = 1
+        while (!block.lastBlock && blocks < MAX_DLMS_BLOCKS) {
+            if (!spodes.sendReadyToReceive(block.blockNumber)) {
+                Log.w(TAG, "AKROS: запрос блока ${block.blockNumber + 1} ($label) не ушёл: ${spodes.lastErrorMessage()}")
+                break
+            }
+            val raw = spodes.getResponseRawBytes()
+            if (raw.isEmpty()) {
+                Log.w(TAG, "AKROS: пустой ответ на блок ${block.blockNumber + 1} ($label) (${spodes.lastErrorMessage()})")
+                break
+            }
+            val next = parseGetResponseBlock(raw)
+            if (next == null) {
+                Log.w(TAG, "AKROS: блок ${block.blockNumber + 1} ($label) пришёл в неожиданном формате")
+                break
+            }
+            data.write(next.data)
+            block = next
+            blocks++
+        }
+
+        if (!block.lastBlock) {
+            Log.w(TAG, "AKROS: $label получен не полностью — оборвались на блоке ${block.blockNumber} из $blocks")
+            return null
+        }
+        val bytes = data.toByteArray()
+        Log.d(TAG, "AKROS: $label собран из $blocks блок(ов), ${bytes.size} байт данных")
+        return runCatching { decodeDlmsValue(bytes) }
+            .onFailure { Log.w(TAG, "AKROS: $label не разобран после склейки блоков: ${it.message}") }
+            .getOrNull()
+    }
+
+    /**
+     * [Android-патч] Читает описание колонок буфера индикации (атрибут 3 «capture_objects»
+     * объекта Profile Generic) — БЕЗ него данные AKROS разобрать невозможно.
+     *
+     * Почему так. Приборы РиМ присылают значения тройками {OBIS-код, значение, scaler+unit} —
+     * каждое значение само себя называет. AKROS присылает «компактный» буфер: массив из одной
+     * структуры, где лежат только значения подряд, без единого OBIS-кода (первый же удачный
+     * ответ выглядел как 14 значений — десять Float32, дата-время, два перечисления и текст
+     * версии ПО). Старый разбор искал в нём OBIS-коды, не находил и честно возвращал «0
+     * элементов» — данные были, а смысла у них не было.
+     *
+     * Смысл колонок хранится в самом приборе: это штатный атрибут 3 того же объекта, список
+     * {class_id, OBIS, номер атрибута, индекс}. Читаем его ОДИН раз за сеанс (состав буфера в
+     * пределах сеанса не меняется) и дальше просто раскладываем значения по этим кодам. Никаких
+     * догадок «колонка 5 — это, наверное, ток»: прибор отвечает на прямой вопрос.
+     *
+     * Если прочитать не удалось — сеанс не рвём: связь есть, ассоциация есть, и осмысленнее
+     * оставить приложение подключённым с пустыми показаниями и явной строкой в логе, чем
+     * уронить подключение целиком. Следующая попытка чтения буфера повторит запрос.
+     */
+    private fun readAkrosCaptureObjects() {
+        akrosCaptureObis = emptyList()
+        akrosScalerUnits = emptyMap() // см. readAkrosScalerUnits() — единицы относятся к КОНКРЕТНОМУ сеансу
+        val sent = akrosGetRequest(
+            classId = MAIN_BUFFER_CLASS_ID,
+            obisCode = MAIN_BUFFER_OBIS,
+            attributeId = PROFILE_CAPTURE_OBJECTS_ATTRIBUTE,
+        )
+        if (!sent) {
+            Log.w(TAG, "AKROS: не удалось отправить запрос capture_objects: ${spodes.lastErrorMessage()}")
+            return
+        }
+        val value = readDlmsValueWithBlocks("capture_objects") ?: return
+        try {
+            val columns = captureColumnsOf(value)
+            akrosCaptureObis = columns
+            Log.i(
+                TAG,
+                "AKROS: описание буфера получено, ${columns.size} колонок: " +
+                        columns.joinToString { c ->
+                            c?.let { "${it.obisCode} (${ObisCatalog.nameOf(it.obisCode) ?: "?"}, класс ${it.classId})" } ?: "—"
+                        },
+            )
+            readAkrosScalerUnits(columns)
+        } catch (ex: Exception) {
+            Log.e(TAG, "AKROS: не удалось разобрать capture_objects: ${ex.message}", ex)
+        }
+    }
+
+    /**
+     * [Android-патч] Дочитывает ТОЧНУЮ единицу измерения для каждой колонки буфера.
+     *
+     * Зачем отдельным шагом. В компактном буфере AKROS лежат только числа — ни OBIS-кодов, ни
+     * единиц. Смысл колонок даёт capture_objects (см. выше), а единицу и множитель прибор
+     * хранит в атрибуте scaler_unit самого объекта: это структура {scaler, unit}, где unit —
+     * код по IEC 62056-6-2 (30 = Вт·ч, 35 = В, 44 = Гц…), а scaler — степень десятки, на
+     * которую нужно умножить значение. Без него единицу пришлось бы угадывать по порядку
+     * величины, а множитель молча считать нулевым — то есть показания могли бы отличаться от
+     * настоящих в тысячу раз и выглядеть при этом правдоподобно.
+     *
+     * Спрашиваем только у тех объектов, у которых scaler_unit вообще есть (Register и его
+     * разновидности — см. ScalerUnit.attributeFor): у Data, Clock или Disconnect Control этого
+     * атрибута нет, и запрос к ним был бы гарантированным отказом доступа.
+     *
+     * Читается ОДИН раз за сеанс и кэшируется: единицы в пределах сеанса не меняются, а каждый
+     * такой запрос — отдельный обмен по BLE, и делать их на каждом цикле автообновления значило
+     * бы утроить трафик ради неизменных данных. Ошибка на отдельной колонке не фатальна: она
+     * останется без единицы, остальные разберутся нормально.
+     */
+    private fun readAkrosScalerUnits(columns: List<CaptureColumn?>) {
+        val units = mutableMapOf<String, ScalerUnit>()
+        columns.filterNotNull()
+            .distinctBy { it.obisCode }
+            .forEach { column ->
+                val attribute = ScalerUnit.attributeFor(column.classId) ?: return@forEach
+                if (!akrosGetRequest(column.classId, column.obisCode, attribute)) {
+                    Log.w(TAG, "AKROS: запрос scaler_unit для ${column.obisCode} не ушёл: ${spodes.lastErrorMessage()}")
+                    return@forEach
+                }
+                val answer = readDlmsValueWithBlocks("scaler_unit ${column.obisCode}") ?: return@forEach
+                val parsed = runCatching { scalerUnitOf(answer) }
+                    .onFailure { Log.w(TAG, "AKROS: scaler_unit для ${column.obisCode} не разобран: ${it.message}") }
+                    .getOrNull()
+                if (parsed != null) units[column.obisCode] = parsed
+            }
+        akrosScalerUnits = units
+        Log.i(
+            TAG,
+            "AKROS: единицы измерения получены для ${units.size} из ${columns.count { it != null }} колонок: " +
+                    units.entries.joinToString { (obis, su) ->
+                        "$obis → ${unitLabelOf(su.unit) ?: "ед.${su.unit}"}${if (su.scaler != 0) " ×10^${su.scaler}" else ""}"
+                    },
+        )
     }
 
     /**
@@ -905,6 +1373,10 @@ class MeterRepositoryImpl @Inject constructor(
     override suspend fun connectBySerialNumber(serialNumber: String, pin: String, remember: Boolean) {
         meterReportedSerial = null // см. ниже — проверять нужно номер ИЗ ЭТОГО сеанса, а не с прошлого подключения
         val found = withContext(Dispatchers.IO) { ble.connectBySerialNumber(serialNumber) }
+        // [Android-патч] см. activeProfile — имя берём РЕАЛЬНОЕ, из эфира, а не введённое
+        // пользователем: по нему и определяется диалект прибора.
+        activeProfile = MeterProtocolProfile.forDeviceName(found.name)
+        Log.i(TAG, "Профиль обмена для \"${found.name}\": $activeProfile")
         spodes.createClient()
         startTransportPump()
         withContext(Dispatchers.IO) { establishHdlcChannel() }
@@ -1414,6 +1886,94 @@ class MeterRepositoryImpl @Inject constructor(
          * буфере индикации; именно по нему проверяется, что подключились к запрошенному ПУ.
          */
         private const val SERIAL_NUMBER_OBIS = "0.0.96.1.0.255"
+
+        /**
+         * [Android-патч] Буфер индикации — единственный объект, из которого приложение берёт
+         * ВСЕ показания. Вынесен в константы, потому что теперь запрашивается двумя разными
+         * способами (см. readAndApplyMainBuffer): у РиМ — «плоской» адресацией, у AKROS —
+         * штатной. Сам объект и класс при этом одни и те же: по паспортам обоих приборов это
+         * «Profile | Индикация», класс 7 (Profile Generic), атрибут 2 (буфер).
+         */
+        private const val MAIN_BUFFER_OBIS = "0.0.21.0.2.255"
+        private const val MAIN_BUFFER_CLASS_ID = 7
+
+        /**
+         * [Android-патч] Атрибут 3 объекта Profile Generic — capture_objects, описание колонок
+         * буфера (атрибут 2). См. readAkrosCaptureObjects().
+         */
+        private const val PROFILE_CAPTURE_OBJECTS_ATTRIBUTE = 3
+
+        /**
+         * [Android-патч] Предел числа блоков одного ответа — защита от зацикливания, см.
+         * assembleDlmsValue(). Самый длинный из реально нужных ответов (описание колонок буфера,
+         * 14 записей по 18 байт) укладывается в три блока по 108 байт; 32 — заведомо с запасом,
+         * но не бесконечность, если прибор из-за рассинхронизации перестанет ставить флаг
+         * последнего блока.
+         */
+        private const val MAX_DLMS_BLOCKS = 32
+
+        /**
+         * [Android-патч] Адреса AKROS — см. MeterProtocolProfile.AKROS_STANDARD и
+         * establishAkrosSession(). Значения взяты из эталонного лога обмена штатной утилиты:
+         * в эфире это байты 0x41 (клиент) и 0x02 0x21 (сервер); библиотека кодирует переданные
+         * сюда числа ровно в них (AppendBit: 32→0x41, 1→0x02, 16→0x21).
+         */
+        private const val AKROS_CLIENT_ADDRESS = 32
+        private const val AKROS_LOGICAL_ADDRESS = 1
+        private const val AKROS_PHYSICAL_ADDRESS = 16
+
+        /**
+         * [Android-патч] Низкий уровень безопасности (LLS) — в эталонном логе AARQ содержит
+         * mechanism-name 2.16.756.5.8.2.1, это механизм №1, то есть проверка по паролю без
+         * шифрования.
+         */
+        private const val AKROS_SECURITY_LEVEL_LOW = 1
+
+        /**
+         * [Android-патч] Пароль ассоциации AKROS. Взят из эталонного лога: в AARQ поле
+         * calling-authentication-value содержит строку "Reader" (байты 52 65 61 64 65 72) —
+         * это пароль ассоциации ЧТЕНИЯ, не путать с PIN-кодом BLE-сопряжения, который спрашивает
+         * сам Android при включении notify. Если для другого прибора/ассоциации пароль окажется
+         * другим, его стоит вынести в настройки, а не подбирать здесь.
+         */
+        private const val AKROS_ASSOCIATION_PASSWORD = "Reader"
+
+        /**
+         * [Android-патч] Пароль/ключ ШИФРОВАННОЙ (высокоуровневой) ассоциации AKROS — HLS-GMAC.
+         * Ровно 16 ASCII-символов; используется и как ключ шифрования, и как ключ аутентификации
+         * (для этого прибора они совпадают — подтверждено побайтовым разбором лога). Если у другого
+         * прибора ключ иной, его стоит вынести в настройки. Не путать с паролем LLS "Reader" выше
+         * и с PIN-кодом BLE-сопряжения.
+         */
+        private const val AKROS_HLS_PASSWORD = "SettingRiM_AKROS"
+
+        /**
+         * [Android-патч] Пробовать ли ШИФРОВАННУЮ (высокоуровневую) ассоциацию HLS-GMAC перед
+         * откатом на низкий уровень. По умолчанию false: на текущем приборе высокий уровень
+         * отвергается («authentication-failure»), а всё нужное и так читается на низком уровне из
+         * публичного буфера. Вернуть true, когда будет точный GMAC-ключ этого экземпляра или
+         * свежий лог успешного высокоуровневого обмена штатной программы — см. establishAkrosSession().
+         */
+        private const val AKROS_TRY_HLS = false
+
+        /**
+         * [Android-патч] Имя устройства AKROS (COSEM logical device name), класс 1 Data. В
+         * эталонном логе атрибут 2 этого объекта возвращает "RIMAKROS07200090" — читается только
+         * внутри шифрованной ассоциации, см. readAkrosSoftwareVersion().
+         */
+        private const val AKROS_DEVICE_NAME_OBIS = "0.0.42.0.0.255"
+        private const val AKROS_DEVICE_NAME_CLASS_ID = 1
+
+        /**
+         * [Android-патч] Кандидаты OBIS-кодов версии ПО для чтения ПО ЗАПРОСУ внутри шифрованной
+         * ассоциации (см. readAkrosSoftwareVersion). Порядок = приоритет; берётся первый непустой
+         * ответ. 0.0.0.2.0.255 — стандартный COSEM "active firmware identifier"; 0.0.96.1.2.255 —
+         * распространённый производственный код версии ПО у приборов линейки.
+         */
+        private val AKROS_FIRMWARE_OBIS_CANDIDATES = listOf(
+            "0.0.0.2.0.255",
+            "0.0.96.1.2.255",
+        )
 
         /**
          * [Android-патч] см. applyDecodedBuffer() — 0.0.96.1.1.255 ("Device ID 1") подтверждён

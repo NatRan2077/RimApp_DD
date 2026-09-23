@@ -26,6 +26,10 @@ import ru.rim.dd.feature.common.ObisCaption
 // на экране и источник данных нельзя было случайно рассинхронизировать.
 private const val OBIS_VOLTAGE = "1.0.12.7.0.255"
 private const val OBIS_CURRENT = "1.0.11.7.0.255"
+// [Android-патч] Пофазные коды для трёхфазных приборов (РиМ 489) — подпись, когда показываем
+// напряжение/ток по фазам A/B/C (см. applyDecodedBuffer() и isThreePhase ниже).
+private const val OBIS_VOLTAGE_L1 = "1.0.32.7.0.255"
+private const val OBIS_CURRENT_L1 = "1.0.31.7.0.255"
 private const val OBIS_NEUTRAL_CURRENT = "1.0.91.7.0.255"
 private const val OBIS_ACTIVE_POWER = "1.0.1.7.0.255"
 private const val OBIS_REACTIVE_POWER = "1.0.3.7.0.255"
@@ -60,16 +64,34 @@ fun NetworkScreen(viewModel: NetworkViewModel = hiltViewModel()) {
         // источник когда-нибудь поменяется, подпись обязана поменяться вместе с ним.
         Card(modifier = Modifier.fillMaxWidth()) {
             Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text("Напряжение: ${"%.2f".format(params.voltage.total)} В")
-                ObisCaption(OBIS_VOLTAGE)
-                Text("Ток: ${"%.3f".format(params.current.total)} А")
-                ObisCaption(OBIS_CURRENT)
+                // [Android-патч] Трёхфазные приборы (РиМ 489) отдают напряжение и ток ПО ФАЗАМ,
+                // а не одним значением. Если фазы есть (isThreePhase) — показываем каждую (A/B/C);
+                // иначе одно суммарное значение, как у однофазных 189.xx / AKROS.
+                if (params.voltage.isThreePhase) {
+                    Text("Напряжение по фазам:")
+                    Text("  A: ${"%.2f".format(params.voltage.l1 ?: 0.0)} В   B: ${"%.2f".format(params.voltage.l2 ?: 0.0)} В   C: ${"%.2f".format(params.voltage.l3 ?: 0.0)} В")
+                    ObisCaption(OBIS_VOLTAGE_L1)
+                } else {
+                    Text("Напряжение: ${"%.2f".format(params.voltage.total)} В")
+                    ObisCaption(OBIS_VOLTAGE)
+                }
+                if (params.current.isThreePhase) {
+                    Text("Ток по фазам:")
+                    Text("  A: ${"%.3f".format(params.current.l1 ?: 0.0)} А   B: ${"%.3f".format(params.current.l2 ?: 0.0)} А   C: ${"%.3f".format(params.current.l3 ?: 0.0)} А")
+                    ObisCaption(OBIS_CURRENT_L1)
+                } else {
+                    Text("Ток: ${"%.3f".format(params.current.total)} А")
+                    ObisCaption(OBIS_CURRENT)
+                }
                 params.neutralCurrentA?.let {
                     Text("Ток нейтрали: ${"%.3f".format(it)} А")
                     ObisCaption(OBIS_NEUTRAL_CURRENT)
                 }
                 Text("Активная мощность: ${"%.3f".format(params.power.total)} кВт")
                 ObisCaption(OBIS_ACTIVE_POWER)
+                if (params.power.isThreePhase) {
+                    Text("  A: ${"%.3f".format(params.power.l1 ?: 0.0)}   B: ${"%.3f".format(params.power.l2 ?: 0.0)}   C: ${"%.3f".format(params.power.l3 ?: 0.0)} кВт")
+                }
                 params.reactivePowerKvar?.let {
                     Text("Реактивная мощность: ${"%.3f".format(it)} квар")
                     ObisCaption(OBIS_REACTIVE_POWER)

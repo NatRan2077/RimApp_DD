@@ -11,6 +11,11 @@
 // FeedIncomingBytes()/PullOutgoingBytes() ниже.
 #include "ble_transport.h"
 
+// [Android-патч] чистая (без транспорта) логика шифрованной HLS-GMAC-ассоциации AKROS,
+// побайтово сверенная с логом рабочего приложения — см. EstablishCipheredConnection().
+#include "spodes_ciphered.hpp"
+#include <ctime> // std::time — засев счётчика вызовов, см. EstablishCipheredConnection()
+
 const char* SpodesClient::GetErrorMessage ()
 {
     return error_message_.c_str();
@@ -147,6 +152,77 @@ bool SpodesClient::SetNormalResponseMode (const ConnectionAddresses &addr, const
     return true;
 }
 
+// [Android-патч] см. подробное объяснение в spodes_client.h — SNRM строго по стандарту,
+// без LLC-заголовка в U-кадре, с честно вычисленными длиной и FCS.
+bool SpodesClient::SetNormalResponseModeStandard (const ConnectionAddresses &addr,
+                                                  const uint16_t &max_info_transmit,
+                                                  const uint16_t &max_info_receive)
+{
+    ServiceFunctions serv_funcs;
+
+    if (addr.source_address != 16 and addr.source_address != 32 and addr.source_address != 48)
+    {
+        error_message_ = "SpodesClient::SetNormalResponseModeStandard: Illegal client address value";
+        return false;
+    }
+    // Адреса кодируются так же, как и в штатном методе: младший бит — признак последнего байта
+    // адреса. Для AKROS (клиент 32, сервер 1:16) это даёт в эфире 0x41 и 0x02 0x21.
+    connection_addr_.source_address = serv_funcs.AppendBit(addr.source_address, 1);
+    connection_addr_.logical_address = serv_funcs.AppendBit(addr.logical_address, 0);
+    connection_addr_.physical_address = serv_funcs.AppendBit(addr.physical_address, 1);
+
+    // Информационное поле SNRM: идентификатор формата 0x81, идентификатор группы 0x80, длина
+    // группы, затем max-info-field-length-transmit (05) и -receive (06), каждый ДВУХбайтовым
+    // значением. Размер окна (07/08) намеренно не передаём — в эталонном обмене его нет, а
+    // значение по умолчанию (1) прибор сообщает сам в ответном UA.
+    const std::vector<uint8_t> info =
+            {
+                    0x81, 0x80, 0x08,
+                    0x05, 0x02, static_cast<uint8_t>((max_info_transmit >> 8) & 0xFF), static_cast<uint8_t>(max_info_transmit & 0xFF),
+                    0x06, 0x02, static_cast<uint8_t>((max_info_receive >> 8) & 0xFF), static_cast<uint8_t>(max_info_receive & 0xFF),
+            };
+
+    std::vector<uint8_t> request =
+            {
+                    0x7E, 0xA0, 0x00,
+                    connection_addr_.logical_address,
+                    connection_addr_.physical_address,
+                    connection_addr_.source_address,
+                    0x93,        // управляющее поле SNRM
+                    0x00, 0x00,  // место под HCS
+            };
+    request.insert(request.end(), info.begin(), info.end());
+    request.push_back(0x00); // место под FCS
+    request.push_back(0x00);
+    request.push_back(0x7E);
+
+    // Длина — РЕАЛЬНАЯ длина кадра без двух флагов, а не прибавка к захардкоженной константе.
+    const uint16_t frame_length = static_cast<uint16_t>(request.size()) - 2;
+    const uint16_t length_field = (frame_length & 0x07FF) | 0xA000;
+    request[1] = static_cast<uint8_t>((length_field >> 8) & 0xFF);
+    request[2] = static_cast<uint8_t>(length_field & 0xFF);
+
+    // HCS — по заголовку (длина + адреса + управляющее поле), FCS — по всему кадру. Диапазоны
+    // те же, что использует FormHDLCHeader(), и они дают контрольные суммы, совпадающие с
+    // эталонными кадрами (проверено пересчётом).
+    const uint16_t hcs = serv_funcs.CalculateCRC(std::vector<uint8_t>(request.begin(), request.begin() + 7), true);
+    request[7] = hcs & 0xFF;
+    request[8] = (hcs >> 8) & 0xFF;
+
+    const uint16_t fcs = serv_funcs.CalculateCRC(std::vector<uint8_t>(request.begin(), request.end() - 2), false);
+    request[request.size() - 3] = fcs & 0xFF;
+    request[request.size() - 2] = (fcs >> 8) & 0xFF;
+
+    // Запоминаем предложенные размеры: если прибор ответит UA, ReceiveUnnumberedAcknowledge()
+    // перезапишет их согласованными значениями из ответа.
+    connection_params_.max_info_length_transmit = max_info_transmit;
+    connection_params_.max_info_length_receive = max_info_receive;
+
+    if (!SendRequest(request))
+        return false;
+    return true;
+}
+
 unsigned long SpodesClient::ReadResponse (std::vector<char> &answer, bool check_raw_response)
 {
     unsigned long result_size = transport_->ReadData(answer.data(), max_length_);
@@ -217,6 +293,20 @@ bool SpodesClient::SendDisconnectRequest ()
 
 bool SpodesClient::SendReadyToReceive(const int8_t &block_number)
 {
+    // [Android-патч] В шифрованной ассоциации AKROS «следующий блок» запрашивается не HDLC
+    // S-кадром RR, а полноценным DLMS get-request-next (C0 02 <номер блока>), зашифрованным
+    // как glo-get-request. Так делает реальное приложение; блочная сборка ответа при этом
+    // целиком на стороне Kotlin (parseGetResponseBlock/assembleDlmsValue), а мы лишь шлём
+    // зашифрованный запрос следующего блока и, как обычно, читаем ответ в GetResponseRaw().
+    if (ciphered_session_)
+    {
+        akros_hls::Bytes apdu = akros_hls::BuildGetNextApdu(static_cast<uint32_t>(block_number), 0x41);
+        akros_hls::Bytes glo = akros_hls::WrapGlo(akros_hls::kGloGetRequest, akros_ciph_key_,
+                                                  akros_client_sys_title_, invocation_counter_, apdu);
+        ++invocation_counter_;
+        return SendApduFrame(glo);
+    }
+
     std::vector<uint8_t> request = {0x7E, 0, 0};
     request.insert(request.end(),
                    {
@@ -279,6 +369,172 @@ bool SpodesClient::SendReadyToReceiveFlatAddress ()
 
     // Это S-frame, не I-frame — send_sequence_number_ не трогаем (как и в SendReadyToReceive(-1)).
     return SendRequest(request);
+}
+
+// [Android-патч] --- Шифрованная HLS-GMAC-ассоциация AKROS -----------------------------------
+// Вся криптология и сборка/разбор APDU вынесены в spodes_ciphered.hpp (namespace akros_hls) и
+// побайтово проверены офлайн против реального лога. Здесь — только транспорт: собрать I-кадр
+// штатным HDLC-заголовком (та же адресация и та же нумерация кадров, что у уже работающего
+// нешифрованного AKROS) и прочитать ответ.
+
+// Отправляет один APDU (байты после LLC-заголовка E6 E6 00) как I-кадр со штатной адресацией.
+bool SpodesClient::SendApduFrame (const std::vector<uint8_t> &apdu)
+{
+    std::vector<uint8_t> request(9, 0);            // место под HDLC-заголовок
+    request.insert(request.end(), {0xE6, 0xE6, 0x00});
+    request.insert(request.end(), apdu.begin(), apdu.end());
+
+    ServiceFunctions serv_funcs;
+    uint8_t control_field = serv_funcs.CalculateControlField(send_sequence_number_, receive_sequence_number_, 1);
+    ServiceFunctions::HDLCParams hdlc_params {0, connection_addr_.source_address,
+                                              connection_addr_.logical_address, connection_addr_.physical_address,
+                                              control_field};
+    serv_funcs.FormHDLCHeader(request, hdlc_params);
+    if (!SendRequest(request))
+        return false;
+    ++send_sequence_number_;
+    return true;
+}
+
+// Читает один HDLC-кадр и возвращает его APDU — байты между LLC-заголовком E6 E7 00 и хвостом
+// (FCS(2)+флаг). Пустой вектор — ничего не пришло/кадр без LLC.
+std::vector<uint8_t> SpodesClient::ReadApduFrame ()
+{
+    std::vector<char> answer(max_length_, 0);
+    unsigned long result_size = ReadResponse(answer, false); // плоская проверка неприменима к шифру
+    std::vector<uint8_t> frame(result_size);
+    for (unsigned long i = 0; i < result_size; i++)
+        frame[i] = static_cast<uint8_t>(answer[i]);
+
+    for (size_t i = 0; i + 3 <= frame.size(); i++)
+        if (frame[i] == 0xE6 && frame[i + 1] == 0xE7 && frame[i + 2] == 0x00)
+        {
+            size_t start = i + 3;
+            size_t end = frame.size();
+            if (end >= 3 && frame[end - 1] == 0x7E) end -= 3; // FCS(2)+закрывающий флаг
+            if (end < start) end = start;
+            return std::vector<uint8_t>(frame.begin() + start, frame.begin() + end);
+        }
+    return {};
+}
+
+bool SpodesClient::EstablishCipheredConnection (const char* key, uint8_t key_len)
+{
+    if (key == nullptr || key_len != 16)
+    {
+        error_message_ = "EstablishCipheredConnection: ключ должен быть ровно 16 байт";
+        return false;
+    }
+    std::memcpy(akros_ciph_key_, key, 16);
+    // [Android-патч] Счётчик вызовов засеваем ТЕКУЩИМ ВРЕМЕНЕМ (секунды epoch), а не нулём.
+    // Прибор хранит максимум увиденного счётчика как защиту от повтора и отвергает значения не
+    // больше него (в первой версии AARQ с IC=0 получал «authentication-failure» — прибор уже
+    // видел 0 в прошлом сеансе). Время монотонно растёт между запусками приложения, поэтому
+    // каждый новый сеанс гарантированно превосходит предыдущий. См. IcBytes() (big-endian) в
+    // spodes_ciphered.hpp — прибор читает счётчик big-endian, значение = само время, крупное.
+    invocation_counter_ = static_cast<uint32_t>(std::time(nullptr));
+    ciphered_session_ = false; // включим только после успешной HLS-аутентификации
+
+    // 1) AARQ — случайный вызов CtoS + зашифрованный glo-initiate-request (IC=0).
+    uint8_t ctos[16] = {};
+    {
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_int_distribution<int> dist(0x00, 0xFF);
+        for (int i = 0; i < 16; i++) ctos[i] = static_cast<uint8_t>(dist(gen));
+    }
+    akros_hls::Bytes aarq = akros_hls::BuildAarq(akros_ciph_key_, akros_client_sys_title_, ctos, invocation_counter_);
+    ++invocation_counter_; // 0 израсходован на шифрование initiate
+    if (!SendApduFrame(aarq))
+    {
+        error_message_ = "EstablishCipheredConnection: не удалось отправить AARQ";
+        return false;
+    }
+
+    // 2) AARE — проверяем «принято», достаём system-title сервера и вызов StoC.
+    std::vector<uint8_t> aare = ReadApduFrame();
+    if (aare.empty())
+    {
+        error_message_ = "EstablishCipheredConnection: пустой/некорректный ответ на AARQ (AARE не получен)";
+        return false;
+    }
+    akros_hls::AareResult ar = akros_hls::ParseAare(aare);
+    if (!ar.ok || !ar.accepted)
+    {
+        error_message_ = "EstablishCipheredConnection: ассоциация отклонена (" + ar.error + ")";
+        return false;
+    }
+    std::memcpy(respond_ap_title_, ar.server_sys_title, 8); // нужен для расшифровки ответов
+    if (!ar.is_hls)
+    {
+        // Сервер не потребовал HLS-подтверждения — считаем ассоциацию открытой (редкий случай).
+        ciphered_session_ = true;
+        return true;
+    }
+
+    // 3) reply_to_HLS_authentication: значение SC||IC||GMAC(StoC) (IC=1), затем зашифрованный
+    //    glo-action-request (кадр с IC=2).
+    akros_hls::Bytes reply_value = akros_hls::BuildHlsReplyValue(akros_ciph_key_, akros_client_sys_title_,
+                                                                 invocation_counter_, ar.stoc);
+    ++invocation_counter_; // 1 израсходован на GMAC ответа
+    akros_hls::Bytes action_apdu = akros_hls::BuildHlsReplyActionApdu(reply_value);
+    akros_hls::Bytes action_glo = akros_hls::WrapGlo(akros_hls::kGloActionRequest, akros_ciph_key_,
+                                                     akros_client_sys_title_, invocation_counter_, action_apdu);
+    ++invocation_counter_; // 2 израсходован на шифрование кадра ACTION
+    if (!SendApduFrame(action_glo))
+    {
+        error_message_ = "EstablishCipheredConnection: не удалось отправить reply_to_HLS_authentication";
+        return false;
+    }
+
+    // 4) glo-action-response — расшифровываем и проверяем результат (00 = успех).
+    std::vector<uint8_t> resp = ReadApduFrame();
+    if (resp.empty())
+    {
+        error_message_ = "EstablishCipheredConnection: пустой ответ на HLS-подтверждение";
+        return false;
+    }
+    std::vector<uint8_t> plain;
+    if (!akros_hls::UnwrapGlo(akros_ciph_key_, respond_ap_title_, resp, plain))
+    {
+        error_message_ = "EstablishCipheredConnection: не удалось расшифровать ответ на HLS (неверный ключ?)";
+        return false;
+    }
+    // plain: C7 01 C1 <action-result> ... — байт результата на позиции 3.
+    if (plain.size() < 4 || plain[0] != 0xC7 || plain[3] != 0x00)
+    {
+        error_message_ = "EstablishCipheredConnection: сервер отклонил HLS-подтверждение (неверный пароль?)";
+        return false;
+    }
+
+    ciphered_session_ = true;
+    return true;
+}
+
+bool SpodesClient::GetRequestCiphered (const RequestParams &params)
+{
+    if (!ciphered_session_)
+    {
+        error_message_ = "GetRequestCiphered: шифрованная ассоциация не установлена";
+        return false;
+    }
+    // OBIS-строку "a.b.c.d.e.f" переводим в 6 байт.
+    uint8_t obis[6] = {};
+    {
+        int vals[6] = {0,0,0,0,0,0}; int idx = 0; int cur = 0; bool any = false;
+        for (char c : params.instance_id)
+        {
+            if (c >= '0' && c <= '9') { cur = cur * 10 + (c - '0'); any = true; }
+            else if (c == '.') { if (idx < 6) vals[idx++] = cur; cur = 0; any = false; }
+        }
+        if (any && idx < 6) vals[idx++] = cur;
+        for (int i = 0; i < 6; i++) obis[i] = static_cast<uint8_t>(vals[i] & 0xFF);
+    }
+    akros_hls::Bytes apdu = akros_hls::BuildGetApdu(params.class_id, obis, params.attribute_id, 0x41);
+    akros_hls::Bytes glo = akros_hls::WrapGlo(akros_hls::kGloGetRequest, akros_ciph_key_,
+                                              akros_client_sys_title_, invocation_counter_, apdu);
+    ++invocation_counter_;
+    return SendApduFrame(glo);
 }
 
 uint8_t SpodesClient::ReceiveUnnumberedAcknowledge ()
@@ -785,6 +1041,43 @@ bool SpodesClient::GetResponseRaw (std::vector<uint8_t> &response)
         std::vector<uint8_t> first(result_size);
         for (unsigned long i = 0; i < result_size; i++)
             first[i] = static_cast<uint8_t>(answer[i]);
+
+        // [Android-патч] Шифрованная ассоциация AKROS: ответ — это glo-get-response (0xCC) сразу
+        // после LLC-заголовка E6 E7 00. Расшифровываем его штатным средством (namespace akros_hls)
+        // и возвращаем ОТКРЫТЫЙ APDU, обёрнутый обратно в E6 E7 00 + хвост — ровно в том виде, в
+        // каком его ждут разборщики на стороне Kotlin (они ищут E6 E7 00 и дальше разбирают DLMS,
+        // не проверяя обрамление). Так весь остальной код — и разбор буфера, и блочная сборка
+        // (parseGetResponseBlock/assembleDlmsValue), и чтение версии ПО — работает без изменений.
+        if (ciphered_session_)
+        {
+            std::vector<uint8_t> apdu;
+            for (size_t i = 0; i + 3 <= first.size(); i++)
+                if (first[i] == 0xE6 && first[i + 1] == 0xE7 && first[i + 2] == 0x00)
+                {
+                    size_t start = i + 3, end = first.size();
+                    if (end >= 3 && first[end - 1] == 0x7E) end -= 3;
+                    if (end < start) end = start;
+                    apdu.assign(first.begin() + start, first.begin() + end);
+                    break;
+                }
+            std::vector<uint8_t> plain;
+            if (apdu.empty() || !akros_hls::UnwrapGlo(akros_ciph_key_, respond_ap_title_, apdu, plain))
+            {
+                error_message_ = "GetResponseRaw: не удалось расшифровать ответ шифрованной ассоциации";
+                response.clear();
+                return true; // связь жива, но кадр не разобрался — пусть Kotlin увидит пустой ответ
+            }
+            // Пересобираем «кадр» для Kotlin-парсера: голова роли не играет (парсер ищет E6 E7 00),
+            // поэтому даём минимальный заголовок, затем LLC-маркер и открытый APDU.
+            response.clear();
+            response.insert(response.end(), first.begin(), first.begin() + std::min<size_t>(9, first.size()));
+            response.insert(response.end(), {0xE6, 0xE7, 0x00});
+            response.insert(response.end(), plain.begin(), plain.end());
+            response.push_back(0);
+            response.push_back(0);
+            response.push_back(0x7E);
+            return true;
+        }
 
         // [Android-патч] ИСПРАВЛЕНО после разбора реального лога пульта РиМ 040.40: бит
         // "сегментировано" (бит 3 второго байта HDLC-заголовка) на этом счётчике НЕ ложный —

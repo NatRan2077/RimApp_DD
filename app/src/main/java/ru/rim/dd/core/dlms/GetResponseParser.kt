@@ -34,9 +34,18 @@ data class ObisReading(
      * конкретную модель.
      */
     val textValue: String? = null,
+    /**
+     * [Android-патч] Заполнено вместо rawValue/scaler, если прибор прислал значение напрямую
+     * числом с плавающей точкой (тег 0x17/0x18). Так отдаёт данные счётчик AKROS: в его буфере
+     * индикации каждое значение — готовый Float32, без пары {scaler, unit}, которой пользуются
+     * приборы РиМ. Раскладывать такой float обратно на rawValue+scaler значило бы терять
+     * точность на ровном месте, поэтому он хранится как есть, а [value] ниже отдаёт
+     * предпочтение ему.
+     */
+    val floatValue: Double? = null,
 ) {
     /** rawValue * 10^scaler — значение в базовой единице (Вт, В, А, Гц, °C, Вт·ч, вар·ч...). */
-    val value: Double get() = rawValue * Math.pow(10.0, scaler.toDouble())
+    val value: Double get() = floatValue ?: (rawValue * Math.pow(10.0, scaler.toDouble()))
 
     /** value / 1000 — удобно для энергии (Вт·ч → кВт·ч, вар·ч → квар·ч) и мощности (Вт → кВт). */
     val valueKwh: Double get() = value / 1000.0
@@ -126,6 +135,107 @@ const val CLOCK_STATUS_OBIS = "0.0.1.0.0.255"
 fun isClockStatusValid(rawStatus: Long): Boolean = (rawStatus and 0x0B) == 0L
 
 /** Подмножество таблицы единиц измерения IEC 62056-6-2, реально встречающееся у этого счётчика. */
+/**
+ * [Android-патч] Один блок ответа, разбитого прибором на части (get-response-with-datablock).
+ *
+ * Зачем это понадобилось. Ответ на чтение большого атрибута физически не помещается в один
+ * HDLC-кадр: при согласовании сеанса счётчик AKROS ограничивает информационное поле 128 байтами,
+ * а описание колонок буфера (capture_objects, 14 записей по 18 байт) — это больше 250. В таких
+ * случаях DLMS штатно переходит на блочную передачу: вместо обычного ответа «C4 01» прибор
+ * присылает «C4 02» с флагом «последний блок», номером блока и куском данных, а клиент должен
+ * запрашивать следующие блоки, пока флаг не станет единицей.
+ *
+ * Пока этого разбора не было, приложение принимало такой ответ за обычный, промахивалось мимо
+ * границ полей на пару байт и упиралось в нулевой байт номера блока, который декодировался как
+ * «пустое значение» — в логе это выглядело как «описание буфера получено, 0 колонок» при
+ * полностью корректном ответе прибора.
+ */
+data class GetResponseBlock(
+    /** true — это последний блок, больше запрашивать нечего. */
+    val lastBlock: Boolean,
+    /** Номер блока; его нужно указать в запросе следующего блока. */
+    val blockNumber: Int,
+    /** Кусок данных из этого блока — их нужно склеить с остальными и разобрать целиком. */
+    val data: ByteArray,
+)
+
+/**
+ * Разбирает ответ, если это get-response-with-datablock, и возвращает [GetResponseBlock].
+ * null — ответ обычный (get-response-normal) и разбирать его нужно через [parseGetResponseValue].
+ */
+fun parseGetResponseBlock(rawFrame: ByteArray): GetResponseBlock? {
+    val llcOffset = findLlcHeader(rawFrame) ?: return null
+    var pos = llcOffset + 3
+    // service-id (0xC4) + choice: нас интересует только choice = 2 (with-datablock)
+    if (rawFrame.getOrNull(pos)?.toInt()?.and(0xFF) != 0xC4) return null
+    if (rawFrame.getOrNull(pos + 1)?.toInt()?.and(0xFF) != 0x02) return null
+    pos += 3 // сместились через service-id, choice и invoke-id-and-priority
+
+    val lastBlock = (rawFrame.getOrNull(pos)?.toInt()?.and(0xFF) ?: return null) != 0
+    pos += 1
+    if (pos + 4 > rawFrame.size) return null
+    var blockNumber = 0
+    for (i in 0 until 4) blockNumber = (blockNumber shl 8) or (rawFrame[pos + i].toInt() and 0xFF)
+    pos += 4
+
+    // result-choice: 0 — дальше «сырые» данные, иначе прибор вернул код ошибки вместо данных.
+    if ((rawFrame.getOrNull(pos)?.toInt()?.and(0xFF) ?: return null) != 0) return null
+    pos += 1
+
+    // Длина куска данных — в кодировке длины A-XDR: до 0x80 это само число, иначе младшие биты
+    // задают, сколько БАЙТ занимает длина.
+    val lengthByte = rawFrame.getOrNull(pos)?.toInt()?.and(0xFF) ?: return null
+    pos += 1
+    var length = lengthByte
+    if (lengthByte > 0x80) {
+        val lengthBytes = lengthByte and 0x7F
+        if (pos + lengthBytes > rawFrame.size) return null
+        length = 0
+        for (i in 0 until lengthBytes) length = (length shl 8) or (rawFrame[pos + i].toInt() and 0xFF)
+        pos += lengthBytes
+    }
+
+    // Хвост кадра — контрольная сумма и закрывающий флаг; в данные они не входят. Если
+    // заявленная длина больше, чем реально осталось, берём что есть: пусть лучше разбор
+    // споткнётся на неполных данных, чем мы выйдем за пределы массива.
+    val available = (rawFrame.size - 3 - pos).coerceAtLeast(0)
+    val take = minOf(length, available)
+    return GetResponseBlock(
+        lastBlock = lastBlock,
+        blockNumber = blockNumber,
+        data = rawFrame.copyOfRange(pos, pos + take),
+    )
+}
+
+/**
+ * [Android-патч] Разбирает DLMS-значение из «голых» данных — без HDLC-кадра и APDU вокруг.
+ * Нужно для блочной передачи (см. [GetResponseBlock]): куски из всех блоков склеиваются, и
+ * получившийся массив байт — это уже само значение, начиная с его тега.
+ */
+fun decodeDlmsValue(data: ByteArray): DlmsValue = DlmsDecoder(data).decodeAt(0).first
+
+/**
+ * [Android-патч] То же, что [unitLabelOf], но для величин, которые показываются делёнными на
+ * 1000 (см. ObisReading.valueKwh — энергия и мощность): «Вт·ч» → «кВт·ч», «Вт» → «кВт».
+ *
+ * Нужно потому, что у прибора единица ВСЕГДА базовая (ватт-часы, ватты — коды 30 и 27), а на
+ * экране показания принято показывать в киловаттах. Раньше подпись «кВт·ч» бралась из
+ * жёсткого списка по категории энергии — то есть если бы прибор отдал величину в другой
+ * единице, подпись всё равно осталась бы прежней и молча соврала. Здесь же преобразуется
+ * ровно та единица, которую прибор назвал сам; неизвестный код не заменяется догадкой, а
+ * показывается как есть («ед.N»), чтобы это было видно, а не потерялось.
+ */
+fun kiloUnitLabelOf(unit: Int?): String? = when (unit) {
+    null -> null
+    27 -> "кВт"
+    28 -> "кВА"
+    29 -> "квар"
+    30 -> "кВт·ч"
+    31 -> "кВА·ч"
+    32 -> "квар·ч"
+    else -> unitLabelOf(unit) ?: "ед.$unit"
+}
+
 fun unitLabelOf(unit: Int?): String? = when (unit) {
     4 -> "сут"
     5 -> "ч"
@@ -374,7 +484,7 @@ private fun collectReadings(value: DlmsValue, out: MutableList<ObisReading>) {
     }
 }
 
-private fun obisCodeOf(bytes: ByteArray): String = bytes.joinToString(".") { (it.toInt() and 0xFF).toString() }
+internal fun obisCodeOf(bytes: ByteArray): String = bytes.joinToString(".") { (it.toInt() and 0xFF).toString() }
 
 /** Компактное текстовое представление для логов — OctetStr(6) печатается как OBIS-код. */
 fun describeDlmsValue(value: DlmsValue): String = when (value) {

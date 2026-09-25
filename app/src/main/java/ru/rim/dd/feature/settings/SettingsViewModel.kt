@@ -28,6 +28,11 @@ class SettingsViewModel @Inject constructor(
     val signalStrengthDbm: StateFlow<Int?> = repository.signalStrengthDbm()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
 
+    // [Android-патч] Для карточки соединения (перенос дизайна) — модель и серийник подключённого
+    // прибора.
+    val meterInfo: StateFlow<ru.rim.dd.core.model.MeterInfo?> = repository.meterInfo()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
+
     fun history(serialNumber: String): StateFlow<List<Reading>> =
         repository.history(serialNumber)
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())

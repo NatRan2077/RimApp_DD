@@ -29,6 +29,11 @@ class InfoViewModel @Inject constructor(
     val tamperState: StateFlow<TamperState> = repository.tamperState()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), TamperState.UNKNOWN)
 
+    // [Android-патч] Для «геро»-плашки статуса на экране (перенос дизайна) — уровень сигнала,
+    // тот же, что на экране «Настройки» (обновляется циклом автообновления).
+    val signalStrengthDbm: StateFlow<Int?> = repository.signalStrengthDbm()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
+
     /** Кнопка «Обновить» — переспрашивает тот же буфер счётчика, что обновляет и «Показания». */
     fun refresh() {
         viewModelScope.launch { repository.refreshReadings() }

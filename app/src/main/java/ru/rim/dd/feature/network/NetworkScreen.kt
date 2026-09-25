@@ -1,142 +1,201 @@
 package ru.rim.dd.feature.network
 
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.Button
-import androidx.compose.material3.Card
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
-import ru.rim.dd.core.dlms.RELAY_CONTROL_STATE_OBIS
+import ru.rim.dd.core.model.PhaseValues
 import ru.rim.dd.core.model.RelaySource
-import ru.rim.dd.feature.common.ObisCaption
+import ru.rim.dd.ui.components.DataCard
+import ru.rim.dd.ui.components.Divider
+import ru.rim.dd.ui.components.MonoText
+import ru.rim.dd.ui.components.ScreenHeader
+import ru.rim.dd.ui.components.SectionLabel
+import ru.rim.dd.ui.components.StatusChip
+import ru.rim.dd.ui.components.formatNumber
+import ru.rim.dd.ui.theme.RimError
+import ru.rim.dd.ui.theme.RimLilac
+import ru.rim.dd.ui.theme.RimPrimaryDeep
+import ru.rim.dd.ui.theme.RimPrimaryLight
+import ru.rim.dd.ui.theme.RimSuccess
+import ru.rim.dd.ui.theme.RimTheme
+import ru.rim.dd.ui.theme.RimViolet
 
-// [Android-патч] OBIS-коды показываемых здесь величин — ровно те, по которым значения
-// читаются в MeterRepositoryImpl.applyDecodedBuffer(). Вынесены в константы, чтобы подпись
-// на экране и источник данных нельзя было случайно рассинхронизировать.
-private const val OBIS_VOLTAGE = "1.0.12.7.0.255"
-private const val OBIS_CURRENT = "1.0.11.7.0.255"
-// [Android-патч] Пофазные коды для трёхфазных приборов (РиМ 489) — подпись, когда показываем
-// напряжение/ток по фазам A/B/C (см. applyDecodedBuffer() и isThreePhase ниже).
-private const val OBIS_VOLTAGE_L1 = "1.0.32.7.0.255"
-private const val OBIS_CURRENT_L1 = "1.0.31.7.0.255"
-private const val OBIS_NEUTRAL_CURRENT = "1.0.91.7.0.255"
-private const val OBIS_ACTIVE_POWER = "1.0.1.7.0.255"
-private const val OBIS_REACTIVE_POWER = "1.0.3.7.0.255"
-private const val OBIS_APPARENT_POWER = "1.0.9.7.0.255"
-private const val OBIS_FREQUENCY = "1.0.14.7.0.255"
-
-/**
- * Экран «Сеть» — соответствует макету wf3_network_relay.png из ТЗ. Помимо изначальных
- * напряжения/тока/мощности/частоты добавлены реактивная и полная мощность, ток нейтрали —
- * реально найдены в буфере счётчика (см. историю диагностики, OBIS 1.0.3.7.0.255 /
- * 1.0.9.7.0.255 / 1.0.91.7.0.255).
- */
 @Composable
-fun NetworkScreen(viewModel: NetworkViewModel = hiltViewModel()) {
+fun NetworkScreen(showObis: Boolean, viewModel: NetworkViewModel = hiltViewModel()) {
     val params by viewModel.networkParams.collectAsState()
     val relay by viewModel.relayState.collectAsState()
-    val countdown by viewModel.turnOnCountdown.collectAsState()
+    val p = RimTheme.palette
+    var refreshing by remember { mutableStateOf(false) }
 
     Column(
-        modifier = Modifier.fillMaxSize().padding(16.dp).verticalScroll(rememberScrollState()),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
+        modifier = Modifier
+            .fillMaxSize()
+            .background(p.background)
+            .verticalScroll(rememberScrollState())
+            .padding(start = 16.dp, end = 16.dp, top = 20.dp, bottom = 24.dp),
     ) {
-        Text("Параметры сети", style = MaterialTheme.typography.headlineSmall)
-        Button(onClick = { viewModel.refresh() }) { Text("Обновить") }
+        LaunchedEffect(refreshing) { if (refreshing) { kotlinx.coroutines.delay(900); refreshing = false } }
+        ScreenHeader("Параметры сети", onRefresh = { refreshing = true; viewModel.refresh() }, refreshing = refreshing)
 
-        // [Android-патч] см. ObisCaption — под каждой величиной её объект из паспорта прибора
-        // и точный OBIS-код. Коды здесь не «по стандарту», а те самые, по которым значение
-        // реально достаётся из буфера индикации в MeterRepositoryImpl.applyDecodedBuffer():
-        // напряжение и ток у этого прибора лежат под НЕСТАНДАРТНЫМИ кодами (1.0.12.7.0.255 и
-        // 1.0.11.7.0.255 вместо привычных 1.0.32.7.0.255 / 1.0.31.7.0.255), поэтому коды
-        // продублированы здесь как константы рядом с местом показа — если в applyDecodedBuffer()
-        // источник когда-нибудь поменяется, подпись обязана поменяться вместе с ним.
-        Card(modifier = Modifier.fillMaxWidth()) {
-            Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                // [Android-патч] Трёхфазные приборы (РиМ 489) отдают напряжение и ток ПО ФАЗАМ,
-                // а не одним значением. Если фазы есть (isThreePhase) — показываем каждую (A/B/C);
-                // иначе одно суммарное значение, как у однофазных 189.xx / AKROS.
-                if (params.voltage.isThreePhase) {
-                    Text("Напряжение по фазам:")
-                    Text("  A: ${"%.2f".format(params.voltage.l1 ?: 0.0)} В   B: ${"%.2f".format(params.voltage.l2 ?: 0.0)} В   C: ${"%.2f".format(params.voltage.l3 ?: 0.0)} В")
-                    ObisCaption(OBIS_VOLTAGE_L1)
-                } else {
-                    Text("Напряжение: ${"%.2f".format(params.voltage.total)} В")
-                    ObisCaption(OBIS_VOLTAGE)
+        // ---- Фазы ----
+        val phaseColors = listOf(RimPrimaryDeep, RimViolet, RimLilac)
+        if (params.voltage.isThreePhase) {
+            Row(Modifier.fillMaxWidth().padding(bottom = 20.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf("A", "B", "C").forEachIndexed { i, ph ->
+                    PhaseCard(
+                        ph = ph,
+                        voltage = phaseValue(params.voltage, i),
+                        current = phaseValue(params.current, i),
+                        color = phaseColors[i],
+                        modifier = Modifier.weight(1f),
+                    )
                 }
-                if (params.current.isThreePhase) {
-                    Text("Ток по фазам:")
-                    Text("  A: ${"%.3f".format(params.current.l1 ?: 0.0)} А   B: ${"%.3f".format(params.current.l2 ?: 0.0)} А   C: ${"%.3f".format(params.current.l3 ?: 0.0)} А")
-                    ObisCaption(OBIS_CURRENT_L1)
-                } else {
-                    Text("Ток: ${"%.3f".format(params.current.total)} А")
-                    ObisCaption(OBIS_CURRENT)
-                }
-                params.neutralCurrentA?.let {
-                    Text("Ток нейтрали: ${"%.3f".format(it)} А")
-                    ObisCaption(OBIS_NEUTRAL_CURRENT)
-                }
-                Text("Активная мощность: ${"%.3f".format(params.power.total)} кВт")
-                ObisCaption(OBIS_ACTIVE_POWER)
-                if (params.power.isThreePhase) {
-                    Text("  A: ${"%.3f".format(params.power.l1 ?: 0.0)}   B: ${"%.3f".format(params.power.l2 ?: 0.0)}   C: ${"%.3f".format(params.power.l3 ?: 0.0)} кВт")
-                }
-                params.reactivePowerKvar?.let {
-                    Text("Реактивная мощность: ${"%.3f".format(it)} квар")
-                    ObisCaption(OBIS_REACTIVE_POWER)
-                }
-                params.apparentPowerKva?.let {
-                    Text("Полная мощность: ${"%.3f".format(it)} кВА")
-                    ObisCaption(OBIS_APPARENT_POWER)
-                }
-                params.frequencyHz?.let {
-                    Text("Частота: ${"%.2f".format(it)} Гц")
-                    ObisCaption(OBIS_FREQUENCY)
-                }
+            }
+        } else {
+            Row(Modifier.fillMaxWidth().padding(bottom = 20.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                SingleMetric("Напряжение", formatNumber(params.voltage.total, 2), "В", RimPrimaryDeep, params.voltage.total < 50 && params.voltage.total > 0, Modifier.weight(1f))
+                SingleMetric("Ток", formatNumber(params.current.total, 3), "А", RimViolet, false, Modifier.weight(1f))
             }
         }
 
-        Text("Состояние реле", style = MaterialTheme.typography.titleMedium)
-        // [Android-патч] см. историю диагностики: ПРЯМОЙ GET на output_state/control_state
-        // размыкателя (0.0.96.3.10.255) без DLMS-ассоциации возвращает отказ доступа (0x0D) —
-        // подтверждено на ДВУХ разных счётчиках. НО тот же control_state, как выяснилось, заодно
-        // приходит КАЖДЫЙ цикл автообновления внутри обычного буфера индикации (0.0.21.0.2.255,
-        // который мы и так читаем) — без всякой ассоциации (см. RELAY_CONTROL_STATE_OBIS в
-        // GetResponseParser.kt и применение в applyDecodedBuffer()/MeterRepositoryImpl). Поэтому
-        // source становится METER_READ уже на первом же успешном цикле после подключения — это
-        // САМОЕ достоверное значение (то же, которым руководствуется индикация самого пульта).
-        // source==UNKNOWN остаётся честным состоянием экрана ТОЛЬКО до первого такого цикла (или
-        // если сам буфер почему-то не разобрался) — чтобы не показать пользователю ложное
-        // "ОТКЛЮЧЕНО" вместо "мы ещё не знаем", что для силового оборудования недопустимо.
-        Text(
-            when {
-                relay.source == RelaySource.UNKNOWN -> "НЕИЗВЕСТНО (нет доступа на чтение)"
-                relay.isOn -> "ВКЛЮЧЕНО"
-                else -> "ОТКЛЮЧЕНО"
+        // ---- Мощность ----
+        SectionLabel("Мощность")
+        DataCard {
+            PowerRow("Активная", formatNumber(params.power.total, 3), "кВт", "1.0.1.7.0.255", showObis)
+            Divider(Modifier.padding(vertical = 12.dp))
+            PowerRow("Реактивная", formatNumber(params.reactivePowerKvar ?: 0.0, 3), "квар", "1.0.3.7.0.255", showObis)
+            Divider(Modifier.padding(vertical = 12.dp))
+            PowerRow("Полная", formatNumber(params.apparentPowerKva ?: 0.0, 3), "кВА", "1.0.9.7.0.255", showObis)
+        }
+
+        Box(Modifier.padding(top = 4.dp))
+        // ---- Дополнительно ----
+        SectionLabel("Дополнительно")
+        DataCard {
+            params.neutralCurrentA?.let {
+                ExtraRow("Ток нейтрали", "${formatNumber(it, 3)} А", "1.0.91.7.0.255", showObis)
+                Divider(Modifier.padding(vertical = 12.dp))
             }
-        )
-        // [Android-патч] см. RELAY_CONTROL_STATE_OBIS — в паспорте прибора этот объект назван
-        // «Размыкатель» (класс Disconnect Control), значение берётся из поля control_state,
-        // приходящего внутри того же буфера индикации.
-        ObisCaption(RELAY_CONTROL_STATE_OBIS)
-        Text("Лимит мощности: ${relay.powerLimitKw} кВт")
-
-        countdown?.let { Text("Включение через: $it c") }
-
-        Button(onClick = viewModel::turnRelayOff) { Text("Отключить") }
-        Button(onClick = viewModel::turnRelayOn, enabled = relay.remoteTurnOnAllowed || !relay.isOn) {
-            Text("Включить")
+            ExtraRow("Частота", "${formatNumber(params.frequencyHz ?: 0.0, 2)} Гц", "1.0.14.7.0.255", showObis)
+            Divider(Modifier.padding(vertical = 12.dp))
+            // Реле — статус
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Column {
+                    Text("Реле", color = p.textSecondary, fontSize = 19.sp)
+                    if (showObis) MonoText("0.0.96.3.10.255", color = RimPrimaryLight, fontSize = 15.sp, weight = FontWeight.Normal)
+                }
+                when {
+                    relay.source == RelaySource.UNKNOWN -> StatusChip("НЕИЗВЕСТНО", p.textSecondary)
+                    relay.isOn -> StatusChip("ВКЛЮЧЕНО", RimSuccess)
+                    else -> StatusChip("ОТКЛЮЧЕНО", RimError)
+                }
+            }
         }
     }
 }
+
+private fun phaseValue(pv: PhaseValues, index: Int): Double = when (index) {
+    0 -> pv.l1 ?: pv.total
+    1 -> pv.l2 ?: 0.0
+    else -> pv.l3 ?: 0.0
+}
+
+@Composable
+private fun PhaseCard(ph: String, voltage: Double, current: Double, color: Color, modifier: Modifier) {
+    val p = RimTheme.palette
+    Column(
+        modifier = modifier
+            .clip(RoundedCornerShape(18.dp))
+            .background(Brush.linearGradient(listOf(color.copy(alpha = if (p.dark) 0.20f else 0.10f), color.copy(alpha = 0.04f))))
+            .border(1.5.dp, color.copy(alpha = 0.25f), RoundedCornerShape(18.dp))
+            .padding(horizontal = 10.dp, vertical = 16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        Box(
+            Modifier.size(28.dp).clip(CircleShape).background(color.copy(alpha = 0.15f)),
+            contentAlignment = Alignment.Center,
+        ) { Text("~$ph", color = color, fontSize = 19.sp, fontWeight = FontWeight.ExtraBold) }
+        Text("Напр.", color = p.textSecondary, fontSize = 20.sp, modifier = Modifier.padding(top = 6.dp))
+        MonoText(formatNumber(voltage, 1), color = if (voltage in 0.001..50.0) RimError else p.textPrimary, fontSize = 27.sp)
+        Text("В", color = p.textFaint, fontSize = 20.sp)
+        Divider(Modifier.padding(vertical = 6.dp))
+        Text("Ток", color = p.textSecondary, fontSize = 20.sp)
+        MonoText(formatNumber(current, 3), color = p.textPrimary, fontSize = 27.sp)
+        Text("А", color = p.textFaint, fontSize = 20.sp)
+    }
+}
+
+@Composable
+private fun SingleMetric(label: String, value: String, unit: String, color: Color, warn: Boolean, modifier: Modifier) {
+    val p = RimTheme.palette
+    Column(
+        modifier = modifier
+            .clip(RoundedCornerShape(18.dp))
+            .background(Brush.linearGradient(listOf(color.copy(alpha = if (p.dark) 0.20f else 0.10f), color.copy(alpha = 0.04f))))
+            .border(1.5.dp, color.copy(alpha = 0.25f), RoundedCornerShape(18.dp))
+            .padding(16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text(label, color = p.textSecondary, fontSize = 11.sp)
+        MonoText(value, color = if (warn) RimError else p.textPrimary, fontSize = 24.sp, modifier = Modifier.padding(top = 4.dp))
+        Text(unit, color = p.textFaint, fontSize = 10.sp)
+    }
+}
+
+@Composable
+private fun PowerRow(label: String, value: String, unit: String, obis: String, showObis: Boolean) {
+    val p = RimTheme.palette
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+        Column {
+            Text(label, color = p.textSecondary, fontSize = 19.sp)
+            if (showObis) MonoText(obis, color = RimPrimaryLight, fontSize = 15.sp, weight = FontWeight.Normal)
+        }
+        Row(verticalAlignment = Alignment.Bottom) {
+            MonoText(value, color = p.textPrimary, fontSize = 23.sp)
+            Text(" $unit", color = p.textPrimary.copy(alpha = 0.5f), fontSize = 12.sp)
+        }
+    }
+}
+
+@Composable
+private fun ExtraRow(label: String, value: String, obis: String, showObis: Boolean) {
+    val p = RimTheme.palette
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+        Column {
+            Text(label, color = p.textSecondary, fontSize = 19.sp)
+            if (showObis) MonoText(obis, color = RimPrimaryLight, fontSize = 15.sp, weight = FontWeight.Normal)
+        }
+        MonoText(value, color = p.textPrimary, fontSize = 23.sp)
+    }
+}
+

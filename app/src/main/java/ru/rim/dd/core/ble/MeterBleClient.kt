@@ -608,11 +608,6 @@ private class MeterGattManager(
         })
     }
 
-    /**
-     * [Android-патч] Публичная обёртка над readRssi() (см. MeterBleClient.requestRssiRead()) —
-     * сам readRssi() объявлен protected в базовом BleManager (Nordic BLE library) и виден
-     * только отсюда, изнутри подкласса, поэтому наружу его не отдать напрямую.
-     */
     fun requestRssi() {
         readRssi()
             .with { _, rssi -> onRssiRead(rssi) }
@@ -625,19 +620,6 @@ private class MeterGattManager(
         // разрыва (например, отсутствие CCCD-дескриптора у характеристики notify).
         Log.println(priority, "MeterGattManager", message)
     }
-
-    /**
-     * [Android-патч] Перебираем ВСЕ известные наборы UUID (см. GattUuids.ALL), а не один
-     * зашитый FFE0. Из-за жёсткой привязки к FFE0 счётчик AKROS отвергался на этом самом месте:
-     * GATT поднимался, сервисы обнаруживались, а дальше приложение само рвало связь — в логе это
-     * видно как «onDeviceDisconnected: reason=4» (REASON_NOT_SUPPORTED). У AKROS тот же профиль
-     * «прозрачного UART», но под альтернативными UUID ABF0/ABF1/ABF2 — они, к слову, лежат
-     * закомментированными в прошивке самого пульта РиМ.
-     *
-     * Подходящим считается набор, у которого есть И сервис, И ОБЕ характеристики: прибор с
-     * «половиной» профиля работать всё равно не сможет, и честнее это увидеть здесь, чем позже
-     * на непонятном молчании в эфире.
-     */
     override fun isRequiredServiceSupported(gatt: BluetoothGatt): Boolean {
         for (profile in GattUuids.ALL) {
             val service = gatt.getService(profile.service) ?: continue
@@ -679,12 +661,6 @@ private class MeterGattManager(
         setNotificationCallback(txCharacteristic).with { _, data ->
             data.value?.let {
                 Log.d("MeterGattManager", "<< notify (${it.size} байт): ${it.toHex()}")
-                // [Android-патч] см. incomingBytes выше. copyOf() — потому что Nordic BLE library
-                // может переиспользовать тот же самый массив под следующий notify: без копии в
-                // поток ушла бы ссылка, содержимое которой к моменту обработки уже подменено.
-                // tryEmit (а не emit) — мы внутри BLE-колбэка, а не корутины, suspend тут нельзя;
-                // при буфере на 512 кадров false здесь означал бы, что «насос» намертво встал,
-                // поэтому это не тихая потеря, а явная ошибка в логе.
                 if (!incomingBytes.tryEmit(it.copyOf())) {
                     Log.e(
                         "MeterGattManager",

@@ -6,16 +6,6 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
 
-/**
- * [Android-патч] Типографика под макет: обычный (sans) текст для подписей и МОНОШИРИННЫЙ для
- * чисел/кодов (напряжение, серийники, OBIS, время). Отдельного шрифтового ресурса не добавляем,
- * чтобы не тянуть файлы — используем системные FontFamily.Default / FontFamily.Monospace, что
- * повторяет var(--font-sans)/var(--font-mono) из Figma-экспорта.
- */
-
-/** Моноширинный стиль для чисел и кодов — применяется точечно на экранах. */
-val MonoNumber = TextStyle(fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
-
 internal fun rimTypography(): Typography {
     val sans = FontFamily.Default
     return Typography(

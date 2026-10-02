@@ -1,14 +1,8 @@
 package ru.rim.dd.core.dlms
 
 /**
- * Универсальное представление одного значения DLMS/COSEM (A-XDR common-data-types,
- * см. IEC 62056-6-2, таблица тегов). Нужно потому что SpodesClientBridge.getResponseRawBytes()
- * отдаёт "сырые" байты ответа без интерпретации — библиотечные GetResponseInt()/
- * GetResponseFloat() умеют разбирать только простые скаляры (и рассчитаны на кадры со
- * стандартной двухбайтовой HDLC-адресацией), а этот счётчик на GET-запрос
- * "0.0.21.0.2.255" отвечает вложенным массивом/структурой (OBIS-код + значение +
- * структура {scaler, unit} на каждый тариф) — см. DlmsDecoder и
- * MeterRepositoryImpl.parseTariffReadings().
+ * Значение DLMS/COSEM (A-XDR, теги по IEC 62056-6-2). Библиотечные GetResponseInt()/GetResponseFloat()
+ * разбирают только простые скаляры, а прибор отвечает вложенными массивами/структурами.
  */
 sealed class DlmsValue {
     data class Struct(val items: List<DlmsValue>) : DlmsValue()
@@ -33,15 +27,12 @@ sealed class DlmsValue {
 class DlmsDecodeException(message: String) : Exception(message)
 
 /**
- * Разбирает A-XDR-кодированное DLMS-значение из массива байт, начиная с произвольной
- * позиции (обычно сразу после service-id/invoke-id/choice-байтов GET-response). Не
- * пытается разобрать вообще все существующие типы COSEM (bit-string, date-time и т.п. —
- * не понадобились для наших ответов) — при встрече неизвестного тега бросает
- * DlmsDecodeException, это ловится на верхнем уровне вызова (см. MeterRepositoryImpl).
+ * Разбирает A-XDR-значение из байтов с произвольной позиции. Поддержаны только нужные типы
+ * (bit-string, date-time и т.п. — нет); неизвестный тег — [DlmsDecodeException].
  */
 class DlmsDecoder(private val data: ByteArray) {
 
-    /** Разбор одного значения начиная с [start]. Возвращает значение и позицию сразу после него. */
+    /** Значение, начинающееся с [start], и позиция сразу после него. */
     fun decodeAt(start: Int): Pair<DlmsValue, Int> {
         if (start >= data.size) throw DlmsDecodeException("Конец данных при чтении тега (pos=$start)")
         val tag = data[start].toInt() and 0xFF
@@ -86,7 +77,7 @@ class DlmsDecoder(private val data: ByteArray) {
         return if (unsigned and signBit != 0L) unsigned - (1L shl (size * 8)) else unsigned
     }
 
-    /** A-XDR-длина: байт < 0x80 — сама длина; иначе младшие 7 бит — кол-во следующих байт длины (big-endian). */
+    /** A-XDR-длина: байт < 0x80 — сама длина; иначе младшие 7 бит — число следующих байт длины (big-endian). */
     private fun readLength(pos: Int): Pair<Int, Int> {
         val first = byteAt(pos)
         if (first < 0x80) return first to pos + 1
@@ -95,18 +86,6 @@ class DlmsDecoder(private val data: ByteArray) {
         return length to pos + 1 + extraBytes
     }
 
-    /**
-     * [Терпимость к неизвестным вариациям формата] Заявленное количество элементов
-     * (count) — не всегда надёжный ориентир: у части ответов этого счётчика вложенность
-     * array/structure не совпадает 1-в-1 с тем, что можно было бы ожидать по стандарту
-     * (см. историю диагностики — decodeCollection на реальном ответе наткнулась на байты
-     * FCS/флага конца кадра, пытаясь прочитать "ещё один" элемент). Поэтому здесь НЕ
-     * бросаем исключение, если очередной элемент не удалось разобрать (кончились
-     * валидные данные раньше заявленного count) — просто останавливаемся и возвращаем
-     * то, что уже успешно распознали. Вызывающий код (collectReadings в
-     * GetResponseParser.kt) обходит дерево в поисках нужных троек независимо от того,
-     * насколько точно оно соответствует заявленной структуре целиком.
-     */
     private fun decodeCollection(start: Int, ctor: (List<DlmsValue>) -> DlmsValue): Pair<DlmsValue, Int> {
         val (count, afterLen) = readLength(start)
         val items = mutableListOf<DlmsValue>()

@@ -17,60 +17,59 @@ import kotlinx.coroutines.withContext
 import ru.rim.dd.core.ble.BleDevice
 import ru.rim.dd.core.ble.MeterBleClient
 import ru.rim.dd.core.bridge.SpodesClientBridge
+import ru.rim.dd.core.dlms.CLOCK_STATUS_OBIS
+import ru.rim.dd.core.dlms.CURRENT_TARIFF_OBIS
 import ru.rim.dd.core.dlms.CaptureColumn
+import ru.rim.dd.core.dlms.DD_PHASE_DISPLAY_OBIS
+import ru.rim.dd.core.dlms.DlmsValue
 import ru.rim.dd.core.dlms.ObisCatalog
 import ru.rim.dd.core.dlms.ObisReading
-import ru.rim.dd.core.dlms.captureColumnsOf
+import ru.rim.dd.core.dlms.RELAY_CONTROL_STATE_OBIS
 import ru.rim.dd.core.dlms.ScalerUnit
+import ru.rim.dd.core.dlms.TAMPER_STATUS_OBIS
+import ru.rim.dd.core.dlms.captureColumnsOf
 import ru.rim.dd.core.dlms.compactReadingsOf
-import ru.rim.dd.core.dlms.DlmsValue
-import ru.rim.dd.core.dlms.parseGetResponseBlock
-import ru.rim.dd.core.dlms.decodeDlmsValue
-import ru.rim.dd.core.dlms.scalerUnitOf
-import ru.rim.dd.core.dlms.kiloUnitLabelOf
-import ru.rim.dd.core.dlms.unitLabelOf
 import ru.rim.dd.core.dlms.decodeCosemDate
 import ru.rim.dd.core.dlms.decodeCosemTime
+import ru.rim.dd.core.dlms.decodeDlmsValue
 import ru.rim.dd.core.dlms.describeDlmsValue
+import ru.rim.dd.core.dlms.isClockStatusValid
+import ru.rim.dd.core.dlms.kiloUnitLabelOf
 import ru.rim.dd.core.dlms.longOrBoolValueOf
 import ru.rim.dd.core.dlms.parseActionResponseResult
+import ru.rim.dd.core.dlms.parseGetResponseBlock
 import ru.rim.dd.core.dlms.parseGetResponseTariffs
 import ru.rim.dd.core.dlms.parseGetResponseValue
-import ru.rim.dd.core.dlms.RELAY_CONTROL_STATE_OBIS
-import ru.rim.dd.core.dlms.CURRENT_TARIFF_OBIS
-import ru.rim.dd.core.dlms.DD_PHASE_DISPLAY_OBIS
-import ru.rim.dd.core.dlms.CLOCK_STATUS_OBIS
-import ru.rim.dd.core.dlms.isClockStatusValid
+import ru.rim.dd.core.dlms.scalerUnitOf
 import ru.rim.dd.core.dlms.textValueOf
+import ru.rim.dd.core.dlms.unitLabelOf
 import ru.rim.dd.core.model.ConnectionState
+import ru.rim.dd.core.model.EnergyDirection
+import ru.rim.dd.core.model.LineVoltages
 import ru.rim.dd.core.model.MeterDeviceName
 import ru.rim.dd.core.model.MeterInfo
 import ru.rim.dd.core.model.MeterProtocolProfile
 import ru.rim.dd.core.model.NetworkParams
 import ru.rim.dd.core.model.PairedDevice
+import ru.rim.dd.core.model.PhaseStatus
 import ru.rim.dd.core.model.PhaseValues
 import ru.rim.dd.core.model.Reading
-import ru.rim.dd.core.model.RelayState
 import ru.rim.dd.core.model.RelaySource
+import ru.rim.dd.core.model.RelayState
 import ru.rim.dd.core.model.TamperState
-import ru.rim.dd.core.dlms.TAMPER_STATUS_OBIS
 import ru.rim.dd.data.local.DeviceStore
 import ru.rim.dd.data.local.ReadingDao
+import java.io.ByteArrayOutputStream
 import java.time.Instant
 import java.time.LocalDateTime
+import java.time.LocalTime
 import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
- * Склеивает три независимых слоя:
- *  - MeterBleClient   — сырые байты по BLE (транспорт);
- *  - SpodesClientBridge — разбор/сборка кадров СПОДЭС (нативный код);
- *  - ReadingDao/DeviceStore — локальное хранение.
- *
- * На этом этапе (начало реализации) методы чтения — заглушки с понятной
- * структурой вызова: как только заработает связка BLE ⇄ JNI-мост, сюда
- * подставляется реальный код вместо TODO, сигнатуры наружу не меняются —
- * поэтому ViewModel'и и Compose-экраны можно писать и тестировать уже сейчас.
+ * Связывает BLE-транспорт ([MeterBleClient]), разбор кадров СПОДЭС ([SpodesClientBridge])
+ * и локальное хранение. Все показания приходят из одного объекта — буфера индикации
+ * 0.0.21.0.2.255 — и раскладываются по StateFlow'ам для экранов.
  */
 @Singleton
 class MeterRepositoryImpl @Inject constructor(
@@ -83,9 +82,6 @@ class MeterRepositoryImpl @Inject constructor(
     private val _relayState = MutableStateFlow(
         RelayState(isOn = false, powerLimitKw = 0.0, source = RelaySource.UNKNOWN)
     )
-    // [Android-патч] см. TAMPER_STATUS_OBIS в GetResponseParser.kt и TamperState.kt —
-    // состояние пломб/магнита/СВЧ/батареи, декодированное из того же буфера индикации,
-    // что и control_state реле (_relayState выше) — без отдельного запроса и ассоциации.
     private val _tamperState = MutableStateFlow(TamperState.UNKNOWN)
     private val _networkParams = MutableStateFlow<NetworkParams?>(null)
     private val _meterInfo = MutableStateFlow<MeterInfo?>(null)
@@ -94,150 +90,74 @@ class MeterRepositoryImpl @Inject constructor(
     private var activeSerialNumber: String? = null
 
     /**
-     * [Android-патч] Серийный номер, который сообщил САМ прибор — объект 0.0.96.1.0.255
-     * («Серийный номер» по паспорту), приходит текстом внутри обычного буфера индикации, без
-     * ассоциации и без отдельного запроса (подтверждено логом: 0.0.96.1.0.255="05000112" при
-     * BLE-имени "RIM1894005000112" — совпадает с точностью до цифры).
-     *
-     * Это САМЫЙ достоверный источник: [activeSerialNumber] разбирается из имени, которое прибор
-     * рекламирует в эфире, а здесь номер пришёл по протоколу от самого счётчика. Именно по нему
-     * connectBySerialNumber() проверяет, что подключился к ТОМУ прибору, номер которого ввёл
-     * пользователь (см. там же) — и рвёт связь, если это оказался другой.
+     * Серийный номер, который прибор сообщил сам (0.0.96.1.0.255 в буфере индикации).
+     * Достовернее имени из BLE-рекламы: по нему connectBySerialNumber() сверяет, что
+     * подключились к нужному прибору.
      */
     private var meterReportedSerial: String? = null
 
     /**
-     * [Android-патч] Диалект, на котором говорит подключённый прибор (см. MeterProtocolProfile).
-     * Определяется по имени устройства ОДИН раз при подключении и дальше используется и при
-     * первом чтении, и при восстановлении сеанса после переподключения — важно, чтобы после
-     * разрыва связи сеанс пересобирался ТЕМ ЖЕ способом, которым был установлен, иначе к AKROS
-     * мы вернулись бы уже без ассоциации и он перестал бы отдавать данные.
+     * Диалект подключённого прибора. Определяется по имени один раз при подключении:
+     * после разрыва сеанс должен пересобираться тем же способом, иначе AKROS вернётся
+     * без ассоциации и перестанет отдавать данные.
      */
     private var activeProfile: MeterProtocolProfile = MeterProtocolProfile.RIM_FLAT
 
     /**
-     * [Android-патч] Описание колонок буфера индикации AKROS — см. readAkrosCaptureObjects().
-     * Список OBIS-кодов в том порядке, в котором прибор присылает значения; null на месте
-     * колонки означает, что её OBIS-код разобрать не удалось (значение такой колонки
-     * пропускается, но порядок остальных не сдвигается). Заполняется один раз за сеанс и
-     * очищается при каждом новом подключении — состав буфера у разных приборов разный.
+     * Колонки буфера AKROS в порядке следования значений (см. [readAkrosCaptureObjects]);
+     * null — OBIS колонки не разобран, её значение пропускается без сдвига остальных.
+     * Состав буфера зависит от прибора, поэтому очищается при каждом подключении.
      */
     private var akrosCaptureObis: List<CaptureColumn?> = emptyList()
 
-    /**
-     * [Android-патч] Точные единицы измерения колонок буфера AKROS — см. readAkrosScalerUnits().
-     * Ключ — OBIS-код колонки, значение — прочитанная у прибора пара {множитель, код единицы}.
-     * Заполняется один раз за сеанс вместе с описанием колонок.
-     */
+    /** Единицы измерения колонок буфера AKROS по OBIS (см. [readAkrosScalerUnits]). */
     private var akrosScalerUnits: Map<String, ScalerUnit> = emptyMap()
 
-    /**
-     * [Android-патч] Установлена ли с AKROS ШИФРОВАННАЯ (высокоуровневая) ассоциация HLS-GMAC —
-     * см. establishAkrosSession() и SpodesClientBridge.establishCipheredConnection(). Пока true,
-     * все GET к прибору идут зашифрованными (akrosGetRequest → getRequestCiphered), а ответы
-     * расшифровываются на нативной стороне. Сбрасывается при каждом новом подключении.
-     */
-    private var akrosCiphered: Boolean = false
-
-    /** Собственный скоуп для «насоса» — живёт, пока есть активное BLE-соединение. */
     private val repositoryScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var pumpJob: Job? = null
-
-    /**
-     * [Android-патч] Автообновление показаний/сети/реле по таймеру + возможность обновить
-     * по кнопке (см. startAutoRefresh()/stopAutoRefresh() и refreshReadings()) — job живёт,
-     * пока есть активное соединение, останавливается вместе с pumpJob в stopTransportPump().
-     */
     private var autoRefreshJob: Job? = null
 
     /**
-     * [Android-патч] Единственный SpodesClient на соединение НЕ потокобезопасен (собственные
-     * счётчики send/receive sequence number и flat_invoke_id_, общий rx/tx-буфер) — до
-     * автообновления это было не важно (единственный "верхнеуровневый" GET на подключение +
-     * ручное «Обновить», которые пользователь физически не мог нажать одновременно). Теперь,
-     * когда GET/ACTION может прийти из ТРЁХ независимых источников (таймер автообновления,
-     * кнопка «Обновить», кнопки включения/отключения реле), конкурентный вызов гарантированно
-     * собьёт нумерацию HDLC-кадров — та же категория бага, что чинили в PairingViewModel (см.
-     * cancelAndJoin() там) и в BleTransport::ReadData(), только на уровне DLMS-транзакций, а не
-     * BLE-скана. Поэтому весь протокольный обмен (GET основного буфера, GET реле, ACTION реле,
-     * диагностика журналов) сериализуем через этот мьютекс — держим его на всё время одного
-     * "верхнеуровневого" запроса (включая вложенные readRelayState() внутри
-     * readAndApplyMainBuffer()/sendDisconnectControlAction() — они НЕ берут лок повторно,
-     * достаточно захватить его один раз на внешнем вызове, иначе Mutex.withLock не реентерабелен
-     * и мы бы поймали дедлок).
+     * Нативный SpodesClient не потокобезопасен (счётчики HDLC-кадров, общий буфер), а запросы
+     * идут из нескольких источников: автообновление, кнопка «Обновить», команды реле.
+     * Поэтому весь протокольный обмен сериализован. Mutex не реентерабелен — лок берётся один
+     * раз на верхнеуровневом вызове, вложенные функции его не захватывают.
      */
     private val protocolMutex = Mutex()
 
     /**
-     * [Android-патч] Механизм переподключения — true с момента ПЕРВОГО успешного
-     * readAndApplyMainBuffer() (см. установку ниже) и до явного disconnect()/forgetDevice().
-     * Отличает "мы уже поднимали протокольный сеанс на этом устройстве хотя бы раз" от
-     * "только что запустили приложение/ещё не подключались" — нужно коллектору connectionState
-     * ниже, чтобы не пытаться restart-ить сеанс во время ПЕРВОГО подключения (там это уже
-     * делает connectByAddress()/connectBySerialNumber() сама, по порядку) — см. init{} ниже.
+     * true с первого успешного ответа транспорта до явного disconnect(). Нужен, чтобы
+     * коллектор connectionState не пересобирал сеанс во время первого подключения, а только
+     * после автопереподключения GATT.
      */
     private var protocolSessionEstablished = false
 
     /**
-     * [Android-патч] НАЙДЕНА причина нативного краша (SIGSEGV в SpodesClient::GetErrorMessage(),
-     * см. историю диагностики — "onDeviceDisconnected" сразу перед крашем): readAndApplyMainBuffer()
-     * вызывался ВНУТРИ protocolMutex.withLock, а вот spodes.destroyClient()/spodes.createClient() в
-     * disconnect()/forgetDevice()/reestablishProtocolSession() — СНАРУЖИ этого мьютекса. Если ровно
-     * в тот момент, когда автообновление (уже держащее мьютекс) застряло на блокирующем ЧТЕНИИ
-     * транспорта (см. 3-секундный таймаут в ble_transport.h), пользователь нажимал «Отключиться» —
-     * spodes.destroyClient() успевал обнулить nativeHandle ДО того, как застрявший вызов дочитывал
-     * ответ и обращался к spodes.lastErrorMessage() (или другим native-методам) — обращение шло по
-     * уже уничтоженному handle=0 → SIGSEGV, весь процесс убивало мгновенно (Fatal signal 11).
-     * Кэшируем сообщение об ошибке здесь, а не через повторный spodes.lastErrorMessage() СНАРУЖИ
-     * protocolMutex.withLock (см. вызовы ниже) — это устраняет тот же класс гонки и для читателей
-     * результата readAndApplyMainBuffer().
+     * Сообщение последней ошибки нативного клиента, записанное под [protocolMutex].
+     * Читать spodes.lastErrorMessage() снаружи лока нельзя: параллельный destroyClient()
+     * обнуляет handle, и обращение к нему роняет процесс (SIGSEGV).
      */
     private var lastProtocolError: String? = null
 
     /**
-     * [Android-патч] "Пакеты не уходят, а пишется что подключено" — по логам пользователя
-     * обнаружился отдельный, ранее незамеченный сценарий: счётчик отвечает HDLC-кадром DM
-     * ("Server is already disconnected") или байтами без LLC-заголовка ("не удалось разобрать
-     * DLMS-данные... не найден LLC-заголовок сервера") — то есть САМ СЧЁТЧИК считает логическую
-     * DLMS/HDLC-сессию разорванной, хотя физический GATT (и с ним ConnectionState.Connected)
-     * у Android остаётся рабочим сколь угодно долго. Обычный "неожиданный разрыв"
-     * (MeterBleClient.onDeviceDisconnected) в этом случае никогда не наступает сам по себе —
-     * раньше автообновление просто бесконечно долбило в мёртвый канал каждые
-     * AUTO_REFRESH_INTERVAL_MS, а UI всё это время честно (но неправильно по сути) показывал
-     * "Подключено". Считаем подряд идущие неудачные циклы readAndApplyMainBuffer() — и пустой
-     * ответ транспорта, и проваленный разбор DLMS одинаково считаются "неудачей" — а при
-     * достижении MAX_CONSECUTIVE_PROTOCOL_FAILURES принудительно рвём и поднимаем GATT-соединение
-     * заново (см. forceReconnect() в startAutoRefresh() ниже) — тем же путём восстановления, что
-     * и настоящий обрыв связи, с честным "Переподключение..." в UI. Сбрасывается в 0 при ЛЮБОМ
-     * успешно разобранном ответе.
+     * Подряд неудачных чтений буфера (пустой ответ или ошибка разбора). Так выглядит DLMS-сессия,
+     * которую счётчик считает закрытой (DM-кадр, ответ без LLC-заголовка), пока Android считает
+     * GATT рабочим, — обычный «неожиданный разрыв» в этом случае не наступает. Достигнув
+     * [MAX_CONSECUTIVE_PROTOCOL_FAILURES], автообновление принудительно переподключается.
      */
     private var consecutiveEmptyOrFailedReads = 0
 
     /**
-     * [Android-патч] "После 3-х таких сообщений нужно повторять то же, что при самом первом
-     * подключении" — по свежему логу (12+ минут, десятки циклов forceReconnect()) выяснилось,
-     * что ОБЫЧНОЕ forceReconnect() (быстрый разрыв+подъём GATT) почти никогда само по себе не
-     * лечит зависшую DLMS-сессию: счётчик/пульт продолжают отвечать пустышками ИЛИ кадрами без
-     * LLC-заголовка раз за разом, даже сразу после свежего GATT-коннекта — реально успешных
-     * чтений за 12 минут было буквально 4 из полусотни попыток. Похоже, дело не в нашем
-     * GATT-канале (он поднимается за доли секунды), а в том, что радиосессия ПУЛЬТ↔СЧЁТЧИК
-     * (отдельный канал, живущий независимо от нашего BLE, см. собственные логи прошивки пульта
-     * про "Radio Error") не успевает пересобраться за это же время. Считаем, сколько ПОДРЯД
-     * ЦЕЛЫХ циклов forceReconnect() прошло БЕЗ единого успешно разобранного ответа — сбрасывается
-     * в 0 при любом успешном разборе (см. readAndApplyMainBuffer()). После
-     * COLD_RECONNECT_THRESHOLD таких циклов подряд просим MeterBleClient.forceReconnect(cold=true)
-     * — с паузой перед следующим connect(), имитируя более естественный (не мгновенный) разрыв,
-     * который, судя по логам, пульту нужен, чтобы самому переустановить связь со счётчиком.
+     * Сколько полных циклов forceReconnect() подряд прошло без единого разобранного ответа.
+     * Быстрое переподключение GATT часто не помогает: радиосессия пульт↔счётчик
+     * пересобирается дольше. После [COLD_RECONNECT_THRESHOLD] циклов просим «холодное»
+     * переподключение с паузой.
      */
     private var consecutiveForceReconnectsWithoutData = 0
 
     init {
-        // [Android-патч] Механизм переподключения. GATT-уровень переподключает сам Android BLE
-        // stack (см. MeterBleClient.handleDisconnected() — useAutoConnect(true)) — здесь только
-        // протокольная часть ПОВЕРХ него: как только связь неожиданно оборвалась, останавливаем
-        // "насос"/автообновление (не шлём GET на мёртвый линк), а когда GATT восстановится —
-        // пересобираем DLMS-сеанс с нуля (SpodesClient/HDLC/первое чтение буфера/автообновление),
-        // тем же кодом, что и при первом подключении.
+        // GATT переподключает сам Android (autoConnect); здесь только протокольная часть:
+        // при обрыве останавливаем обмен, при восстановлении пересобираем DLMS-сеанс.
         repositoryScope.launch {
             ble.unexpectedDisconnects.collect {
                 Log.w(TAG, "Обнаружен неожиданный разрыв связи — останавливаем протокольный обмен, ждём автопереподключения BLE")
@@ -256,47 +176,21 @@ class MeterRepositoryImpl @Inject constructor(
 
     override fun connectionState(): Flow<ConnectionState> = ble.connectionState
 
-    // [Android-патч] см. signalStrengthDbm() в MeterRepository.kt.
     override fun signalStrengthDbm(): Flow<Int?> = ble.signalStrengthDbm
 
     override fun scanDevices(): Flow<BleDevice> = ble.scan()
 
     override suspend fun connectByAddress(address: String, pin: String, remember: Boolean, deviceName: String?) {
-        // [Android-патч] см. meterReportedSerial — номер, сообщённый прибором, относится к
-        // КОНКРЕТНОМУ сеансу. Обнуляем ДО чтения буфера, иначе при подключении к другому прибору
-        // (а по адресу это ровно тот случай — пользователь выбрал устройство из списка) в поле
-        // могло бы остаться значение с прошлого подключения, пока новый прибор не пришлёт своё.
+        // Номер от прибора относится к конкретному сеансу — не тащим его с прошлого подключения.
         meterReportedSerial = null
-        // [Android-патч] см. activeProfile — диалект выбираем ДО создания клиента и открытия
-        // канала: от него зависит и порядок установления сеанса, и адресация запросов.
-        activeProfile = MeterProtocolProfile.forDeviceName(deviceName)
-        Log.i(TAG, "Профиль обмена для \"$deviceName\": $activeProfile")
         withContext(Dispatchers.IO) { ble.connectByAddress(address) }
-        spodes.createClient()
-        startTransportPump()
-        withContext(Dispatchers.IO) { establishHdlcChannel() }
-        val connected = protocolMutex.withLock { withContext(Dispatchers.IO) { readAndApplyMainBuffer() } }
-        if (!connected) {
-            stopTransportPump()
-            ble.disconnect()
-            // [Android-патч] см. lastProtocolError выше — берём сообщение, УЖЕ закэшированное
-            // readAndApplyMainBuffer() ПОКА он ещё держал protocolMutex, а не отдельным
-            // spodes.lastErrorMessage() здесь (после stopTransportPump()/ble.disconnect() выше это
-            // было бы обращением к нативному клиенту вне мьютекса — тот же класс гонки, что уронил
-            // процесс, см. комментарий у lastProtocolError).
-            throw IllegalStateException(lastProtocolError ?: "неизвестная ошибка")
-        }
-        // Сбрасываем ПЕРЕД разбором имени — иначе, если разбор не удастся (deviceName == null или
-        // не подходит под формат), activeSerialNumber мог бы остаться от ПРЕДЫДУЩЕГО подключения
-        // (это правилось задним числом — заметил при повторной проверке, до этого было всегда null).
+        openProtocolSession(deviceName)
+
+        // Сбрасываем до разбора имени: иначе при неудачном разборе остался бы номер прошлого прибора.
+        // meterReportedSerial не трогаем — первое чтение буфера уже могло его получить.
         activeSerialNumber = null
-        // [Android-патч] meterReportedSerial НЕ сбрасываем: к этому моменту readAndApplyMainBuffer()
-        // выше уже мог получить номер от самого прибора, и он достовернее разбора имени ниже.
         applyDeviceNameInfo(deviceName)
         if (remember) {
-            // [Android-патч] см. meterReportedSerial — номер от самого прибора надёжнее разобранного
-            // из имени: сопряжение сохраняем под ним, тогда и «Настройки»/автоподключение будут
-            // опознавать прибор по тому же номеру, который потом сверяется при подключении.
             deviceStore.rememberDevice(
                 PairedDevice(
                     serialNumber = meterReportedSerial ?: activeSerialNumber ?: address,
@@ -308,178 +202,144 @@ class MeterRepositoryImpl @Inject constructor(
     }
 
     /**
-     * [Android-патч] Модель и серийный номер счётчика НЕЛЬЗЯ прочитать по DLMS без ассоциации
-     * (см. комментарий у readFirmwareVersion() — та же причина, "object unavailable"). Но пульт
-     * РиМ 040.40 рекламируется в эфире BLE-именем, которое само содержит эти данные — подтверждено
-     * пользователем на реальном устройстве ("RIM1894604314652": первые 5 цифр после буквенного
-     * префикса — модель, "18946" → "189.46" (точка после 3-й цифры), оставшиеся 8 цифр — серийный
-     * номер, "04314652"). Парсер терпим к пробелам/дефисам в имени (просто выбирает все цифры), но
-     * при ЛЮБОМ отклонении от 13 цифр возвращает null — лучше оставить прочерк, чем ошибочно
-     * догадаться модель/серийный из имени нестандартного формата.
+     * Ищет в эфире прибор с ТОЧНО таким серийным номером и после подключения сверяет его с
+     * номером, который прибор сообщил сам, — имя в рекламе прибор называет про себя, ему одному
+     * доверять нельзя. Несовпадение — разрыв связи: иначе пользователь увидел бы показания
+     * (и мог бы управлять реле) чужого прибора. Если прибор номер не сообщает, остаётся только
+     * фильтр поиска; это пишется в лог.
      */
-    private fun parseModelAndSerialFromDeviceName(name: String?): Pair<String, String>? {
-        // [Android-патч] Сам разбор переехал в MeterDeviceName (core/model) — ТУ ЖЕ логику
-        // использует поиск прибора по номеру ПУ в MeterBleClient.connectBySerialNumber(). Держать
-        // две копии нельзя: разойдись они хоть на символ — и фильтр поиска начал бы считать
-        // «нашим» не тот прибор, который потом опознаёт этот метод.
-        val parsed = MeterDeviceName.parse(name) ?: return null
-        return parsed.model to parsed.serialNumber
+    override suspend fun connectBySerialNumber(serialNumber: String, pin: String, remember: Boolean) {
+        meterReportedSerial = null
+        val found = withContext(Dispatchers.IO) { ble.connectBySerialNumber(serialNumber) }
+        openProtocolSession(found.name)
+
+        val reported = meterReportedSerial
+        if (reported != null && !MeterDeviceName.serialsEqual(reported, serialNumber)) {
+            Log.e(
+                TAG,
+                "ПОДКЛЮЧИЛИСЬ НЕ К ТОМУ ПРИБОРУ: запрошен № $serialNumber, а прибор " +
+                        "(\"${found.name}\", ${found.address}) сообщил о себе № $reported — разрываем связь",
+            )
+            abortSession(
+                "Подключение отменено: найденный прибор сообщил номер $reported вместо запрошенного " +
+                        "$serialNumber. Проверьте номер ПУ"
+            )
+        }
+        if (reported == null) {
+            Log.w(
+                TAG,
+                "Прибор не сообщил свой серийный номер ($SERIAL_NUMBER_OBIS) — сверить подключение " +
+                        "по протоколу не с чем, полагаемся только на совпадение номера в имени устройства " +
+                        "(\"${found.name}\")",
+            )
+        }
+
+        // Реальное имя из эфира приоритетнее введённого номера; если оно нестандартное — берём введённый.
+        applyDeviceNameInfo(found.name)
+        if (activeSerialNumber == null) activeSerialNumber = serialNumber
+        if (remember) {
+            deviceStore.rememberDevice(
+                PairedDevice(
+                    serialNumber = reported ?: activeSerialNumber ?: serialNumber,
+                    bleAddress = found.address,
+                ),
+            )
+        }
+        startAutoRefresh()
     }
 
-    /** Разбирает [name] через [parseModelAndSerialFromDeviceName] и применяет к _meterInfo/activeSerialNumber. */
+    /** Общая часть подключения: профиль, нативный клиент, HDLC-канал и первое чтение буфера. */
+    private suspend fun openProtocolSession(deviceName: String?) {
+        activeProfile = MeterProtocolProfile.forDeviceName(deviceName)
+        Log.i(TAG, "Профиль обмена для \"$deviceName\": $activeProfile")
+        spodes.createClient()
+        startTransportPump()
+        withContext(Dispatchers.IO) { establishHdlcChannel() }
+        if (!readMainBuffer()) {
+            stopTransportPump()
+            ble.disconnect()
+            throw IllegalStateException(lastProtocolError ?: "неизвестная ошибка")
+        }
+    }
+
+    /** Закрывает транспорт и бросает исключение — для сбоев при установлении сеанса. */
+    private fun abortSession(message: String): Nothing {
+        stopTransportPump()
+        ble.disconnect()
+        throw IllegalStateException(message)
+    }
+
+    private suspend fun readMainBuffer(): Boolean =
+        protocolMutex.withLock { withContext(Dispatchers.IO) { readAndApplyMainBuffer() } }
+
+    /**
+     * Модель и серийный номер по DLMS без ассоциации не прочитать, но BLE-имя РиМ их содержит
+     * («RIM1894604314652»: 18946 → модель 189.46, 04314652 → серийный номер).
+     * Разбор живёт в [MeterDeviceName] — им же пользуется поиск прибора по номеру.
+     */
     private fun applyDeviceNameInfo(name: String?) {
-        val parsed = parseModelAndSerialFromDeviceName(name)
+        val parsed = MeterDeviceName.parse(name)
         if (parsed == null) {
             Log.w(TAG, "Модель/серийный номер: не удалось разобрать имя устройства \"$name\" (ожидалось 13 цифр после префикса \"RIM\")")
             return
         }
-        val (model, serial) = parsed
-        Log.d(TAG, "Модель/серийный номер разобраны из имени устройства \"$name\": модель=$model, серийный=$serial")
-        activeSerialNumber = serial
-        val prev = _meterInfo.value
-        _meterInfo.value = (prev ?: MeterInfo(model = "—", serialNumber = "—", firmwareVersion = "—"))
-            .copy(model = model, serialNumber = serial)
+        Log.d(TAG, "Модель/серийный номер разобраны из имени устройства \"$name\": модель=${parsed.model}, серийный=${parsed.serialNumber}")
+        activeSerialNumber = parsed.serialNumber
+        _meterInfo.value = (_meterInfo.value ?: blankMeterInfo())
+            .copy(model = parsed.model, serialNumber = parsed.serialNumber)
     }
 
+    private fun blankMeterInfo() =
+        MeterInfo(model = "—", serialNumber = activeSerialNumber ?: "—", firmwareVersion = "—")
+
     /**
-     * GET-запрос через GetRequestFlatAddress — "плоская" однобайтовая HDLC-адресация и
-     * invoke-id-and-priority=0x81, как их использует штатная прошивка пульта РиМ 040.40
-     * при обращении к этому конкретному счётчику (подтверждено сравнением с реальным
-     * логом Tera Term и совпадающим ответом настоящего прибора на захардкоженный тестовый
-     * кадр — см. историю диагностики). Обычный spodes.getRequest() тут не работает: он
-     * пишет двухбайтовый logical+physical адрес и invoke-id 0xC1, счётчик такие кадры
-     * молча игнорирует.
+     * GET буфера индикации 0.0.21.0.2.255 (класс 7, атрибут 2) и разбор ответа в StateFlow'ы.
+     * Общий код для первого чтения, автообновления и кнопки «Обновить».
      *
-     * destAddress=0x03/srcAddress=0x43 — адреса, подтверждённые на реальном приборе для
-     * этого GET (класс 7 "Data", OBIS 0.0.21.0.2.255, атрибут 2 — первый запрос из лога
-     * пульта). Если в дальнейшем понадобятся другие OBIS-запросы — адреса пока считаем
-     * постоянными для этого устройства, но это не проверено для других OBIS.
-     */
-    /**
-     * [Android-патч] ПОПРОБОВАЛИ и ОТКАЗАЛИСЬ: установление DLMS-ассоциации (AARQ/AARE) через
-     * establishConnectionFlatAddress() — см. историю диагностики. Гипотеза была разумной
-     * (0x0B "object unavailable" даже для обязательного Association LN намекал на нужду в
-     * ассоциации), но реальный счётчик отреагировал на AARQ ПЛОХО: он не прислал настоящий
-     * AARE (тег 0x61), а начал отвечать одним и тем же кадром "E6 E7 00 D8 02 01" АБСОЛЮТНО
-     * на любой следующий запрос — включая тот самый GET 0.0.21.0.2.255, который до этого
-     * стабильно работал. То есть счётчик, получив AARQ, которого не ждал (он вообще не
-     * использует классическое ACSE-соглашение — ни SNRM/UA, ни AARQ/AARE, судя по всему),
-     * переходит в какой-то залоченный/ошибочный режим до конца BLE-сессии (переподключение
-     * его сбрасывает). Поэтому AARQ теперь НЕ вызывается автоматически при подключении —
-     * это было бы регрессией (ломает единственный рабочий канал данных). Метод
-     * tryEstablishAssociation() и нативная пара establishConnectionFlatAddress()/
-     * establishConnectionResponseRawBytes() оставлены в бридже нетронутыми на случай, если
-     * позже найдётся правильный security_level/пароль и захочется проверить снова вручную —
-     * но по умолчанию код к этому больше не обращается.
+     * У РиМ запрос идёт «плоской» адресацией (dest 0x03 / src 0x43, invoke-id 0x81, как у
+     * штатного пульта) — библиотека умеет её только через getRequestFlatAddress(). У AKROS
+     * адреса стандартные и уже сохранены в клиенте после SNRM, поэтому обычный getRequest().
      *
-     * [Android-патч] РАЗГАДКА (получена сравнением с реальным логом самого пульта РиМ 040.40,
-     * снятым на настоящем обмене пульт↔счётчик): "5 показаний" — это была вовсе не вся правда
-     * об объекте 0.0.21.0.2.255, а только ПЕРВЫЙ HDLC-сегмент его ответа! Лог пульта показывает,
-     * что ответ на ЭТОТ ЖЕ САМЫЙ запрос (байт в байт совпадает с нашим — сверено) реально приходит
-     * 7+ сегментами: пульт получает первый ~137-байтовый кадр с битом "сегментировано", шлёт
-     * HDLC S-frame (RR) с "плоской" адресацией, получает следующий сегмент, и так далее, пока не
-     * получит финальный (без этого бита) — и только тогда разбирает итоговый буфер (в логе пульта
-     * это подписано "End Of Segmentation" / "DLMS - Parsing Data Success"). Наш клиент раньше
-     * (см. историю в GetResponseRaw()) считал этот бит ложным и НЕ запрашивал продолжение — из-за
-     * чего видел только первый сегмент (те самые 5 значений активной энергии по тарифам).
-     * ИСПРАВЛЕНО: GetResponseRaw() теперь сам дочитывает все сегменты через
-     * SendReadyToReceiveFlatAddress() (см. spodes_client.cpp) — тот самый баг с "ложной
-     * сегментацией" был на самом деле багом в RR-кадре (он шёл с двухбайтовой адресацией,
-     * которую счётчик игнорировал, отсюда и 6-секундное зависание, которое когда-то заставило
-     * убрать чтение продолжения вовсе). Разобрав ПОЛНЫЙ буфер (в логе пульта — 83 элемента),
-     * там оказались активная/реактивная энергия по тарифам 1-8 (не только 1-5) за ДВА периода,
-     * мощности (активная/реактивная/полная), ток нейтрали, частота, дата/время и статусные
-     * OBIS-коды 0.0.96.x — то есть, вероятно, все ~80 параметров "Настройки индикации" И БЕЗ
-     * ассоциации, И без обращения к другим OBIS-объектам.
-     *
-     * [Android-патч] УТОЧНЕНИЕ (после полного разбора всех 83 элементов, см.
-     * applyDecodedBuffer() ниже): напряжение и ток в буфере ЕСТЬ, но под НЕСТАНДАРТНЫМИ OBIS —
-     * 1.0.12.7.0.255 (не 1.0.32.7.0.255) и 1.0.11.7.0.255 (не 1.0.31.7.0.255). Также нашлись
-     * температура прибора (0.0.96.9.0.255) и напряжение резервного питания (0.0.96.6.3.255).
-     * Первоначальный вывод "напряжения в буфере нет" был ошибкой при неполной таблице единиц
-     * измерения IEC 62056-6-2 — исправлено.
-     *
-     * [Android-патч] Диагностический перебор кандидатов (probeStandardObisCandidates(),
-     * ~40 дополнительных GET-запросов на подключение — сканирование 0.0.21.0.C.255 по C=0..19
-     * плюс десяток угадаек по стандартным Register-объектам) УДАЛЁН: он был нужен только пока
-     * не было ясно, что единственный буфер 0.0.21.0.2.255 уже содержит все нужные параметры
-     * (энергия, мощности, напряжение, ток, частота, температура, часы — см. applyDecodedBuffer()
-     * ниже). Теперь это просто лишняя задержка подключения — каждый кандидат из перебора это
-     * отдельный GET-запрос/ответ по BLE, а нужных данных он всё равно не давал (без ассоциации
-     * все "угадайки" гарантированно возвращали object-unavailable, а сканирование 0.0.21.0.C.255
-     * подтвердило, что кроме C=1 и C=2 других профилей нет).
-     *
-     * [Android-патч] Переименована из probeWithoutAssociation() в readAndApplyMainBuffer() —
-     * теперь это не только "проверка при подключении", но и общая логика для кнопки
-     * «Обновить» на экранах (см. refreshReadings() ниже): один и тот же GET-запрос
-     * 0.0.21.0.2.255 обновляет все три StateFlow разом (показания/сеть/инфо), поэтому
-     * достаточно одной функции, вызываемой и при коннекте, и по требованию пользователя.
+     * Возвращает false, только если запрос не удалось отправить. Пустой ответ и ошибка разбора
+     * считаются неудачей в [consecutiveEmptyOrFailedReads], но связь не рвут.
      */
     private fun readAndApplyMainBuffer(): Boolean {
-        // [Android-патч] см. MeterProtocolProfile — адресация запроса зависит от прибора.
-        // У AKROS адреса стандартные (клиент 32 / сервер 1:16), и их уже держит внутри себя
-        // сам SpodesClient после SNRM (connection_addr_), поэтому идёт штатный getRequest();
-        // у РиМ — «плоская» однобайтовая адресация, которую библиотека сама не умеет, отсюда
-        // отдельный getRequestFlatAddress(). Запрашиваемый объект в обоих случаях ОДИН И ТОТ ЖЕ:
-        // буфер индикации 0.0.21.0.2.255 (класс 7) — по паспорту AKROS он у него тоже есть
-        // («Profile | Индикация»), так что разбор ответа и все экраны остаются общими.
         val sent = if (activeProfile == MeterProtocolProfile.AKROS_STANDARD) {
-            Log.d(TAG, "GET-request буфера AKROS (${if (akrosCiphered) "шифрованный" else "открытый"})")
-            akrosGetRequest(
-                classId = MAIN_BUFFER_CLASS_ID,
-                obisCode = MAIN_BUFFER_OBIS,
-                attributeId = 2,
-            )
+            Log.d(TAG, "GET-request буфера AKROS")
+            spodes.getRequest(MAIN_BUFFER_CLASS_ID, MAIN_BUFFER_OBIS, attributeId = 2)
         } else {
             Log.d(TAG, "GET-request через GetRequestFlatAddress (плоская адресация, invoke-id=0x81, как у пульта)")
             spodes.getRequestFlatAddress(
                 classId = MAIN_BUFFER_CLASS_ID,
                 obisCode = MAIN_BUFFER_OBIS,
                 attributeId = 2,
-                destAddress = 0x03,
-                srcAddress = 0x43,
+                destAddress = FLAT_DEST_ADDRESS,
+                srcAddress = FLAT_SRC_ADDRESS,
             )
         }
         if (!sent) {
-            // [Android-патч] см. lastProtocolError выше — читаем сообщение ЗДЕСЬ, пока функция
-            // ещё выполняется внутри protocolMutex.withLock (это гарантирует вызывающий код), а не
-            // отдельным spodes.lastErrorMessage() снаружи лока, где он мог бы попасть на уже
-            // уничтоженный nativeHandle.
             lastProtocolError = spodes.lastErrorMessage()
-            consecutiveEmptyOrFailedReads++ // см. consecutiveEmptyOrFailedReads выше
+            consecutiveEmptyOrFailedReads++
             return false
         }
 
         val raw = spodes.getResponseRawBytes()
         if (raw.isEmpty()) {
             lastProtocolError = spodes.lastErrorMessage()
-            consecutiveEmptyOrFailedReads++ // см. consecutiveEmptyOrFailedReads выше — например, DM-кадр "Server is already disconnected"
+            consecutiveEmptyOrFailedReads++
             Log.w(TAG, "GET-response: пустой ответ от транспорта ($lastProtocolError, подряд неудач: $consecutiveEmptyOrFailedReads)")
-            return true // соединение по BLE рабочее (формально), просто нет данных для парсинга — не рвём коннект ЗДЕСЬ; см. счётчик выше
+            return true
         }
-        // [Android-патч] см. protocolSessionEstablished выше — отмечаем это ЗДЕСЬ, а не в
-        // connectByAddress()/connectBySerialNumber(), потому что readAndApplyMainBuffer() — общая
-        // точка и для первого подключения, и для восстановления сеанса после переподключения
-        // (см. reestablishProtocolSession() ниже), и именно успешный ответ транспорта (а не что-то
-        // из вызывающего кода) — надёжный признак "сеанс реально поднялся".
+        // Именно ответ транспорта — надёжный признак, что сеанс реально поднялся.
         protocolSessionEstablished = true
         try {
-            // [Android-патч] см. readAkrosCaptureObjects() — буфер AKROS «компактный»: значения
-            // идут подряд, без OBIS-кодов, и смысл колонок берётся из описания, прочитанного при
-            // установлении сеанса. Разбор буфера РиМ (тройки {OBIS, значение, scaler+unit}) для
-            // него не годится — именно поэтому раньше выходило «разобрано 0 элементов».
             val all = if (activeProfile == MeterProtocolProfile.AKROS_STANDARD) {
-                // Буфер AKROS тоже приходит блоками — см. assembleDlmsValue(): четырнадцать
-                // колонок с датой-временем и строкой версии ПО в 128 байт не помещаются.
-                // Дочитываем блоки СРАЗУ, до всего остального: пока ответ не забран из канала
-                // целиком, любой следующий запрос попадёт на «хвост» этого — и разъедется весь
-                // дальнейший обмен.
+                // Буфер AKROS приходит блоками; дочитываем сразу, пока канал не занят «хвостом»
+                // этого ответа, иначе следующий запрос разъедется с ним.
                 val buffer = assembleDlmsValue(raw, "буфер индикации")
                 if (akrosCaptureObis.isEmpty()) {
-                    // Описание колонок не получено — пробуем ещё раз: без него значения буфера
-                    // сопоставить не с чем, а сеанс к этому моменту уже живой. Сами значения
-                    // этого цикла пропадают, но следующее автообновление (через несколько секунд)
-                    // разберёт буфер уже полностью.
+                    // Без описания колонок значения не с чем сопоставить; этот цикл потерян,
+                    // следующее автообновление разберёт буфер полностью.
                     Log.w(TAG, "AKROS: описания буфера ещё нет — запрашиваем capture_objects повторно")
                     readAkrosCaptureObjects()
                 }
@@ -489,66 +349,30 @@ class MeterRepositoryImpl @Inject constructor(
             }
             Log.d(TAG, "GET-response: разобрано ${all.size} элементов буфера: $all")
             applyDecodedBuffer(all)
-            consecutiveEmptyOrFailedReads = 0 // см. consecutiveEmptyOrFailedReads выше — реально получили и разобрали данные
-            consecutiveForceReconnectsWithoutData = 0 // см. consecutiveForceReconnectsWithoutData выше — тем же событием: раз данные реально разобрались, "холодная" эскалация больше не нужна
+            consecutiveEmptyOrFailedReads = 0
+            consecutiveForceReconnectsWithoutData = 0
         } catch (ex: Exception) {
-            // Не рвём соединение из-за ошибки разбора — само GET-request/response уже сработало,
-            // а формат ответа для другого OBIS-кода может отличаться и потребовать доработки парсера.
-            // [Android-патч] но считаем как неудачу для consecutiveEmptyOrFailedReads выше — именно
-            // так на практике выглядит десинхронизация DLMS-сессии ("не найден LLC-заголовок сервера").
             consecutiveEmptyOrFailedReads++
             Log.e(TAG, "GET-response: не удалось разобрать DLMS-данные: ${ex.message} (подряд неудач: $consecutiveEmptyOrFailedReads)", ex)
         }
-
-        // [Android-патч] readFirmwareVersion() ВРЕМЕННО не вызывается — этот и любой другой OBIS,
-        // кроме 0.0.21.0.2.255, гарантированно возвращает "object unavailable" без установленной
-        // DLMS-ассоциации (подтверждено диагностикой журналов), а association на этом приборе
-        // пока недоступна (нужен корректный security_level/пароль — см. историю у readFirmwareVersion()
-        // ниже). Раньше это был лишний GET на каждое подключение/обновление без всякой пользы —
-        // убрали, пока проблема с доступом не решится. Сам метод оставлен нетронутым на будущее.
-        //
-        // [Android-патч] readRelayState() ТОЖЕ больше не вызывается здесь — по той же причине:
-        // оба её GET-запроса (output_state/control_state как отдельные атрибуты объекта Disconnect
-        // Control) гарантированно возвращают 0x0D без ассоциации. НАСТОЯЩЕЕ состояние реле теперь
-        // приходит САМО, без единого лишнего запроса — см. RELAY_CONTROL_STATE_OBIS в
-        // GetResponseParser.kt и применение в applyDecodedBuffer() (вызван строкой выше): оно
-        // читается как обычное поле буфера 0.0.21.0.2.255, который мы и так только что разобрали.
-        // Метод readRelayState() оставлен нетронутым на случай, если ассоциация всё же появится —
-        // тогда чтение по прямому OBIS снова станет иметь смысл (как резервный/более точный путь).
         return true
     }
 
-    /**
-     * [Android-патч] «Индикация» состояния размыкателя (UC-07) — ПЕРЕД управлением (ACTION/SET на
-     * реле) сначала проверяем безопасное ЧТЕНИЕ, по договорённости: формат ACTION-запроса для
-     * ЭТОГО прибора не сверен с реальным логом пульта (в отличие от GET, который мы каждый раз
-     * сверяли), а отправлять непроверенную команду на физическое силовое оборудование вслепую —
-     * не вариант. GET — безопасная операция, ей рискуем.
-     *
-     * OBIS 0.0.96.3.10.255, класс "Disconnect Control" — найден в паспорте прибора (файл-выгрузка
-     * "RIM1894604314652") с описанием "Размыкатель"; 70 — стандартный DLMS/COSEM class-id для
-     * Disconnect Control (не догадка конкретно под этот прибор, как OBIS-коды, а часть спецификации
-     * DLMS UA 1000-1 — тот же источник, что и class-id=7 для Profile Generic, который на этом
-     * приборе уже подтверждённо работает). Пробуем два атрибута по той же спецификации:
-     * attribute 2 (output_state — Boolean, физическое состояние выхода) и attribute 3
-     * (control_state — Enum: 0=disconnected, 1=connected, 2=ready_for_reconnection). Не знаем
-     * заранее, доступны ли они без ассоциации — весь остальной прибор, кроме 0.0.21.0.2.255, её
-     * требует (подтверждено диагностикой 23 журналов) — поэтому это и есть диагностика: если оба
-     * вернут "object unavailable", будет ясно, что реле упирается в ту же стену, что и журналы.
-     */
+    // Не вызывается: без ассоциации прибор отдаёт только буфер 0.0.21.0.2.255, состояние реле
+    // приходит внутри него (RELAY_CONTROL_STATE_OBIS). Оставлено на случай появления ассоциации.
     private fun readRelayState() {
         val outputState = readDisconnectControlAttribute(attributeId = 2, label = "output_state")
         val controlState = readDisconnectControlAttribute(attributeId = 3, label = "control_state")
 
-        if (outputState == null && controlState == null) return // оба недоступны — вероятно, снова нет ассоциации
+        if (outputState == null && controlState == null) return
 
         val prev = _relayState.value
         val isOn = when {
-            controlState != null -> controlState == 1L // 1 = connected по DLMS Disconnect Control
+            controlState != null -> controlState == 1L // 0=disconnected, 1=connected, 2=ready_for_reconnection
             outputState != null -> outputState == 1L
             else -> prev.isOn
         }
-        val remoteTurnOnAllowed = controlState == 2L // 2 = ready_for_reconnection
+        val remoteTurnOnAllowed = controlState == 2L
         _relayState.value = prev.copy(isOn = isOn, remoteTurnOnAllowed = remoteTurnOnAllowed)
         Log.d(
             TAG,
@@ -558,13 +382,13 @@ class MeterRepositoryImpl @Inject constructor(
     }
 
     private fun readDisconnectControlAttribute(attributeId: Int, label: String): Long? {
-        Log.d(TAG, "GET-request размыкателя (0.0.96.3.10.255, class=70 Disconnect Control, attr=$attributeId \"$label\")")
+        Log.d(TAG, "GET-request размыкателя ($DISCONNECT_CONTROL_OBIS, class=$DISCONNECT_CONTROL_CLASS_ID Disconnect Control, attr=$attributeId \"$label\")")
         val sent = spodes.getRequestFlatAddress(
-            classId = 70,
-            obisCode = "0.0.96.3.10.255",
+            classId = DISCONNECT_CONTROL_CLASS_ID,
+            obisCode = DISCONNECT_CONTROL_OBIS,
             attributeId = attributeId,
-            destAddress = 0x03,
-            srcAddress = 0x43,
+            destAddress = FLAT_DEST_ADDRESS,
+            srcAddress = FLAT_SRC_ADDRESS,
         )
         if (!sent) {
             Log.w(TAG, "Размыкатель ($label, attr=$attributeId): запрос не отправлен (${spodes.lastErrorMessage()})")
@@ -585,52 +409,17 @@ class MeterRepositoryImpl @Inject constructor(
         }
     }
 
-    /**
-     * [Android-патч] Отдельный "голый" GET на служебный OBIS 0.0.96.1.2.255 (class 1 "Data",
-     * attribute 2) — версия ПО этого прибора. Не входит в capture_objects профиля
-     * 0.0.21.0.2.255, поэтому запрашивается отдельным запросом сразу после основного.
-     *
-     * [Android-патч] ВАЖНО (см. историю диагностики кнопки «Обновить»): счётчик, похоже, ДЕЙСТВИТЕЛЬНО
-     * хранит нумерацию HDLC-кадров (N(S)/N(R)) в рамках всего BLE-соединения, а не по одному
-     * запросу — попытка принудительно сбрасывать её в 0 перед каждым верхнеуровневым GET (был
-     * такой фикс в GetRequestFlatAddress()) оказалась ОШИБКОЙ: счётчик воспринимал повтор N(S)=0
-     * как дублирующийся кадр и просто переотправлял старый ACK, не выполняя команду заново —
-     * поэтому фикс откачен. Корректность второго GET подряд (этого) зависит от того, что
-     * send_sequence_number_/receive_sequence_number_ у нас накапливаются БЕЗ ДРЕЙФА относительно
-     * реального числа переданных/принятых кадров — отдельно исправлен баг в BleTransport::ReadData()
-     * (см. ble_transport.h), из-за которого чтение каждого сегмента могло растягиваться на секунды
-     * и, возможно, склеивать границы кадров. Это подтверждено логом реального обмена: второй GET
-     * подряд теперь ПОЛУЧАЕТ настоящий (не голый RR) DLMS-ответ.
-     *
-     * [Android-патч] КОД ПОДТВЕРЖДЁН (сверено с паспортом объектов прибора, файл-выгрузка
-     * "RIM1894604314652", загруженный пользователем): для класса "Data" с описанием "Версия ПО"
-     * в паспорте прямо указан OBIS 0.0.96.1.2.255 — то есть угадка была верной, дело не в неверном
-     * коде. Реальный ответ прибора на этот GET — корректно оформленный data-access-result с кодом
-     * 0x0B (11, "object unavailable"): прибор понимает запрос, но не отдаёт значение по этому
-     * адресу без прикладной ассоциации (AARQ/AARE). Это согласуется с более ранним наблюдением у
-     * establishConnectionFlatAddress() (см. комментарий ниже по коду и в SpodesClientBridge.kt) —
-     * БЕЗ ассоциации счётчик отдаёт ровно ОДИН "публичный" объект, 0.0.21.0.2.255 (основной буфер),
-     * а вообще всё остальное, включая обязательный для любого DLMS-сервера Association LN
-     * (0.0.40.0.0.255), отвечает тем же самым "object unavailable". Поэтому перебор ДРУГИХ
-     * OBIS-кодов версии ПО (0.0.96.1.0/1/6.255, 1.0.0.2.0.255 и т.п.) ничего не даст — они тоже
-     * упрутся в то же самое "нет ассоциации", а не в "неверный код". А сам AARQ на этом приборе
-     * пробовали включать раньше — он не присылает настоящий AARE и вместо этого ломает единственный
-     * рабочий канал данных до конца BLE-сессии (см. подробности в readAndApplyMainBuffer() выше),
-     * так что автоматически он больше не вызывается. Итог: "странная" версия ПО — это ЧИСТАЯ,
-     * ожидаемая ошибка доступа, а не мусорные/нечитаемые байты; чтобы читать её по-настоящему,
-     * нужен правильный security_level/пароль для AARQ этого конкретного прибора (уточнить у
-     * специалиста РиМ или по паспорту прибора) — тогда можно будет аккуратно (вручную, не при
-     * каждом коннекте) попробовать tryEstablishAssociation() ещё раз. Ошибку разбора здесь не
-     * считаем фатальной — версия ПО просто останется прочерком.
-     */
+    // Не вызывается: версия ПО 0.0.96.1.2.255 без ассоциации отдаёт data-access-result 0x0B
+    // («object unavailable») — код верный, но значение доступно только внутри буфера индикации.
+    // Оставлено на случай появления ассоциации.
     private fun readFirmwareVersion() {
         Log.d(TAG, "GET-request версии ПО (0.0.96.1.2.255, class=1, attr=2)")
         val sent = spodes.getRequestFlatAddress(
             classId = 1,
             obisCode = "0.0.96.1.2.255",
             attributeId = 2,
-            destAddress = 0x03,
-            srcAddress = 0x43,
+            destAddress = FLAT_DEST_ADDRESS,
+            srcAddress = FLAT_SRC_ADDRESS,
         )
         if (!sent) {
             Log.w(TAG, "Версия ПО: запрос не отправлен (${spodes.lastErrorMessage()})")
@@ -645,14 +434,8 @@ class MeterRepositoryImpl @Inject constructor(
             val value = parseGetResponseValue(raw)
             val text = textValueOf(value)
             Log.d(TAG, "Версия ПО: разобрано как \"$text\" (сырое значение: ${describeDlmsValue(value)})")
-            val prev = _meterInfo.value
-            _meterInfo.value = (
-                    prev ?: MeterInfo(model = "—", serialNumber = activeSerialNumber ?: "—", firmwareVersion = "—")
-                    ).copy(firmwareVersion = text)
+            _meterInfo.value = (_meterInfo.value ?: blankMeterInfo()).copy(firmwareVersion = text)
         } catch (ex: Exception) {
-            // Ожидаемый случай на этом приборе без ассоциации: data-access-result 0x0B
-            // ("object unavailable") — код OBIS верный (сверено с паспортом), просто прибор не
-            // отдаёт его без AARQ. См. комментарий к функции выше.
             Log.w(
                 TAG,
                 "Версия ПО: не удалось разобрать ответ (${ex.message}) — сырые байты (${raw.size}): " +
@@ -662,186 +445,87 @@ class MeterRepositoryImpl @Inject constructor(
     }
 
     /**
-     * [Android-патч] По запросу пользователя ("вытягивать все возможные журналы") — каталог
-     * объектов класса Profile Generic из паспорта прибора (файл-выгрузка "RIM1894604314652",
-     * загруженный пользователем), у которых в описании явно значится "Журнал ..." либо это
-     * связанные с журналами суточный/месячный отчёт и профили нагрузки. OBIS-коды и названия
-     * взяты дословно из паспорта — attribute 2 (buffer) для класса Profile Generic (7) везде
-     * одинаков, как и у уже рабочего 0.0.21.0.2.255.
-     */
-    private data class LogCandidate(val obisCode: String, val label: String)
-
-    private val LOG_CANDIDATES = listOf(
-        LogCandidate("0.0.99.98.0.255", "Журнал событий по напряжению"),
-        LogCandidate("0.0.99.98.1.255", "Журнал событий по току"),
-        LogCandidate("0.0.99.98.2.255", "Журнал включений-выключений"),
-        LogCandidate("0.0.99.98.3.255", "Журнал коррекций"),
-        LogCandidate("0.0.99.98.4.255", "Журнал внешних воздействий"),
-        LogCandidate("0.0.99.98.5.255", "Журнал подключений"),
-        LogCandidate("0.0.99.98.6.255", "Журнал несанкционированного доступа"),
-        LogCandidate("0.0.99.98.7.255", "Журнал самодиагностики"),
-        LogCandidate("0.0.99.98.8.255", "Журнал событий по Tg(Ф)"),
-        LogCandidate("0.0.99.98.9.255", "Журнал ПКЭ"),
-        LogCandidate("0.0.99.98.11.255", "Журнал радиопоиска"),
-        LogCandidate("0.0.99.98.12.255", "Журнал контроля Tg(Ф)"),
-        LogCandidate("0.0.99.98.13.255", "Журнал установки времени"),
-        LogCandidate("0.0.99.98.14.255", "Годовой журнал"),
-        LogCandidate("0.0.99.98.15.255", "Журнал ПКЭ на РДЧ"),
-        LogCandidate("0.0.99.98.16.255", "Журнал контроля мощности"),
-        LogCandidate("0.0.99.98.18.255", "Журнал блокировки реле"),
-        LogCandidate("1.0.94.7.0.255", "Журнал стоп-кадра"),
-        LogCandidate("1.0.98.1.0.255", "Месячный журнал"),
-        LogCandidate("1.0.98.2.0.255", "Суточный журнал"),
-        LogCandidate("1.0.99.1.0.255", "Профиль нагрузки №1"),
-        LogCandidate("1.0.99.2.0.255", "Профиль нагрузки №2"),
-        LogCandidate("1.0.99.3.0.255", "Профиль нагрузки №3"),
-    )
-
-    /**
-     * Один GET на буфер журнала — та же "плоская" адресация, что и у readAndApplyMainBuffer()/
-     * readFirmwareVersion(). Формат записей у каждого журнала свой (разные capture_objects) и
-     * заранее неизвестен, поэтому пока не парсим целевую структуру — просто логируем общий DLMS-
-     * разбор (describeDlmsValue) при успехе либо код ошибки при неудаче. По ожиданиям (см.
-     * комментарий у readFirmwareVersion()) большинство, вероятно, вернёт то же самое "object
-     * unavailable" 0x0B — этот прибор без AARQ отдаёт только 0.0.21.0.2.255 — но не проверяли
-     * КАЖДЫЙ журнал по отдельности, так что диагностика имеет смысл.
-     */
-    private fun tryReadLog(candidate: LogCandidate) {
-        Log.d(TAG, "GET-request журнала \"${candidate.label}\" (${candidate.obisCode}, class=7, attr=2)")
-        val sent = spodes.getRequestFlatAddress(
-            classId = 7,
-            obisCode = candidate.obisCode,
-            attributeId = 2,
-            destAddress = 0x03,
-            srcAddress = 0x43,
-        )
-        if (!sent) {
-            Log.w(TAG, "Журнал \"${candidate.label}\" (${candidate.obisCode}): запрос не отправлен (${spodes.lastErrorMessage()})")
-            return
-        }
-        val raw = spodes.getResponseRawBytes()
-        if (raw.isEmpty()) {
-            Log.w(TAG, "Журнал \"${candidate.label}\" (${candidate.obisCode}): пустой ответ от транспорта (${spodes.lastErrorMessage()})")
-            return
-        }
-        try {
-            val value = parseGetResponseValue(raw)
-            Log.d(TAG, "Журнал \"${candidate.label}\" (${candidate.obisCode}): УСПЕХ — ${describeDlmsValue(value)}")
-        } catch (ex: Exception) {
-            Log.w(TAG, "Журнал \"${candidate.label}\" (${candidate.obisCode}): ${ex.message}")
-        }
-    }
-
-    private fun probeAllLogCandidates() {
-        Log.d(TAG, "=== Диагностика журналов: пробуем ${LOG_CANDIDATES.size} объектов класса Profile Generic ===")
-        for (candidate in LOG_CANDIDATES) {
-            tryReadLog(candidate)
-        }
-        Log.d(TAG, "=== Диагностика журналов: завершено ===")
-    }
-
-    override suspend fun probeAllLogs() {
-        if (pumpJob?.isActive != true) {
-            Log.w(TAG, "probeAllLogs(): нет активного BLE-соединения")
-            return
-        }
-        protocolMutex.withLock { withContext(Dispatchers.IO) { probeAllLogCandidates() } }
-    }
-
-    /**
-     * Раскладывает ПОЛНЫЙ буфер объекта 0.0.21.0.2.255 (83 элемента, см. историю диагностики —
-     * сравнение с логом реального пульта) по трём независимым StateFlow, которые уже слушают
-     * экраны «Показания»/«Сеть»/«Инфо». Один и тот же буфер содержит вперемешку:
-     *  - накопленную энергию (OBIS A.B.C.8.E.F, C=1..4 — активная/реактивная, E — тариф,
-     *    F=255 — текущий расчётный период, F=101 — предыдущий период) → _readings;
-     *  - мгновенные величины сети (A.B.C.7.0.255 — мощность/напряжение/ток/частота,
-     *    нестандартные коды C=11/12/91, подтверждённые реальными значениями) → _networkParams;
-     *  - статусные OBIS 0.0.96.x (температура, резервное питание) и часы самого прибора
-     *    (0.0.0.9.1.255 время / 0.0.0.9.2.255 дата) → _meterInfo.
-     * Показания за предыдущий период (F=101) сознательно не показываются на текущем этапе —
-     * экран «Показания» ориентирован на текущие значения (можно добавить отдельно позже).
+     * Раскладывает буфер индикации по StateFlow'ам: состояние реле и пломб, энергия по тарифам,
+     * мгновенные параметры сети, сведения о приборе. Показания за предыдущий период (F=101)
+     * экран «Показания» показывает отдельной группой «РДЧ».
      */
     private fun applyDecodedBuffer(all: List<ObisReading>) {
-        fun find(obis: String) = all.firstOrNull { it.obisCode == obis }
+        applyRelayState(all)
+        applyTamperState(all)
+        applyEnergyReadings(all)
+        applyNetworkParams(all)
+        applyMeterInfo(all)
+    }
 
-        // [Android-патч] Текст поля буфера. РАНЬШЕ версия ПО/модель/серийник искались ТОЛЬКО в
-        // textValue (VisibleString, тег 0x0A) — так их отдаёт РиМ. Но AKROS присылает эти же
-        // поля OCTET-STRING'ом (тег 0x09): в логе 0.0.96.1.2.255 приходит как байты
-        // [49,46,48,50] = "1.02", при этом textValue=null — и поле «Версия ПО» молча оставалось
-        // пустым, хотя значение реально пришло. Теперь берём textValue, а если его нет —
-        // декодируем octetValue как ASCII (только если все байты печатные, иначе это не текст,
-        // а, например, дата-время, и подставлять её в «Версия ПО» нельзя).
-        fun readingText(r: ObisReading?): String? {
-            r ?: return null
-            r.textValue?.let { return it }
-            val bytes = r.octetValue ?: return null
-            if (bytes.isEmpty() || bytes.any { (it.toInt() and 0xFF) !in 0x20..0x7E }) return null
-            return String(bytes, Charsets.US_ASCII).trim().takeIf { it.isNotEmpty() }
+    /** Поле буфера по OBIS-коду; при дубликатах берётся первое. */
+    private fun List<ObisReading>.byObis(obis: String) = firstOrNull { it.obisCode == obis }
+
+    /**
+     * Текст поля буфера. РиМ отдаёт текст как VisibleString, AKROS — как OCTET STRING
+     * («1.02» приходит байтами [49,46,48,50]). Октеты принимаются только если все байты
+     * печатные: иначе это, например, дата-время, и в «Версию ПО» его подставлять нельзя.
+     */
+    private fun ObisReading?.asText(): String? {
+        val reading = this ?: return null
+        reading.textValue?.let { return it }
+        val bytes = reading.octetValue ?: return null
+        if (bytes.isEmpty() || bytes.any { (it.toInt() and 0xFF) !in 0x20..0x7E }) return null
+        return String(bytes, Charsets.US_ASCII).trim().takeIf { it.isNotEmpty() }
+    }
+
+    /**
+     * control_state размыкателя приходит позиционным полем этого же буфера: прямое чтение
+     * Disconnect Control без ассоциации отвечает 0x0D. Значения: 0=disconnected, 1=connected,
+     * 2=ready_for_reconnection.
+     */
+    private fun applyRelayState(all: List<ObisReading>) {
+        val controlState = all.byObis(RELAY_CONTROL_STATE_OBIS)?.rawValue ?: return
+        _relayState.value = _relayState.value.copy(
+            isOn = controlState == 1L,
+            remoteTurnOnAllowed = controlState == 2L,
+            source = RelaySource.METER_READ,
+        )
+    }
+
+    /** Пломбы и датчики — позиционное поле «Значки ДД» (раскладка бит — в [TamperState]). */
+    private fun applyTamperState(all: List<ObisReading>) {
+        val status = all.byObis(TAMPER_STATUS_OBIS)?.rawValue ?: return
+        _tamperState.value = TamperState.decode(status)
+    }
+
+    private fun applyEnergyReadings(all: List<ObisReading>) {
+        val energy = all.filter { r ->
+            val g = r.obisCode.split(".")
+            // C=1..4 — активная/реактивная энергия; D=8 — накопленная (F=255 текущий период,
+            // F=101 расчётный день), D=17 — старые коды РДЧ прежних версий ПО прибора.
+            g.size == 6 && (g[2].toIntOrNull() in 1..4) &&
+                    ((g[3] == "8" && (g[5] == "255" || g[5] == "101")) || g[3] == "17")
         }
-
-        // ---- Состояние размыкателя (control_state) → _relayState ----
-        // [Android-патч] см. RELAY_CONTROL_STATE_OBIS в GetResponseParser.kt: то самое поле,
-        // которое при ПРЯМОМ чтении объекта Disconnect Control (0.0.96.3.10.255, attr=3) даёт
-        // отказ доступа 0x0D — оказывается, приходит внутри ЭТОГО буфера каждый цикл, безо
-        // всякой ассоциации (подтверждено логами реального пульта — см. историю диагностики).
-        // Значения control_state по DLMS Disconnect Control: 0=disconnected, 1=connected,
-        // 2=ready_for_reconnection (см. readRelayState() ниже — та же семантика).
-        val controlState = find(RELAY_CONTROL_STATE_OBIS)?.rawValue
-        if (controlState != null) {
-            val prev = _relayState.value
-            _relayState.value = prev.copy(
-                isOn = controlState == 1L,
-                remoteTurnOnAllowed = controlState == 2L,
-                source = RelaySource.METER_READ,
+        if (energy.isEmpty()) return
+        _readings.value = energy.map {
+            Reading(
+                obisId = it.obisCode,
+                tariff = it.tariff,
+                valueKwh = it.valueKwh,
+                timestamp = Instant.now(),
+                // valueKwh получен делением на 1000, поэтому единицу прибора (Вт·ч) переводим в «кило».
+                unitLabel = kiloUnitLabelOf(it.unit),
+                isRdch = it.obisCode.split(".").let { g -> g.getOrNull(5) == "101" || g.getOrNull(3) == "17" },
             )
         }
+    }
 
-        // ---- Пломбы/датчики внешних воздействий → _tamperState ----
-        // [Android-патч] см. TAMPER_STATUS_OBIS в GetResponseParser.kt и TamperState.kt —
-        // раскладка бит 1:1 расшифрована из исходников прошивки самого пульта РиМ 040.40
-        // (thread_dataRequest.c::read_status()). Как и с реле, это НЕ отдельный GET на объекты
-        // СТО 34.01-5.1-006 (0.0.96.51.x — почти наверняка отказ доступа без ассоциации), а то
-        // же самое позиционное поле "Значки ДД" внутри ЭТОГО буфера, которое пульт уже читает.
-        val tamperStatus = find(TAMPER_STATUS_OBIS)?.rawValue
-        if (tamperStatus != null) {
-            _tamperState.value = TamperState.decode(tamperStatus)
-        }
-
-        // ---- Энергия по категориям и тарифам (текущий период) → _readings ----
-        val energyReadings = all.filter { r ->
-            val g = r.obisCode.split(".")
-            g.size == 6 && g[3] == "8" && g[5] == "255" && (g[2].toIntOrNull() in 1..4)
-        }
-        if (energyReadings.isNotEmpty()) {
-            _readings.value = energyReadings.map {
-                Reading(
-                    obisId = it.obisCode,
-                    tariff = it.tariff,
-                    valueKwh = it.valueKwh,
-                    timestamp = Instant.now(),
-                    // [Android-патч] см. Reading.unitLabel — единица от самого прибора, если он её
-                    // сообщил. valueKwh делит на 1000, поэтому и подпись переводим в «кило»:
-                    // прибор отдаёт Вт·ч, на экране — кВт·ч.
-                    unitLabel = kiloUnitLabelOf(it.unit),
-                )
-            }
-        }
-
-        // ---- Мгновенные параметры сети → _networkParams ----
-        // [Android-патч] ПОДДЕРЖКА ТРЁХФАЗНЫХ ПРИБОРОВ (напр. РиМ 489). У однофазных (189.xx,
-        // AKROS) мгновенные величины лежат под «суммарными» OBIS: напряжение 1.0.12.7.0.255,
-        // ток 1.0.11.7.0.255. У трёхфазного 489 таких кодов НЕТ — вместо них пофазные (это и
-        // видно в его буфере: напряжение 1.0.32.7 / 1.0.52.7 / 1.0.72.7 ≈ 143 В, частота
-        // 1.0.14.7 ≈ 50 Гц). Раньше мы читали только суммарные коды, поэтому на 489 напряжение
-        // и ток показывались нулями, хотя прибор под нагрузкой и реально их отдаёт. Теперь берём
-        // и суммарные, и пофазные; PhaseValues.total для трёхфазного — L1 (чтобы поле не пустовало),
-        // а l1/l2/l3 заполняются для пофазного отображения на экране «Сеть».
-        // OBIS по стандарту COSEM: фаза A = *.(2x).7, фаза B = *.(4x).7, фаза C = *.(6x).7.
+    /**
+     * Однофазные приборы (189.xx, AKROS) отдают напряжение и ток под суммарными OBIS
+     * (1.0.12.7 / 1.0.11.7), трёхфазный 489 — только пофазными (1.0.32.7 / 52.7 / 72.7).
+     * Берём и те и другие: total у трёхфазного — L1, чтобы поле не пустовало.
+     */
+    private fun applyNetworkParams(all: List<ObisReading>) {
         fun phase(total: String, l1: String, l2: String, l3: String, divide: Double = 1.0): PhaseValues? {
-            val t = find(total)?.value
-            val a = find(l1)?.value
-            val b = find(l2)?.value
-            val c = find(l3)?.value
+            val t = all.byObis(total)?.value
+            val a = all.byObis(l1)?.value
+            val b = all.byObis(l2)?.value
+            val c = all.byObis(l3)?.value
             if (t == null && a == null && b == null && c == null) return null
             return PhaseValues(
                 total = (t ?: a ?: 0.0) / divide,
@@ -850,155 +534,140 @@ class MeterRepositoryImpl @Inject constructor(
                 l3 = c?.div(divide),
             )
         }
+
         val voltage = phase("1.0.12.7.0.255", "1.0.32.7.0.255", "1.0.52.7.0.255", "1.0.72.7.0.255")
         val current = phase("1.0.11.7.0.255", "1.0.31.7.0.255", "1.0.51.7.0.255", "1.0.71.7.0.255")
-        // Мощности — в кВт/квар/кВА, поэтому делим на 1000 (прибор отдаёт в Вт/вар/ВА).
+        // Мощности прибор отдаёт в Вт/вар/ВА, на экране — кВт/квар/кВА.
         val power = phase("1.0.1.7.0.255", "1.0.21.7.0.255", "1.0.41.7.0.255", "1.0.61.7.0.255", divide = 1000.0)
         val reactivePower = phase("1.0.3.7.0.255", "1.0.23.7.0.255", "1.0.43.7.0.255", "1.0.63.7.0.255", divide = 1000.0)
         val apparentPower = phase("1.0.9.7.0.255", "1.0.29.7.0.255", "1.0.49.7.0.255", "1.0.69.7.0.255", divide = 1000.0)
-        val neutralCurrentA = find("1.0.91.7.0.255")?.value
-        val frequencyHz = find("1.0.14.7.0.255")?.value
-        if (voltage != null || current != null || power != null) {
-            _networkParams.value = NetworkParams(
-                voltage = voltage ?: PhaseValues(total = 0.0),
-                current = current ?: PhaseValues(total = 0.0),
-                power = power ?: PhaseValues(total = 0.0),
-                frequencyHz = frequencyHz,
-                reactivePowerKvar = reactivePower?.total,
-                apparentPowerKva = apparentPower?.total,
-                neutralCurrentA = neutralCurrentA,
-            )
+        val cosPhi = phase("1.0.13.7.0.255", "1.0.33.7.0.255", "1.0.53.7.0.255", "1.0.73.7.0.255")
+
+        // Линейные напряжения: 1.0.124/125/126.7, у прежних версий ПО — 1.0.12.7.1/2/3.
+        val newL12 = all.byObis("1.0.124.7.0.255")?.value
+        val newL23 = all.byObis("1.0.125.7.0.255")?.value
+        val newL13 = all.byObis("1.0.126.7.0.255")?.value
+        val oldL12 = all.byObis("1.0.12.7.1.255")?.value
+        val oldL23 = all.byObis("1.0.12.7.2.255")?.value
+        val oldL13 = all.byObis("1.0.12.7.3.255")?.value
+        val lineVoltages = when {
+            newL12 != null || newL23 != null || newL13 != null -> LineVoltages(newL12, newL23, newL13)
+            oldL12 != null || oldL23 != null || oldL13 != null -> LineVoltages(oldL12, oldL23, oldL13, legacyCodes = true)
+            else -> null
         }
 
-        // ---- Температура / резервное питание / часы прибора → _meterInfo ----
-        val temperatureC = find("0.0.96.9.0.255")?.value
-        val backupVoltageV = find("0.0.96.6.3.255")?.value
-        val dateBytes = find("0.0.0.9.2.255")?.octetValue
-        val timeBytes = find("0.0.0.9.1.255")?.octetValue
+        if (voltage == null && current == null && power == null) return
+        _networkParams.value = NetworkParams(
+            voltage = voltage ?: PhaseValues(total = 0.0),
+            current = current ?: PhaseValues(total = 0.0),
+            power = power ?: PhaseValues(total = 0.0),
+            frequencyHz = all.byObis("1.0.14.7.0.255")?.value,
+            reactivePowerKvar = reactivePower?.total,
+            apparentPowerKva = apparentPower?.total,
+            neutralCurrentA = all.byObis("1.0.91.7.0.255")?.value,
+            cosPhi = cosPhi,
+            lineVoltages = lineVoltages,
+        )
+    }
+
+    /**
+     * Сведения о приборе. Поля, не пришедшие в этом цикле, сохраняют прежнее значение;
+     * OBIS-подпись хранится вместе со значением, чтобы не отвязаться от источника.
+     */
+    private fun applyMeterInfo(all: List<ObisReading>) {
+        val temperatureC = all.byObis("0.0.96.9.0.255")?.value
+        val backupVoltageV = all.byObis("0.0.96.6.3.255")?.value
+
+        val dateBytes = all.byObis("0.0.0.9.2.255")?.octetValue
+        val timeBytes = all.byObis("0.0.0.9.1.255")?.octetValue
         val deviceClock = if (dateBytes != null && timeBytes != null) {
             val date = decodeCosemDate(dateBytes)
             val time = decodeCosemTime(timeBytes)
             if (date != null && time != null) LocalDateTime.of(date, time) else null
         } else null
 
-        // [Android-патч] Версия ПО — НЕ хардкодим "у этой модели её тут нет": пользователь
-        // обнаружил, что на ДРУГОМ счётчике этой же линейки первый сегмент буфера крупнее и,
-        // судя по всему, содержит версию ПО прямо внутри "публичного" профиля индикации — то
-        // есть без отдельного GET и без ассоциации (readFirmwareVersion() ниже по-прежнему не
-        // вызывается — она требует ассоциацию, которой у нас нет). Раз состав буфера отличается
-        // от модели к модели, сначала проверяем ИЗВЕСТНЫЙ по паспорту OBIS версии ПО
-        // (0.0.96.1.2.255 — стандартный "Device ID 2", подтверждён паспортом РиМ 040.40), а
-        // затем логируем ЛЮБЫЕ другие текстовые поля буфера — если версия ПО на новом приборе
-        // лежит под другим OBIS, это будет видно в логе и код можно будет расширить, не гадая.
+        // Состав буфера зависит от модели; текстовые поля логируем, чтобы версию ПО под
+        // незнакомым OBIS было видно сразу.
         val textReadings = all.filter { it.textValue != null }
         if (textReadings.isNotEmpty()) {
             Log.d(TAG, "В буфере найдены текстовые поля: ${textReadings.joinToString { "${it.obisCode}=\"${it.textValue}\"" }}")
         }
-        // [Android-патч] см. MeterInfo.firmwareVersionObis — запоминаем не только САМО значение,
-        // но и OBIS-код кандидата, который его дал: экран «Инфо» подписывает величину её
-        // объектом из паспорта, и подпись обязана соответствовать реальному источнику, а не
-        // первому коду из списка кандидатов.
         val firmwareEntry = FIRMWARE_VERSION_OBIS_CANDIDATES
-            .firstNotNullOfOrNull { obis -> readingText(find(obis))?.let { obis to it } }
+            .firstNotNullOfOrNull { obis -> all.byObis(obis).asText()?.let { obis to it } }
         val firmwareVersion = firmwareEntry?.second
-        // [Android-патч] см. FIRMWARE_VERSION_OBIS_CANDIDATES — тот же буфер на проверенном
-        // втором счётчике (модель 189.40) содержит ещё и человекочитаемое имя модели прямо
-        // текстом ("RIM 189.40" под OBIS 0.0.96.1.1.255, "Device ID 1") — надёжнее, чем парсинг
-        // BLE-имени по формату "13 цифр" (applyDeviceNameInfo), который вообще может не подойти
-        // для другой линейки счётчиков. Берём из буфера, когда есть; парсинг имени остаётся как
-        // запасной вариант (см. applyDeviceNameInfo) на случай, если в буфере этого поля нет.
-        // [Android-патч] см. MeterInfo.modelObis — та же причина, что и у версии ПО выше:
-        // если модель пришла из буфера, подписываем её этим OBIS; если буфер её не содержит и
-        // название осталось от разбора BLE-имени, modelObis останется null и подписи не будет.
+        // Имя модели из буфера надёжнее разбора BLE-имени, которое остаётся запасным вариантом.
         val modelEntry = MODEL_NAME_OBIS_CANDIDATES
-            .firstNotNullOfOrNull { obis -> readingText(find(obis))?.let { obis to it } }
+            .firstNotNullOfOrNull { obis -> all.byObis(obis).asText()?.let { obis to it } }
         val modelName = modelEntry?.second
 
-        // [Android-патч] см. meterReportedSerial выше — серийный номер САМОГО прибора из буфера.
-        // Это и подпись на экране «Инфо» (теперь честный OBIS вместо «из имени BLE-устройства»),
-        // и — главное — то, чем connectBySerialNumber() проверяет, что подключился к нужному ПУ.
-        val serialFromBuffer = readingText(find(SERIAL_NUMBER_OBIS))?.trim()?.takeIf { it.isNotEmpty() }
+        val serialFromBuffer = all.byObis(SERIAL_NUMBER_OBIS).asText()?.trim()?.takeIf { it.isNotEmpty() }
         if (serialFromBuffer != null && serialFromBuffer != meterReportedSerial) {
             Log.d(TAG, "Прибор сообщил свой серийный номер ($SERIAL_NUMBER_OBIS): \"$serialFromBuffer\"")
         }
         if (serialFromBuffer != null) meterReportedSerial = serialFromBuffer
 
-        // [Android-патч] см. CURRENT_TARIFF_OBIS в GetResponseParser.kt — до этого патча
-        // позиционное поле буфера с номером текущего тарифа молча терялось.
-        val currentTariff = find(CURRENT_TARIFF_OBIS)?.rawValue?.toInt()
-        // [Android-патч] см. CLOCK_STATUS_OBIS/isClockStatusValid() в GetResponseParser.kt.
-        val clockValid = find(CLOCK_STATUS_OBIS)?.rawValue?.let { isClockStatusValid(it) }
+        val currentTariff = all.byObis(CURRENT_TARIFF_OBIS)?.rawValue?.toInt()
+        val clockValid = all.byObis(CLOCK_STATUS_OBIS)?.rawValue?.let { isClockStatusValid(it) }
 
-        // [Android-патч] см. DD_PHASE_DISPLAY_OBIS в GetResponseParser.kt — смысл поля НЕ
-        // расшифрован (в отличие от TAMPER_STATUS_OBIS, в исходниках прошивки ДД не встретился
-        // под этим именем), поэтому пока только логируем сырое значение — если оно окажется
-        // информативным (например, будет меняться в логах с многофазных счётчиков), на основе
-        // этого лога можно будет добавить полноценную расшифровку, не гадая вслепую.
-        val phaseDisplayRaw = find(DD_PHASE_DISPLAY_OBIS)?.rawValue
-        if (phaseDisplayRaw != null) {
-            Log.d(TAG, "Буфер: \"Отображение фаз ДД\" ($DD_PHASE_DISPLAY_OBIS) = $phaseDisplayRaw (смысл поля пока не расшифрован)")
+        // Раскладка «как в прошивке пульта»: направление энергии — байт 3 поля «Значки ДД»,
+        // статус фаз — отдельное позиционное поле.
+        val energyDirection = all.byObis(TAMPER_STATUS_OBIS)?.rawValue?.let { EnergyDirection.decode(it) }
+        val phaseStatus = all.byObis(DD_PHASE_DISPLAY_OBIS)?.rawValue?.let { PhaseStatus.decode(it) }
+        if (phaseStatus != null) {
+            Log.d(TAG, "Буфер: статус фаз ($DD_PHASE_DISPLAY_OBIS) = $phaseStatus, направление энергии = $energyDirection")
         }
 
-        if (temperatureC != null || backupVoltageV != null || deviceClock != null || firmwareVersion != null ||
-            modelName != null || currentTariff != null || clockValid != null || serialFromBuffer != null
-        ) {
-            val prev = _meterInfo.value
-            _meterInfo.value = (
-                    prev ?: MeterInfo(model = "—", serialNumber = activeSerialNumber ?: "—", firmwareVersion = "—")
-                    ).copy(
-                    model = modelName ?: prev?.model ?: "—",
-                    // [Android-патч] см. meterReportedSerial выше — номер от самого прибора важнее
-                    // разобранного из BLE-имени: имя — это то, как прибор себя рекламирует, а здесь
-                    // он ответил по протоколу. К имени откатываемся, только если в буфере номера нет.
-                    serialNumber = serialFromBuffer ?: activeSerialNumber ?: prev?.serialNumber ?: "—",
-                    temperatureC = temperatureC,
-                    backupVoltageV = backupVoltageV,
-                    deviceClock = deviceClock,
-                    lastSeenAt = Instant.now(),
-                    firmwareVersion = firmwareVersion ?: prev?.firmwareVersion ?: "—",
-                    currentTariff = currentTariff ?: prev?.currentTariff,
-                    clockValid = clockValid ?: prev?.clockValid,
-                    // [Android-патч] см. MeterInfo.modelObis/firmwareVersionObis — источник подписи
-                    // идёт вместе со значением: если в этом цикле значение не пришло, сохраняем
-                    // прежнюю пару «значение + его OBIS», чтобы подпись не отвязалась от числа.
-                    modelObis = modelEntry?.first ?: prev?.modelObis,
-                    firmwareVersionObis = firmwareEntry?.first ?: prev?.firmwareVersionObis,
-                    serialNumberObis = if (serialFromBuffer != null) SERIAL_NUMBER_OBIS else prev?.serialNumberObis,
-                )
-        }
+        val rdchDate = all.byObis("0.0.0.9.2.101")?.octetValue?.let { decodeCosemDate(it) }
+        val rdchTime = all.byObis("0.0.0.9.1.101")?.octetValue?.let { decodeCosemTime(it) }
+        val rdchDateTime = rdchDate?.let { LocalDateTime.of(it, rdchTime ?: LocalTime.MIDNIGHT) }
+
+        val hdlcP1 = all.byObis(HDLC_P1_OBIS)?.rawValue
+        val hdlcP2 = all.byObis(HDLC_P2_OBIS)?.rawValue
+        val operatingTimeReading = all.byObis(OPERATING_TIME_OBIS)
+        val operatingTime = operatingTimeReading?.value
+        val operatingTimeUnit = unitLabelOf(operatingTimeReading?.unit)
+
+        if (temperatureC == null && backupVoltageV == null && deviceClock == null && firmwareVersion == null &&
+            modelName == null && currentTariff == null && clockValid == null && serialFromBuffer == null &&
+            hdlcP1 == null && hdlcP2 == null && operatingTime == null &&
+            rdchDateTime == null && phaseStatus == null && energyDirection == null
+        ) return
+
+        val prev = _meterInfo.value
+        _meterInfo.value = (prev ?: blankMeterInfo()).copy(
+            model = modelName ?: prev?.model ?: "—",
+            // Номер от самого прибора важнее разобранного из BLE-имени.
+            serialNumber = serialFromBuffer ?: activeSerialNumber ?: prev?.serialNumber ?: "—",
+            temperatureC = temperatureC,
+            backupVoltageV = backupVoltageV,
+            deviceClock = deviceClock,
+            lastSeenAt = Instant.now(),
+            firmwareVersion = firmwareVersion ?: prev?.firmwareVersion ?: "—",
+            currentTariff = currentTariff ?: prev?.currentTariff,
+            clockValid = clockValid ?: prev?.clockValid,
+            modelObis = modelEntry?.first ?: prev?.modelObis,
+            firmwareVersionObis = firmwareEntry?.first ?: prev?.firmwareVersionObis,
+            serialNumberObis = if (serialFromBuffer != null) SERIAL_NUMBER_OBIS else prev?.serialNumberObis,
+            hdlcP1 = hdlcP1 ?: prev?.hdlcP1,
+            hdlcP2 = hdlcP2 ?: prev?.hdlcP2,
+            operatingTime = operatingTime ?: prev?.operatingTime,
+            operatingTimeUnit = operatingTimeUnit ?: prev?.operatingTimeUnit,
+            rdchDateTime = rdchDateTime ?: prev?.rdchDateTime,
+            phaseStatus = phaseStatus ?: prev?.phaseStatus,
+            energyDirection = energyDirection ?: prev?.energyDirection,
+        )
     }
 
     /**
-     * HDLC-адресация нужна SpodesClient ВНУТРЕННЕ (EstablishConnectionRequest берёт
-     * connection_addr_ из того, что сохранил SetNormalResponseMode) — поэтому вызов
-     * setNormalResponseMode() не убираем. НО: по реальному логу обмена пульт↔счётчик
-     * (Tera Term) выяснилось, что счётчик вообще не использует классический SNRM/UA
-     * хэндшейк — пульт с самого старта шлёт I-кадры с GET-запросами напрямую, без SNRM
-     * и даже без AARQ/AARE.
+     * РиМ не отвечает на SNRM и не использует ассоциацию: пульт сразу шлёт I-кадры с GET.
+     * SNRM отправляем без ожидания UA — оно гарантированно упиралось в 3-секундный таймаут
+     * транспорта на каждом подключении. Рабочий путь строит HDLC-заголовки сам (*FlatAddress),
+     * connection_addr_ из SetNormalResponseMode ему не нужен.
      *
-     * [Android-патч] НАЙДЕНА причина "долгого подключения": мы всё равно ЖДАЛИ ответ на
-     * SNRM (spodes.receiveUnnumberedAcknowledge()) — а он гарантированно таймаутится
-     * (устройство никогда не шлёт UA), и таймаут транспорта — 3 секунды (см.
-     * BleTransport::read_timeout_ms_ в ble_transport.h). То есть КАЖДОЕ подключение теряло
-     * фиксированные ~3 секунды на заведомо бесполезное ожидание. При этом connection_addr_,
-     * который выставляет setNormalResponseMode(), в реальности вообще не используется —
-     * весь рабочий путь идёт через *FlatAddress()-методы (GetRequestFlatAddress(),
-     * GetResponseRaw(), SendReadyToReceiveFlatAddress()), которые строят HDLC-заголовок
-     * САМИ, с параметрами dest/src, переданными явно, а не через connection_addr_. Поэтому
-     * само ожидание UA не даёт вообще ничего полезного нашему коду — убрано. SNRM
-     * по-прежнему отправляем (мгновенная запись, не блокирует) на случай, если устройству
-     * всё же важно увидеть этот кадр в эфире, просто больше не тратим 3 секунды на ответ,
-     * которого не будет.
-     *
-     * sourceAddress = 16 — единственное разрешённое значение в SetNormalResponseMode
-     * (библиотека жёстко проверяет 16/32/48); в реальном обмене пульт использует
-     * адрес 33 (0x43>>1), но такое значение эта библиотека не пропустит — это
-     * ограничение самой SpodesClient, а не наша ошибка. logicalAddress=1, physicalAddress=1 —
-     * совпадает с тем, что видно в реальных кадрах (адрес счётчика = 1).
+     * sourceAddress=16 — единственное значение, которое пропускает библиотека (16/32/48);
+     * logical/physical=1 — как в реальных кадрах.
      */
     private fun establishHdlcChannel() {
-        // [Android-патч] см. MeterProtocolProfile — у AKROS принципиально другой порядок
-        // установления сеанса, поэтому здесь развилка, а не общий код с оговорками.
         if (activeProfile == MeterProtocolProfile.AKROS_STANDARD) {
             establishAkrosSession()
             return
@@ -1010,31 +679,14 @@ class MeterRepositoryImpl @Inject constructor(
             physicalAddress = HDLC_PHYSICAL_ADDRESS,
         )
         Log.d(TAG, "SNRM: setNormalResponseMode вернул $snrmOk")
-        if (!snrmOk) {
-            stopTransportPump()
-            ble.disconnect()
-            throw IllegalStateException("Не удалось сформировать SNRM-кадр: ${spodes.lastErrorMessage()}")
-        }
-        // Ожидание UA убрано — см. комментарий выше: 3 секунды впустую на каждое подключение.
+        if (!snrmOk) abortSession("Не удалось сформировать SNRM-кадр: ${spodes.lastErrorMessage()}")
     }
 
     /**
-     * [Android-патч] Установление сеанса с AKROS — полноценное, в отличие от РиМ.
-     *
-     * Порядок вычитан из эталонного лога обмена штатной утилиты с прибором (границы полей в
-     * кадрах проверены пересчётом HCS/FCS, а не «на глаз»):
-     *
-     *  1. SNRM с адресами клиент 32 / сервер логический 1, физический 16 — в эфире это
-     *     байты 0x41 и 0x02 0x21. Здесь важно, что библиотека кодирует адреса ровно так же
-     *     (AppendBit: 32→0x41, 1→0x02, 16→0x21), то есть штатный путь SpodesClient — это в
-     *     точности то, что ждёт AKROS, и городить свою сборку кадров не нужно.
-     *  2. ДОЖИДАЕМСЯ UA. У РиМ этот шаг убран (прибор молчит, и ожидание тратило 3 секунды
-     *     впустую), а AKROS отвечает — в его UA приходят согласованные max-info 128/128 и
-     *     размер окна 1, и без этого шага размеры кадров останутся несогласованными.
-     *  3. АССОЦИАЦИЯ AARQ/AARE с низким уровнем безопасности (LLS) и паролем. Для РиМ мы от
-     *     ассоциации отказались — она ломала прибор до конца сессии; для AKROS она,
-     *     наоборот, обязательна: в эталонном логе AARE приходит с result=0 (accepted), и
-     *     только после этого идут запросы данных.
+     * Полноценный сеанс AKROS (порядок сверен с эталонным логом штатной утилиты):
+     * SNRM (клиент 32, сервер 1:16) → ожидание UA, в котором согласуются max-info 128/128 →
+     * AARQ с низким уровнем безопасности (LLS, пароль «Reader») → чтение описания буфера.
+     * Для AKROS ассоциация обязательна, в отличие от РиМ, которого она ломает до конца сессии.
      */
     private fun establishAkrosSession() {
         Log.d(
@@ -1042,160 +694,43 @@ class MeterRepositoryImpl @Inject constructor(
             "AKROS: SNRM (клиент=$AKROS_CLIENT_ADDRESS, сервер логич.=$AKROS_LOGICAL_ADDRESS, " +
                     "физич.=$AKROS_PHYSICAL_ADDRESS)",
         )
-        // [Android-патч] ИМЕННО setNormalResponseModeStandard, а не обычный setNormalResponseMode:
-        // тот отправляет испорченный кадр (лишний LLC-заголовок внутри U-кадра, неверное поле
-        // длины и несошедшаяся FCS — разбор в spodes_client.h). Приборы РиМ это прощали, потому
-        // что на SNRM не отвечают вовсе, а AKROS кадр с битой контрольной суммой молча
-        // отбрасывал — в логе это и выглядело как «не дождались UA».
+        // Именно Standard-вариант: обычный setNormalResponseMode шлёт кадр с лишним LLC-заголовком и
+        // неверной FCS — РиМ это не замечает (не отвечает на SNRM), а AKROS такой кадр отбрасывает.
         val snrmOk = spodes.setNormalResponseModeStandard(
             sourceAddress = AKROS_CLIENT_ADDRESS,
             logicalAddress = AKROS_LOGICAL_ADDRESS,
             physicalAddress = AKROS_PHYSICAL_ADDRESS,
         )
-        if (!snrmOk) {
-            stopTransportPump()
-            ble.disconnect()
-            throw IllegalStateException("AKROS: не удалось сформировать SNRM-кадр: ${spodes.lastErrorMessage()}")
-        }
+        if (!snrmOk) abortSession("AKROS: не удалось сформировать SNRM-кадр: ${spodes.lastErrorMessage()}")
 
-        // Ответ на SNRM: 1 — пришёл UA (сеанс открыт), 2 — прибор ответил DM («уже отключён»),
-        // 0 — ошибка/таймаут. Разделяем случаи явно: по одному этому коду в логе сразу видно,
-        // дошёл ли до прибора сам SNRM, — а это первое, что нужно знать при разборе.
         val ua = spodes.receiveUnnumberedAcknowledge()
         Log.d(TAG, "AKROS: ответ на SNRM = $ua (1=UA, 2=DM, 0=ошибка/таймаут)")
         if (ua != 1) {
-            stopTransportPump()
-            ble.disconnect()
-            throw IllegalStateException(
+            abortSession(
                 if (ua == 2) "AKROS: прибор ответил DM — сеанс не открыт"
                 else "AKROS: не дождались UA на SNRM (${spodes.lastErrorMessage()})"
             )
         }
 
-        // [Android-патч] РАБОЧИЙ РЕЖИМ — НИЗКОУРОВНЕВАЯ ассоциация (LLS, пароль "Reader").
-        // Её достаточно: версия ПО, параметры сети, энергия, тарифы, время — всё лежит в
-        // публичном буфере индикации и читается на низком уровне (проверено логом).
-        //
-        // Высокоуровневая (шифрованная HLS-GMAC) ассоциация ОСТАВЛЕНА в коде, но по умолчанию
-        // ВЫКЛЮЧЕНА флагом AKROS_TRY_HLS. Её схема побайтово сверена с эталонным логом
-        // (см. spodes_ciphered.hpp и тест), однако конкретный прибор на стенде отвергает её с
-        // «authentication-failure» даже при заведомо большом счётчике вызовов — то есть дело не
-        // в защите от повтора, а либо в другом GMAC-ключе этого экземпляра, либо в требовании
-        // прочитать текущий frame-counter прибора перед ассоциацией. Как только появится точный
-        // ключ или свежий лог УСПЕШНОГО высокоуровневого обмена штатной программы с этим
-        // прибором — достаточно вернуть AKROS_TRY_HLS = true (и, при необходимости, поправить
-        // засев счётчика/ключ), весь остальной код уже готов.
-        akrosCiphered = false
-        if (AKROS_TRY_HLS) {
-            Log.d(TAG, "AKROS: AARQ (шифрованная ассоциация, HLS-GMAC)")
-            if (spodes.establishCipheredConnection(AKROS_HLS_PASSWORD)) {
-                akrosCiphered = true
-                Log.i(TAG, "AKROS: шифрованная ассоциация установлена — доступны все объекты")
-            } else {
-                Log.w(
-                    TAG,
-                    "AKROS: шифрованная ассоциация не удалась (${spodes.lastErrorMessage()}) — " +
-                            "откатываемся на низкоуровневую (LLS, пароль \"$AKROS_ASSOCIATION_PASSWORD\")",
-                )
-            }
-        }
-        if (!akrosCiphered) {
-            Log.d(TAG, "AKROS: AARQ (низкоуровневая ассоциация, LLS, пароль \"$AKROS_ASSOCIATION_PASSWORD\")")
-            val aarqOk = spodes.establishConnection(
-                securityLevel = AKROS_SECURITY_LEVEL_LOW,
-                password = AKROS_ASSOCIATION_PASSWORD,
-            )
-            if (!aarqOk) {
-                stopTransportPump()
-                ble.disconnect()
-                throw IllegalStateException("AKROS: ассоциация не установлена: ${spodes.lastErrorMessage()}")
-            }
-        }
+        // Низкого уровня достаточно: всё нужное лежит в публичном буфере индикации.
+        Log.d(TAG, "AKROS: AARQ (низкоуровневая ассоциация, LLS, пароль \"$AKROS_ASSOCIATION_PASSWORD\")")
+        val aarqOk = spodes.establishConnection(
+            securityLevel = AKROS_SECURITY_LEVEL_LOW,
+            password = AKROS_ASSOCIATION_PASSWORD,
+        )
+        if (!aarqOk) abortSession("AKROS: ассоциация не установлена: ${spodes.lastErrorMessage()}")
         Log.i(TAG, "AKROS: ассоциация установлена, можно читать данные")
         readAkrosCaptureObjects()
-        if (akrosCiphered) readAkrosSoftwareVersion()
     }
 
     /**
-     * [Android-патч] GET к AKROS: в шифрованной ассоциации — зашифрованный (getRequestCiphered),
-     * иначе обычный. Единая точка, чтобы все чтения AKROS (описание буфера, единицы, сам буфер,
-     * версия ПО) автоматически шли правильным способом и не расходились.
-     */
-    private fun akrosGetRequest(classId: Int, obisCode: String, attributeId: Int): Boolean =
-        if (akrosCiphered) spodes.getRequestCiphered(classId, obisCode, attributeId)
-        else spodes.getRequest(classId, obisCode, attributeId)
-
-    /**
-     * [Android-патч] Читает версию ПО и имя устройства ПО ЗАПРОСУ — не из рекламного имени BLE,
-     * а прямым чтением объектов прибора (доступно только внутри шифрованной ассоциации, см.
-     * establishAkrosSession). Имя устройства (0.0.42.0.0.255, class 1) в эталонном логе приходит
-     * как "RIMAKROS07200090" и читается гарантированно; версию ПО пробуем по стандартным
-     * OBIS-кандидатам и берём первый успешный ответ. Ошибка на отдельном объекте не фатальна:
-     * связь и ассоциация остаются, просто соответствующее поле не обновится.
-     */
-    private fun readAkrosSoftwareVersion() {
-        // Имя устройства (COSEM logical device name) — подтверждено логом.
-        readAkrosStringObject(AKROS_DEVICE_NAME_CLASS_ID, AKROS_DEVICE_NAME_OBIS, "имя устройства")
-            ?.let { name ->
-                Log.i(TAG, "AKROS: имя устройства ($AKROS_DEVICE_NAME_OBIS) = \"$name\"")
-                val prev = _meterInfo.value
-                _meterInfo.value = (prev ?: MeterInfo(model = "—", serialNumber = activeSerialNumber ?: "—", firmwareVersion = "—"))
-                    .copy(model = name, modelObis = AKROS_DEVICE_NAME_OBIS)
-            }
-        // Версия ПО — перебор стандартных кандидатов, берём первый непустой.
-        for (obis in AKROS_FIRMWARE_OBIS_CANDIDATES) {
-            val version = readAkrosStringObject(classId = 1, obisCode = obis, label = "версия ПО")
-            if (!version.isNullOrBlank()) {
-                Log.i(TAG, "AKROS: версия ПО ($obis) = \"$version\"")
-                val prev = _meterInfo.value
-                _meterInfo.value = (prev ?: MeterInfo(model = "—", serialNumber = activeSerialNumber ?: "—", firmwareVersion = "—"))
-                    .copy(firmwareVersion = version, firmwareVersionObis = obis)
-                break
-            }
-        }
-    }
-
-    /**
-     * [Android-патч] Читает один атрибут как строку/октет-строку (версия ПО, имя устройства).
-     * Возвращает текст либо null, если объект недоступен/ответ не разобрался. Ответ приходит
-     * одним кадром (эти объекты малы), поэтому дочитывание блоков не нужно — но на всякий
-     * случай пропускаем через тот же readDlmsValueWithBlocks(), который обрабатывает и обычный,
-     * и блочный ответ.
-     */
-    private fun readAkrosStringObject(classId: Int, obisCode: String, label: String): String? {
-        if (!akrosGetRequest(classId, obisCode, attributeId = 2)) {
-            Log.w(TAG, "AKROS: запрос \"$label\" ($obisCode) не ушёл: ${spodes.lastErrorMessage()}")
-            return null
-        }
-        val value = readDlmsValueWithBlocks(label) ?: return null
-        return textValueOf(value).trim().takeIf { it.isNotEmpty() }
-    }
-
-    /**
-     * [Android-патч] Читает ответ на уже отправленный GET-запрос и, если прибор разбил его на
-     * части, ДОЧИТЫВАЕТ остальные и склеивает — только после этого разбирает значение.
+     * Читает ответ на уже отправленный GET и, если прибор разбил его на блоки, дочитывает
+     * остальные и склеивает перед разбором значения.
      *
-     * ЗАЧЕМ ЭТО ПОНАДОБИЛОСЬ. При установлении сеанса AKROS соглашается на информационное поле
-     * в 128 байт. Описание колонок буфера (capture_objects — 14 записей по 18 байт) и сам буфер
-     * в такой кадр не помещаются, и DLMS штатно переходит на блочную передачу: вместо обычного
-     * ответа «C4 01» прибор присылает «C4 02» с флагом «последний блок», номером блока и куском
-     * данных, а клиент обязан запрашивать следующие блоки, пока флаг не станет единицей.
-     *
-     * Пока этого цикла не было, приложение брало ПЕРВЫЙ блок за целый ответ. В логе это выглядело
-     * особенно обманчиво: разбор промахивался мимо границ полей на пару байт, упирался в нулевой
-     * байт номера блока, декодировал его как «пустое значение» — и честно сообщал «описание
-     * буфера получено, 0 колонок» при полностью исправном ответе прибора. Отсюда же росли и
-     * «данных нет» на экранах: без описания колонок значения буфера сопоставить не с чем.
-     *
-     * Обычный (неблочный) ответ проходит здесь насквозь, поэтому вызывать метод безопасно для
-     * любого GET — блочность определяется по самому ответу, а не по тому, какой атрибут мы
-     * запросили (у одного и того же объекта короткий scaler_unit придёт одним кадром, а длинный
-     * буфер — блоками).
-     *
-     * Ограничитель на [MAX_DLMS_BLOCKS] блоков — защита от зацикливания: если прибор из-за
-     * рассинхронизации перестанет ставить флаг последнего блока, лучше выйти с записью в лог,
-     * чем крутить обмен по BLE бесконечно. Неполный ответ НЕ разбираем: обрывок данных
-     * декодировался бы «успешно», но в неправильные значения — это хуже, чем честный null.
+     * AKROS соглашается на информационное поле 128 байт, поэтому описание колонок и сам буфер
+     * приходят блоками («C4 02» с флагом последнего блока вместо «C4 01»). Принять первый блок за
+     * весь ответ нельзя: разбор промахивается мимо границ и «успешно» возвращает 0 колонок.
+     * Обычный ответ проходит насквозь, так что вызывать можно для любого GET.
      */
     private fun readDlmsValueWithBlocks(label: String): DlmsValue? {
         val first = spodes.getResponseRawBytes()
@@ -1207,9 +742,10 @@ class MeterRepositoryImpl @Inject constructor(
     }
 
     /**
-     * [Android-патч] То же, что [readDlmsValueWithBlocks], но для случая, когда первый кадр
-     * ответа УЖЕ прочитан вызывающим кодом (см. readAndApplyMainBuffer(): там тот же кадр нужен
-     * ещё и разбору буфера РиМ, который работает с «сырым» кадром, а не со значением).
+     * Склейка блоков для случая, когда первый кадр уже прочитан вызывающим кодом.
+     * Неполный ответ не разбираем: обрывок декодировался бы «успешно», но в неверные значения.
+     * [MAX_DLMS_BLOCKS] защищает от бесконечного обмена, если прибор перестанет ставить флаг
+     * последнего блока.
      */
     private fun assembleDlmsValue(first: ByteArray, label: String): DlmsValue? {
         var block = parseGetResponseBlock(first)
@@ -1217,7 +753,7 @@ class MeterRepositoryImpl @Inject constructor(
                 .onFailure { Log.w(TAG, "AKROS: ответ на $label не разобран: ${it.message}") }
                 .getOrNull()
 
-        val data = java.io.ByteArrayOutputStream()
+        val data = ByteArrayOutputStream()
         data.write(block.data)
         var blocks = 1
         while (!block.lastBlock && blocks < MAX_DLMS_BLOCKS) {
@@ -1252,33 +788,15 @@ class MeterRepositoryImpl @Inject constructor(
     }
 
     /**
-     * [Android-патч] Читает описание колонок буфера индикации (атрибут 3 «capture_objects»
-     * объекта Profile Generic) — БЕЗ него данные AKROS разобрать невозможно.
-     *
-     * Почему так. Приборы РиМ присылают значения тройками {OBIS-код, значение, scaler+unit} —
-     * каждое значение само себя называет. AKROS присылает «компактный» буфер: массив из одной
-     * структуры, где лежат только значения подряд, без единого OBIS-кода (первый же удачный
-     * ответ выглядел как 14 значений — десять Float32, дата-время, два перечисления и текст
-     * версии ПО). Старый разбор искал в нём OBIS-коды, не находил и честно возвращал «0
-     * элементов» — данные были, а смысла у них не было.
-     *
-     * Смысл колонок хранится в самом приборе: это штатный атрибут 3 того же объекта, список
-     * {class_id, OBIS, номер атрибута, индекс}. Читаем его ОДИН раз за сеанс (состав буфера в
-     * пределах сеанса не меняется) и дальше просто раскладываем значения по этим кодам. Никаких
-     * догадок «колонка 5 — это, наверное, ток»: прибор отвечает на прямой вопрос.
-     *
-     * Если прочитать не удалось — сеанс не рвём: связь есть, ассоциация есть, и осмысленнее
-     * оставить приложение подключённым с пустыми показаниями и явной строкой в логе, чем
-     * уронить подключение целиком. Следующая попытка чтения буфера повторит запрос.
+     * Читает описание колонок буфера (атрибут 3 «capture_objects» Profile Generic).
+     * РиМ присылает значения тройками {OBIS, значение, scaler+unit}, а AKROS — «компактный»
+     * буфер: только значения подряд, без OBIS. Смысл колонок хранится в самом приборе, читаем
+     * его один раз за сеанс. При неудаче сеанс не рвём — следующее чтение буфера повторит запрос.
      */
     private fun readAkrosCaptureObjects() {
         akrosCaptureObis = emptyList()
-        akrosScalerUnits = emptyMap() // см. readAkrosScalerUnits() — единицы относятся к КОНКРЕТНОМУ сеансу
-        val sent = akrosGetRequest(
-            classId = MAIN_BUFFER_CLASS_ID,
-            obisCode = MAIN_BUFFER_OBIS,
-            attributeId = PROFILE_CAPTURE_OBJECTS_ATTRIBUTE,
-        )
+        akrosScalerUnits = emptyMap()
+        val sent = spodes.getRequest(MAIN_BUFFER_CLASS_ID, MAIN_BUFFER_OBIS, PROFILE_CAPTURE_OBJECTS_ATTRIBUTE)
         if (!sent) {
             Log.w(TAG, "AKROS: не удалось отправить запрос capture_objects: ${spodes.lastErrorMessage()}")
             return
@@ -1301,24 +819,11 @@ class MeterRepositoryImpl @Inject constructor(
     }
 
     /**
-     * [Android-патч] Дочитывает ТОЧНУЮ единицу измерения для каждой колонки буфера.
-     *
-     * Зачем отдельным шагом. В компактном буфере AKROS лежат только числа — ни OBIS-кодов, ни
-     * единиц. Смысл колонок даёт capture_objects (см. выше), а единицу и множитель прибор
-     * хранит в атрибуте scaler_unit самого объекта: это структура {scaler, unit}, где unit —
-     * код по IEC 62056-6-2 (30 = Вт·ч, 35 = В, 44 = Гц…), а scaler — степень десятки, на
-     * которую нужно умножить значение. Без него единицу пришлось бы угадывать по порядку
-     * величины, а множитель молча считать нулевым — то есть показания могли бы отличаться от
-     * настоящих в тысячу раз и выглядеть при этом правдоподобно.
-     *
-     * Спрашиваем только у тех объектов, у которых scaler_unit вообще есть (Register и его
-     * разновидности — см. ScalerUnit.attributeFor): у Data, Clock или Disconnect Control этого
-     * атрибута нет, и запрос к ним был бы гарантированным отказом доступа.
-     *
-     * Читается ОДИН раз за сеанс и кэшируется: единицы в пределах сеанса не меняются, а каждый
-     * такой запрос — отдельный обмен по BLE, и делать их на каждом цикле автообновления значило
-     * бы утроить трафик ради неизменных данных. Ошибка на отдельной колонке не фатальна: она
-     * останется без единицы, остальные разберутся нормально.
+     * Читает единицу и множитель (атрибут scaler_unit) каждой колонки буфера: компактный буфер
+     * содержит только числа, а без множителя показания могли бы отличаться от настоящих в
+     * тысячу раз и выглядеть правдоподобно. Спрашиваем только объекты, у которых этот атрибут
+     * есть (см. [ScalerUnit.attributeFor]); единицы за сеанс не меняются, поэтому читаем один раз.
+     * Ошибка на одной колонке не фатальна — она остаётся без единицы.
      */
     private fun readAkrosScalerUnits(columns: List<CaptureColumn?>) {
         val units = mutableMapOf<String, ScalerUnit>()
@@ -1326,7 +831,7 @@ class MeterRepositoryImpl @Inject constructor(
             .distinctBy { it.obisCode }
             .forEach { column ->
                 val attribute = ScalerUnit.attributeFor(column.classId) ?: return@forEach
-                if (!akrosGetRequest(column.classId, column.obisCode, attribute)) {
+                if (!spodes.getRequest(column.classId, column.obisCode, attribute)) {
                     Log.w(TAG, "AKROS: запрос scaler_unit для ${column.obisCode} не ушёл: ${spodes.lastErrorMessage()}")
                     return@forEach
                 }
@@ -1347,94 +852,8 @@ class MeterRepositoryImpl @Inject constructor(
     }
 
     /**
-     * [Android-патч] ИСПРАВЛЕНА СЕРЬЁЗНАЯ ОШИБКА: «ввожу номер ПУ, а подключаюсь иногда к другому
-     * прибору». Здесь стоял TODO, и он был не про удобство — введённый номер В ПОИСКЕ ВООБЩЕ НЕ
-     * УЧАСТВОВАЛ: вызывался connectByNamePrefix("RIM"), то есть бралось ПЕРВОЕ попавшееся
-     * устройство с подходящим префиксом имени. С одним счётчиком рядом это незаметно, с двумя —
-     * лотерея, причём молчаливая: пользователь смотрит показания чужого прибора, будучи уверен,
-     * что открыл свой, а на экране «Сеть» может ещё и скомандовать чужим размыкателем.
-     *
-     * Теперь защита двойная, и вторая ступень — главная:
-     *
-     * 1. ПОИСК. ble.connectBySerialNumber() берёт из эфира только прибор, чей серийный номер в
-     *    рекламируемом имени ТОЧНО равен запрошенному (см. MeterDeviceName). Нет такого в эфире —
-     *    честная ошибка «прибор не найден», а не подключение к «похожему».
-     *
-     * 2. ПРОВЕРКА ПОСЛЕ ПОДКЛЮЧЕНИЯ. Имя в эфире — это то, как прибор себя НАЗЫВАЕТ; доверять
-     *    только ему нельзя. Поэтому после первого же успешного чтения буфера сверяем номер,
-     *    который сообщил САМ прибор по протоколу (объект 0.0.96.1.0.255, см. meterReportedSerial),
-     *    с тем, что ввёл пользователь. Не совпало — немедленно рвём связь и сообщаем об этом
-     *    прямо, вместо того чтобы показывать чужие показания.
-     *
-     * Если прибор номер не сообщил (в буфере его нет — на других моделях линейки состав буфера
-     * отличается), вторая ступень пропускается: тогда единственная гарантия — фильтр поиска,
-     * и это честно пишется в лог, чтобы при разборе было видно, какой ступенью всё держалось.
-     */
-    override suspend fun connectBySerialNumber(serialNumber: String, pin: String, remember: Boolean) {
-        meterReportedSerial = null // см. ниже — проверять нужно номер ИЗ ЭТОГО сеанса, а не с прошлого подключения
-        val found = withContext(Dispatchers.IO) { ble.connectBySerialNumber(serialNumber) }
-        // [Android-патч] см. activeProfile — имя берём РЕАЛЬНОЕ, из эфира, а не введённое
-        // пользователем: по нему и определяется диалект прибора.
-        activeProfile = MeterProtocolProfile.forDeviceName(found.name)
-        Log.i(TAG, "Профиль обмена для \"${found.name}\": $activeProfile")
-        spodes.createClient()
-        startTransportPump()
-        withContext(Dispatchers.IO) { establishHdlcChannel() }
-        val connected = protocolMutex.withLock { withContext(Dispatchers.IO) { readAndApplyMainBuffer() } }
-        if (!connected) {
-            stopTransportPump()
-            ble.disconnect()
-            // [Android-патч] см. lastProtocolError выше — тот же приём, что и в connectByAddress().
-            throw IllegalStateException(lastProtocolError ?: "неизвестная ошибка")
-        }
-
-        // Ступень 2 — сверка с номером, который прибор сообщил о себе сам (см. комментарий выше).
-        val reported = meterReportedSerial
-        if (reported != null && !MeterDeviceName.serialsEqual(reported, serialNumber)) {
-            Log.e(
-                TAG,
-                "ПОДКЛЮЧИЛИСЬ НЕ К ТОМУ ПРИБОРУ: запрошен № $serialNumber, а прибор " +
-                        "(\"${found.name}\", ${found.address}) сообщил о себе № $reported — разрываем связь",
-            )
-            stopTransportPump()
-            ble.disconnect()
-            throw IllegalStateException(
-                "Подключение отменено: найденный прибор сообщил номер $reported вместо запрошенного " +
-                        "$serialNumber. Проверьте номер ПУ"
-            )
-        }
-        if (reported == null) {
-            Log.w(
-                TAG,
-                "Прибор не сообщил свой серийный номер ($SERIAL_NUMBER_OBIS) — сверить подключение " +
-                        "по протоколу не с чем, полагаемся только на совпадение номера в имени устройства " +
-                        "(\"${found.name}\")",
-            )
-        }
-
-        // Реальное имя найденного устройства (found.name) — приоритетнее введённого пользователем
-        // serialNumber: из него разбираются и модель, и серийный (см. applyDeviceNameInfo()).
-        // Если разбор не удался (нестандартное имя), activeSerialNumber останется null здесь —
-        // тогда используем то, что ввёл пользователь, как и раньше.
-        applyDeviceNameInfo(found.name)
-        if (activeSerialNumber == null) activeSerialNumber = serialNumber
-        if (remember) {
-            deviceStore.rememberDevice(
-                // [Android-патч] запоминаем номер от самого прибора, если он есть — именно по нему
-                // сопряжение потом опознаётся однозначно (см. meterReportedSerial выше).
-                PairedDevice(
-                    serialNumber = reported ?: activeSerialNumber ?: serialNumber,
-                    bleAddress = found.address,
-                ),
-            )
-        }
-        startAutoRefresh()
-    }
-
-    /**
-     * «Насос» между транспортом (BLE) и протоколом (SpodesClientBridge) — см. комментарий
-     * в SpodesClientBridge.kt. Две независимые корутины: одна пересылает входящие
-     * notify-пакеты в нативный код, другая опрашивает исходящие байты и шлёт их по BLE.
+     * «Насос» между транспортом и протоколом: одна корутина пересылает входящие notify-пакеты
+     * в нативный код, другая опрашивает исходящие байты и шлёт их по BLE.
      */
     private fun startTransportPump() {
         stopTransportPump()
@@ -1446,7 +865,7 @@ class MeterRepositoryImpl @Inject constructor(
                 while (true) {
                     val outgoing = spodes.pullOutgoingBytes()
                     if (outgoing.isNotEmpty()) ble.writeBytes(outgoing)
-                    delay(20) // TODO: заменить поллинг на событие/канал, если 20 мс окажется мало
+                    delay(PUMP_POLL_INTERVAL_MS)
                 }
             }
         }
@@ -1459,52 +878,25 @@ class MeterRepositoryImpl @Inject constructor(
     }
 
     /**
-     * [Android-патч] Автообновление по таймеру — запускается после УСПЕШНОГО первого чтения
-     * при подключении (см. connectByAddress()/connectBySerialNumber()), останавливается вместе
-     * с "насосом" в stopTransportPump() (т.е. при любом разрыве/переподключении/forgetDevice()).
-     * Переиспользует readAndApplyMainBuffer() — тот же код, что и кнопка «Обновить»
-     * (refreshReadings()) и что обновляет разом показания/сеть/инфо/состояние реле
-     * (readRelayState() вызывается внутри неё же). Захватываем protocolMutex на каждой
-     * итерации — если в этот момент пользователь нажал «Обновить» или включает/отключает реле,
-     * просто ждём своей очереди, а не шлём кадр поверх чужого запроса.
+     * Автообновление: каждые [AUTO_REFRESH_INTERVAL_MS] перечитывает буфер индикации (тот же
+     * [readAndApplyMainBuffer], что и у кнопки «Обновить») и заодно обновляет RSSI. Лок берётся на
+     * каждой итерации, так что ручной запрос или команда реле просто ждут очереди.
      *
-     * Интервал — 5 секунд: полный цикл (основной буфер, обычно 7+ HDLC-сегментов, + 2 GET на
-     * состояние реле) в логах занимает заметно меньше секунды на сегмент, так что запас большой;
-     * это самое начало настройки — если 5 c окажется слишком часто/редко для реального
-     * использования, интервал стоит вынести в настройки, а не подбирать на глаз здесь.
+     * При [MAX_CONSECUTIVE_PROTOCOL_FAILURES] неудачных циклах подряд принудительно
+     * переподключается (см. [consecutiveEmptyOrFailedReads]); job завершается сам, не дожидаясь
+     * отмены из коллектора разрывов, чтобы не отправить ещё один GET в готовящийся разрыв.
      */
     private fun startAutoRefresh() {
         stopAutoRefresh()
-        ble.requestRssiRead() // [Android-патч] см. signalStrengthDbm() — сразу первое значение, не ждём 5 с.
+        ble.requestRssiRead()
         autoRefreshJob = repositoryScope.launch {
             while (true) {
                 delay(AUTO_REFRESH_INTERVAL_MS)
-                val ok = protocolMutex.withLock { withContext(Dispatchers.IO) { readAndApplyMainBuffer() } }
-                // [Android-патч] см. lastProtocolError выше — НЕ повторный spodes.lastErrorMessage()
-                // здесь (после освобождения protocolMutex.withLock) — та самая гонка, что уронила
-                // процесс: пока этот вызов ждал ответ, «Отключиться» мог успеть уничтожить нативный
-                // клиент, и повторное обращение к нему упало бы в SIGSEGV.
+                val ok = readMainBuffer()
                 if (!ok) Log.w(TAG, "Автообновление: GET-запрос не удался ($lastProtocolError)")
-                // [Android-патч] см. consecutiveEmptyOrFailedReads выше — "пакеты не уходят, а
-                // пишется что подключено": счётчик мог счесть DLMS/HDLC-сессию мёртвой (DM-кадр
-                // "Server is already disconnected" или ответы без LLC-заголовка), при этом Android
-                // ВСЁ ЕЩЁ считает GATT-соединение рабочим — обычный "неожиданный разрыв" тут сам
-                // по себе никогда не наступит, автообновление так и будет долбить в мёртвый канал
-                // бесконечно. После нескольких подряд неудачных циклов принудительно рвём и заново
-                // поднимаем GATT-соединение — тем же путём восстановления, что и настоящий обрыв
-                // связи (см. MeterBleClient.forceReconnect()), с честным "Переподключение..." в UI.
-                // Останавливаем ЭТОТ ЖЕ job прямо здесь (return@launch), а не ждём, пока
-                // stopTransportPump() из коллектора unexpectedDisconnects в init{} доедет до
-                // отмены — избегаем гонки "автообновление успело послать ещё один GET, пока
-                // разрыв только готовится".
                 if (consecutiveEmptyOrFailedReads >= MAX_CONSECUTIVE_PROTOCOL_FAILURES) {
                     consecutiveEmptyOrFailedReads = 0
                     consecutiveForceReconnectsWithoutData++
-                    // [Android-патч] см. consecutiveForceReconnectsWithoutData выше — если и
-                    // ПРЕДЫДУЩИЕ COLD_RECONNECT_THRESHOLD полных цикла forceReconnect() подряд не
-                    // дали ни одного успешно разобранного ответа, обычное (быстрое) переподключение
-                    // явно не помогает — просим MeterBleClient «холодное» переподключение с паузой
-                    // перед следующим connect(), а не долбим GATT ещё быстрее.
                     val cold = consecutiveForceReconnectsWithoutData >= COLD_RECONNECT_THRESHOLD
                     if (cold) consecutiveForceReconnectsWithoutData = 0
                     Log.w(
@@ -1516,9 +908,6 @@ class MeterRepositoryImpl @Inject constructor(
                     ble.forceReconnect(cold = cold)
                     return@launch
                 }
-                // [Android-патч] см. signalStrengthDbm() в MeterRepository.kt — попутно, тем же
-                // циклом (отдельный таймер не нужен): читаем RSSI активного соединения, чтобы
-                // экран «Настройки» показывал живой уровень сигнала, а не значение со сканирования.
                 ble.requestRssiRead()
             }
         }
@@ -1530,40 +919,21 @@ class MeterRepositoryImpl @Inject constructor(
     }
 
     /**
-     * [Android-патч] Механизм переподключения — пересборка протокольного сеанса ПОСЛЕ того, как
-     * Android BLE stack сам восстановил GATT-соединение (см. init{}/MeterBleClient.
-     * unexpectedDisconnects выше). Ровно тот же порядок действий, что и в хвосте
-     * connectByAddress()/connectBySerialNumber() при первом подключении, но БЕЗ повторного
-     * BLE-поиска устройства и без повторного разбора имени (модель/серийный уже известны).
+     * Пересборка протокольного сеанса после того, как Android сам восстановил GATT. Порядок тот
+     * же, что при первом подключении, но без поиска устройства и разбора имени.
      *
-     * spodes.destroyClient() перед createClient() — как и в disconnect() ниже: счётчик сбрасывает
-     * свою HDLC-нумерацию кадров на новой BLE-сессии (см. комментарий у readFirmwareVersion() про
-     * send/receive sequence number), поэтому и наш клиент не должен тащить состояние старого
-     * DLMS-сеанса поверх нового физического соединения.
+     * Пауза перед началом нужна счётчику: после резкого обрыва HDLC-сессии он ещё не готов
+     * принять новый SNRM, и первый GET почти гарантированно проваливался.
+     * Клиент уничтожается под [protocolMutex] — иначе destroyClient() обнулил бы handle под
+     * выполняющимся чтением (см. [lastProtocolError]).
      *
-     * [Android-патч] НАЙДЕНА причина реального нативного краша (SIGSEGV в SpodesClient::
-     * GetErrorMessage(), см. lastProtocolError выше) — destroyClient()/createClient() здесь
-     * раньше вызывались СНАРУЖИ protocolMutex, а autoRefreshJob держит этот же мьютекс всё время
-     * своего readAndApplyMainBuffer() (включая блокирующее ожидание ответа транспорта, до 3 с).
-     * Если разрыв связи происходил прямо в этот момент, spodes.destroyClient() успевал обнулить
-     * nativeHandle ДО того, как застрявший вызов дочитывал ответ и обращался к native-методам —
-     * обращение по уже уничтоженному handle=0 роняло процесс мгновенно. Оборачиваем оба вызова в
-     * тот же protocolMutex.withLock — теперь destroyClient() гарантированно ДОЖДЁТСЯ, пока текущий
-     * (если он есть) readAndApplyMainBuffer() полностью освободит мьютекс, прежде чем уничтожить
-     * клиент из-под него.
+     * Автообновление запускается и при неудачном первом GET: если оно не стартует, опрос
+     * останавливается навсегда при формально «подключённом» BLE; а при мёртвом транспорте
+     * счётчик неудач сам вызовет forceReconnect().
      */
     private fun reestablishProtocolSession() {
         repositoryScope.launch {
             try {
-                // [Android-патч] НАЙДЕНА причина затяжного цикла "переподключились — тут же
-                // снова не найден LLC-заголовок — переподключились — снова..." (по свежим логам:
-                // после forceReconnect()/реального разрыва GATT поднимался почти мгновенно, за
-                // 50-150 мс, но САМЫЙ ПЕРВЫЙ GET сразу после этого почти гарантированно проваливался
-                // — то есть проблема не в скорости GATT-реконнекта, а в том, что счётчик просто ещё
-                // не готов принимать новый SNRM сразу после резкого обрыва предыдущей HDLC-сессии).
-                // Небольшая пауза здесь — до открытия HDLC-канала заново — даёт счётчику время
-                // "остыть" после разрыва; RECONNECT_SETTLE_DELAY_MS подобрана с запасом, но не в
-                // ущерб отзывчивости (пользователь и так уже видит "Переподключение..." в UI).
                 delay(RECONNECT_SETTLE_DELAY_MS)
                 protocolMutex.withLock {
                     withContext(Dispatchers.IO) {
@@ -1573,27 +943,7 @@ class MeterRepositoryImpl @Inject constructor(
                 }
                 startTransportPump()
                 withContext(Dispatchers.IO) { establishHdlcChannel() }
-                val connected = protocolMutex.withLock { withContext(Dispatchers.IO) { readAndApplyMainBuffer() } }
-                // [Android-патч] НАЙДЕНА, похоже, ГЛАВНАЯ причина жалобы "подключено, а данные не
-                // идут" (см. свежий лог: после переподключения счётчик/пульт несколько циклов
-                // подряд отвечает только короткими служебными HDLC-кадрами (RR), без реальных
-                // данных, — readAndApplyMainBuffer() в этом случае всё равно возвращает
-                // connected=true, см. её комментарий про "пустой ответ от транспорта — не рвём
-                // коннект ЗДЕСЬ"). Раньше startAutoRefresh() запускался ТОЛЬКО в ветке
-                // connected == true. Но connected == false здесь означает не "счётчик молчит",
-                // а конкретно "сам getRequestFlatAddress() не смог отправить кадр" (транспорт
-                // мёртв на уровне нативного клиента) — и раньше в этом случае автообновление
-                // НЕ запускалось вообще. То есть если самый первый GET после реконнекта не
-                // ушёл, автообновление больше НИКОГДА не запускалось само — BLE оставался
-                // «подключён», а опрос счётчика останавливался навсегда, до ручного
-                // вмешательства (кнопка «Обновить» или ручное отключение/подключение). Теперь
-                // запускаем автообновление в ОБОИХ случаях: если транспорт всё же жив, но
-                // счётчик пока отвечает только служебными кадрами — автообновление само
-                // подхватит и разберёт данные, как только счётчик отойдёт (это уже наблюдалось
-                // в логах — через один-два цикла по 5 с реальные данные начинали приходить).
-                // Если же транспорт действительно мёртв — тот же MAX_CONSECUTIVE_PROTOCOL_FAILURES
-                // внутри автообновления быстро это увидит и сам вызовет ble.forceReconnect()
-                // заново, вместо вечного "тихого" простоя.
+                val connected = readMainBuffer()
                 startAutoRefresh()
                 if (connected) {
                     Log.d(TAG, "Протокольный сеанс восстановлен после автопереподключения")
@@ -1613,146 +963,97 @@ class MeterRepositoryImpl @Inject constructor(
     override fun readings(): Flow<List<Reading>> = _readings.asStateFlow()
 
     /**
-     * Обновление по кнопке («Показания»/«Сеть»/«Инфо» — все три экрана дёргают этот же метод,
-     * см. ReadingsViewModel.refresh()/NetworkViewModel.refresh()/InfoViewModel.refresh()).
-     * Раньше это была заглушка, ничего не делавшая — кнопка «Обновить» была нерабочей. Теперь
-     * просто переспрашиваем тот же буфер 0.0.21.0.2.255 (readAndApplyMainBuffer() — общий код
-     * с первым чтением при подключении), который разом обновляет энергию/сеть/инфо.
-     *
-     * Проверяем pumpJob (а не activeSerialNumber — он остаётся null при подключении по адресу,
-     * см. TODO в connectByAddress()), чтобы не слать GET по мёртвому BLE-соединению.
+     * Кнопка «Обновить» на всех экранах: один GET буфера обновляет показания, сеть и инфо.
+     * Проверяем pumpJob, а не activeSerialNumber (при подключении по адресу он может быть null).
      */
     override suspend fun refreshReadings() {
         if (pumpJob?.isActive != true) {
             Log.w(TAG, "refreshReadings(): нет активного BLE-соединения — обновлять нечего")
             return
         }
-        protocolMutex.withLock {
-            withContext(Dispatchers.IO) {
-                val ok = readAndApplyMainBuffer()
-                // [Android-патч] см. lastProtocolError выше — тут (в отличие от startAutoRefresh())
-                // повторный spodes.lastErrorMessage() формально ещё был бы безопасен (мы всё ещё
-                // внутри protocolMutex.withLock), но используем закэшированное значение для
-                // единообразия и чтобы не дёргать native лишний раз без необходимости.
-                if (!ok) Log.w(TAG, "refreshReadings(): GET-запрос не удался ($lastProtocolError)")
-            }
-        }
+        if (!readMainBuffer()) Log.w(TAG, "refreshReadings(): GET-запрос не удался ($lastProtocolError)")
     }
 
     override fun networkParams(): Flow<NetworkParams> = _networkParams.map {
         it ?: NetworkParams(
-            voltage = ru.rim.dd.core.model.PhaseValues(0.0),
-            current = ru.rim.dd.core.model.PhaseValues(0.0),
-            power = ru.rim.dd.core.model.PhaseValues(0.0),
+            voltage = PhaseValues(0.0),
+            current = PhaseValues(0.0),
+            power = PhaseValues(0.0),
         )
     }
 
-    override fun meterInfo(): Flow<MeterInfo> = _meterInfo.map {
-        it ?: MeterInfo(model = "—", serialNumber = activeSerialNumber ?: "—", firmwareVersion = "—")
-    }
+    override fun meterInfo(): Flow<MeterInfo> = _meterInfo.map { it ?: blankMeterInfo() }
 
     override fun relayState(): Flow<RelayState> = _relayState.asStateFlow()
 
-    // [Android-патч] см. _tamperState/applyDecodedBuffer() выше и TamperState.kt.
     override fun tamperState(): Flow<TamperState> = _tamperState.asStateFlow()
 
     /**
-     * [Android-патч] UC-08 — включение реле: ACTION method 2 ("remote_reconnect") на объекте
-     * Disconnect Control (0.0.96.3.10.255). Формат ПОДТВЕРЖДЁН реальным логом пульта РиМ 040.40
-     * (сам пульт пометил этот обмен как "DLMS - Recive Relay Connect"): параметр метода
-     * присутствует (choice=1), тип Integer8 (0x0F), значение 0 — см. sendDisconnectControlAction().
-     *
-     * 60-секундный обратный отсчёт перед вызовом — на стороне ViewModel (NetworkViewModel.
-     * turnRelayOn()), здесь только сама команда.
+     * Включение реле: ACTION method 2 («remote_reconnect») Disconnect Control. Формат
+     * подтверждён логом пульта: параметр Integer8 = 0. 60-секундный отсчёт — на стороне ViewModel.
      */
     override suspend fun turnRelayOn() {
         sendDisconnectControlAction(methodId = 2, label = "remote_reconnect/включение")
     }
 
     /**
-     * [Android-патч] UC-08 — немедленное отключение реле: ACTION method 1 ("remote_disconnect").
-     * В ОТЛИЧИЕ от turnRelayOn(), формат ЗДЕСЬ НЕ ПОДТВЕРЖДЁН реальным логом — в захваченном
-     * логе пульта нашлась только команда включения. Параметр собран по аналогии с методом 2
-     * (тот же Integer8=0) — это ПРЕДПОЛОЖЕНИЕ по симметрии, а не проверенный факт. Если на
-     * реальном приборе это вернёт ошибку (Action-Result ≠ 0) вместо успеха — первое, что стоит
-     * попробовать: вызвать метод 1 БЕЗ параметра (по базовой спецификации DLMS UA 1000-1 у
-     * remote_disconnect параметров нет вообще; параметр у remote_reconnect в логе пульта мог
-     * быть особенностью конкретно этой прошивки/устройства, а не общим правилом для обоих
-     * методов). Работаем "вслепую" по явной договорённости с заказчиком.
+     * Отключение реле: ACTION method 1 («remote_disconnect»). В логе пульта нашлась только команда
+     * включения, поэтому параметр (Integer8 = 0) собран по аналогии — предположение. Если прибор
+     * вернёт ошибку, первым делом стоит попробовать вызов без параметра: по DLMS UA 1000-1 у
+     * remote_disconnect параметров нет.
      */
     override suspend fun turnRelayOff() {
         sendDisconnectControlAction(methodId = 1, label = "remote_disconnect/отключение")
     }
 
     /**
-     * [Android-патч] Общий код turnRelayOn()/turnRelayOff() — ACTION-запрос к Disconnect
-     * Control той же "плоской" адресацией, что и GET (см. readDisconnectControlAttribute()).
-     * После успешного Action-Result (0) переспрашиваем состояние реле через readRelayState() —
-     * ACTION-response сам по себе новое состояние не возвращает (см. parseActionResponseResult()
-     * в GetResponseParser.kt), поэтому UI обновляем РЕАЛЬНЫМ значением, а не оптимистично.
+     * ACTION к Disconnect Control той же «плоской» адресацией, что и GET. Состояние реле после
+     * успешного Action-Result (0) обновляем сразу, по факту команды: прямое чтение атрибутов без
+     * ассоциации отказывает (0x0D). Реальное значение придёт на следующем автообновлении из
+     * буфера индикации и перезапишет предположение.
      */
     private suspend fun sendDisconnectControlAction(methodId: Int, label: String) {
         if (pumpJob?.isActive != true) {
             Log.w(TAG, "Размыкатель ($label): нет активного BLE-соединения — команда не отправлена")
             return
         }
-        protocolMutex.withLock { withContext(Dispatchers.IO) {
-            Log.d(TAG, "ACTION-запрос размыкателя (0.0.96.3.10.255, class=70 Disconnect Control, method=$methodId \"$label\")")
-            val sent = spodes.actionRequestFlatAddress(
-                classId = 70,
-                obisCode = "0.0.96.3.10.255",
-                methodId = methodId,
-                hasParameter = true,
-                parameterType = 0x0F, // Integer8 — как в подтверждённом логе пульта (метод 2)
-                parameterValue = 0,
-                destAddress = 0x03,
-                srcAddress = 0x43,
-            )
-            if (!sent) {
-                Log.w(TAG, "Размыкатель ($label): запрос не отправлен (${spodes.lastErrorMessage()})")
-                return@withContext
-            }
-            val raw = spodes.getResponseRawBytes()
-            if (raw.isEmpty()) {
-                Log.w(TAG, "Размыкатель ($label): пустой ответ от транспорта (${spodes.lastErrorMessage()})")
-                return@withContext
-            }
-            val result = parseActionResponseResult(raw)
-            when {
-                result == null -> Log.w(TAG, "Размыкатель ($label): не удалось разобрать ACTION-response")
-                result != 0 -> Log.w(
-                    TAG,
-                    "Размыкатель ($label): сервер вернул Action-Result код 0x%02X (%d) — команда НЕ выполнена"
-                        .format(result, result),
+        protocolMutex.withLock {
+            withContext(Dispatchers.IO) {
+                Log.d(TAG, "ACTION-запрос размыкателя ($DISCONNECT_CONTROL_OBIS, class=$DISCONNECT_CONTROL_CLASS_ID Disconnect Control, method=$methodId \"$label\")")
+                val sent = spodes.actionRequestFlatAddress(
+                    classId = DISCONNECT_CONTROL_CLASS_ID,
+                    obisCode = DISCONNECT_CONTROL_OBIS,
+                    methodId = methodId,
+                    hasParameter = true,
+                    parameterType = 0x0F, // Integer8
+                    parameterValue = 0,
+                    destAddress = FLAT_DEST_ADDRESS,
+                    srcAddress = FLAT_SRC_ADDRESS,
                 )
-                else -> {
-                    Log.d(TAG, "Размыкатель ($label): УСПЕХ (Action-Result=0)")
-                    // [Android-патч] НАЙДЕНА причина "индикация реле всегда ОТКЛЮЧЕНО": GET на
-                    // ОБА атрибута Disconnect Control (output_state/control_state) у этого
-                    // прибора без ассоциации возвращает data-access-result (control_state —
-                    // подтверждено логом, код 0x0D "scope-of-access-violated"; output_state,
-                    // судя по симптому, тоже) — то есть readRelayState() ниже практически
-                    // никогда не может обновить _relayState настоящими данными, а она и не
-                    // должна в этом случае: readRelayState() специально ничего не трогает,
-                    // если ОБА чтения не удались (см. её комментарий), — так что UI застревал
-                    // на значении по умолчанию (isOn=false) НАВСЕГДА, даже после успешного
-                    // включения. Но ACTION при этом РАБОТАЕТ (право вызвать метод и право
-                    // прочитать атрибут — это РАЗНЫЕ проверки доступа в DLMS) — раз сервер
-                    // вернул Action-Result=0, он ТОЧНО выполнил именно ту команду, которую мы
-                    // просили. Поэтому обновляем UI ОПТИМИСТИЧНО по самому факту успеха
-                    // команды (какой метод вызывали — такое и состояние), а не ждём
-                    // подтверждения через GET, которого может не случиться вовсе.
-                    val prev = _relayState.value
-                    _relayState.value = prev.copy(isOn = methodId == 2, source = RelaySource.REMOTE_CONTROL)
-                    // [Android-патч] readRelayState() здесь больше не вызывается — она всё равно
-                    // упёрлась бы в тот же 0x0D. Реальное подтверждение придёт само на следующем
-                    // цикле автообновления (не позже AUTO_REFRESH_INTERVAL_MS) через control_state
-                    // из буфера индикации (см. applyDecodedBuffer()/RELAY_CONTROL_STATE_OBIS) и
-                    // перезапишет это оптимистичное значение настоящим — включая
-                    // remoteTurnOnAllowed для состояния "готов ко включению".
+                if (!sent) {
+                    Log.w(TAG, "Размыкатель ($label): запрос не отправлен (${spodes.lastErrorMessage()})")
+                    return@withContext
+                }
+                val raw = spodes.getResponseRawBytes()
+                if (raw.isEmpty()) {
+                    Log.w(TAG, "Размыкатель ($label): пустой ответ от транспорта (${spodes.lastErrorMessage()})")
+                    return@withContext
+                }
+                val result = parseActionResponseResult(raw)
+                when {
+                    result == null -> Log.w(TAG, "Размыкатель ($label): не удалось разобрать ACTION-response")
+                    result != 0 -> Log.w(
+                        TAG,
+                        "Размыкатель ($label): сервер вернул Action-Result код 0x%02X (%d) — команда НЕ выполнена"
+                            .format(result, result),
+                    )
+                    else -> {
+                        Log.d(TAG, "Размыкатель ($label): УСПЕХ (Action-Result=0)")
+                        _relayState.value = _relayState.value.copy(isOn = methodId == 2, source = RelaySource.REMOTE_CONTROL)
+                    }
                 }
             }
-        } }
+        }
     }
 
     override fun history(serialNumber: String): Flow<List<Reading>> =
@@ -1767,220 +1068,91 @@ class MeterRepositoryImpl @Inject constructor(
             }
         }
 
-    // [Android-патч] НАЙДЕНА причина реального нативного краша на устройстве пользователя (SIGSEGV
-    // в SpodesClient::GetErrorMessage() сразу после "onDeviceDisconnected" в логе) — spodes.
-    // destroyClient() здесь вызывался СНАРУЖИ protocolMutex, а readAndApplyMainBuffer() (запускается
-    // автообновлением каждые AUTO_REFRESH_INTERVAL_MS) держит этот мьютекс на всё время своего
-    // выполнения, включая блокирующее ожидание ответа транспорта (до 3 с, см. ble_transport.h).
-    // Если пользователь нажимал «Отключиться» ИМЕННО в этот момент, destroyClient() успевал обнулить
-    // nativeHandle ДО того, как застрявший вызов дочитывал ответ и обращался к native-методам —
-    // обращение по уже уничтоженному handle=0 роняло процесс мгновенно (Fatal signal 11, весь
-    // процесс, не просто исключение). См. подробный разбор у lastProtocolError выше. Оборачиваем
-    // destroyClient() в тот же protocolMutex — теперь он гарантированно ДОЖДЁТСЯ, пока текущий (если
-    // он есть) readAndApplyMainBuffer() полностью освободит мьютекс, прежде чем уничтожить клиент
-    // из-под него.
     override suspend fun forgetDevice(serialNumber: String) {
         deviceStore.forget(serialNumber)
-        if (activeSerialNumber == serialNumber) {
-            stopTransportPump()
-            protocolMutex.withLock { withContext(Dispatchers.IO) { spodes.destroyClient() } }
-            ble.disconnect()
-            activeSerialNumber = null
-            meterReportedSerial = null // [Android-патч] см. meterReportedSerial — номер прибора относится к КОНКРЕТНОМУ сеансу
-            protocolSessionEstablished = false
-            consecutiveEmptyOrFailedReads = 0
-        }
+        if (activeSerialNumber == serialNumber) disconnect()
     }
 
-    // [Android-патч] см. disconnect() в MeterRepository.kt — то же самое, что и внутри
-    // forgetDevice() выше (останавливаем "насос"/автообновление, уничтожаем DLMS-клиент,
-    // рвём BLE-соединение), но БЕЗ deviceStore.forget() — прибор остаётся сопряжённым.
-    // [Android-патч] protocolSessionEstablished = false — иначе коллектор connectionState в init{}
-    // принял бы следующее ЯВНОЕ подключение (уже к другому прибору с экрана «Подключение», см.
-    // AppNavHost/ConnectionWatcherViewModel) за "восстановление после разрыва" и попытался бы
-    // пересобрать сеанс ДВАЖДЫ параллельно с connectByAddress()/connectBySerialNumber().
-    // [Android-патч] см. комментарий у forgetDevice() выше — та же самая гонка/фикс: destroyClient()
-    // теперь ждёт protocolMutex, а не вызывается напрямую поверх ещё выполняющегося
-    // readAndApplyMainBuffer().
+    /**
+     * Закрывает сеанс, не забывая прибор. destroyClient() ждёт [protocolMutex]: иначе он
+     * обнулил бы handle под выполняющимся чтением (SIGSEGV). protocolSessionEstablished
+     * сбрасывается, чтобы следующее явное подключение не приняли за автовосстановление.
+     */
     override suspend fun disconnect() {
         stopTransportPump()
         protocolMutex.withLock { withContext(Dispatchers.IO) { spodes.destroyClient() } }
         ble.disconnect()
         activeSerialNumber = null
-        meterReportedSerial = null // [Android-патч] см. meterReportedSerial — номер прибора относится к КОНКРЕТНОМУ сеансу
+        meterReportedSerial = null
         protocolSessionEstablished = false
         consecutiveEmptyOrFailedReads = 0
     }
 
     companion object {
-        /** Пульты РиМ 040.40 рекламируются в эфире как "RIM ..." — фильтр скана/поиска по имени. */
-        // [Android-патч] BLE_NAME_PREFIX ("RIM") УДАЛЁН вместе с последним его потребителем —
-        // connectBySerialNumber() больше не ищет «первый попавшийся прибор с именем на RIM», а
-        // требует точного совпадения номера ПУ (см. MeterDeviceName). Фильтр по префиксу тут и
-        // не нужен: разбор имени и так требует строго 13 цифр нужной структуры, а сама прошивка
-        // пульта РиМ 040.40 фильтрует эфир ровно так же — только по номеру счётчика, без проверки
-        // буквенного префикса (см. app_ble.c: SCAN_FILTER_BY_NAME_MASK + numMeterStr).
+        private const val TAG = "MeterRepository"
 
-        // См. комментарий у establishHdlcChannel(): 16 подтверждено кодом, 1/1 — предположение.
+        // РиМ: sourceAddress=16 — единственное значение, которое пропускает библиотека;
+        // logical/physical=1 — как в реальных кадрах обмена.
         private const val HDLC_SOURCE_ADDRESS = 16
         private const val HDLC_LOGICAL_ADDRESS = 1
         private const val HDLC_PHYSICAL_ADDRESS = 1
 
-        private const val TAG = "MeterRepository"
+        // «Плоская» однобайтовая адресация РиМ, подтверждённая на реальном приборе.
+        private const val FLAT_DEST_ADDRESS = 0x03
+        private const val FLAT_SRC_ADDRESS = 0x43
 
-        /** [Android-патч] Интервал автообновления — см. startAutoRefresh(). */
+        private const val PUMP_POLL_INTERVAL_MS = 20L
         private const val AUTO_REFRESH_INTERVAL_MS = 5_000L
 
-        /**
-         * [Android-патч] см. consecutiveEmptyOrFailedReads выше — сколько подряд неудачных циклов
-         * автообновления (пустой ответ ИЛИ ошибка разбора DLMS) считаем признаком того, что
-         * DLMS/HDLC-сессия умерла, хотя GATT формально ещё "подключён". 3 цикла × 5 с = 15 с —
-         * достаточно, чтобы не дёргаться на единичный транспортный сбой (они бывают и сами
-         * проходят), но и не оставлять пользователя надолго с мёртвым "Подключено".
-         */
+        /** Три цикла × 5 с = 15 с: не реагируем на единичный сбой, но и не держим мёртвое «Подключено». */
         private const val MAX_CONSECUTIVE_PROTOCOL_FAILURES = 3
 
-        /**
-         * [Android-патч] см. consecutiveForceReconnectsWithoutData выше — сколько ПОЛНЫХ циклов
-         * forceReconnect() подряд (каждый — это уже MAX_CONSECUTIVE_PROTOCOL_FAILURES неудач сам
-         * по себе, то есть COLD_RECONNECT_THRESHOLD=3 здесь — это ещё примерно 3×15 с ≈ 45 с
-         * обычных попыток) должны пройти БЕЗ единого успешного чтения, прежде чем просить
-         * MeterBleClient «холодное» переподключение вместо обычного. Само число — по аналогии с
-         * MAX_CONSECUTIVE_PROTOCOL_FAILURES, подбиралось не научно: даёт обычному быстрому
-         * реконнекту разумный шанс сработать (как это иногда и происходило в логах), но не
-         * заставляет пользователя ждать минутами, если обычный способ явно не работает.
-         */
+        /** Сколько циклов forceReconnect() подряд без данных терпим до «холодного» переподключения. */
         private const val COLD_RECONNECT_THRESHOLD = 3
 
-        /**
-         * [Android-патч] см. reestablishProtocolSession() выше — пауза перед пересборкой
-         * DLMS/HDLC-сессии после того, как GATT-соединение восстановилось (переподключение или
-         * forceReconnect()). Даёт счётчику время "остыть" после резкого обрыва предыдущей
-         * HDLC-сессии, прежде чем слать новый SNRM — без неё новый SNRM почти гарантированно
-         * приходил слишком рано и сессия тут же разваливалась опять ("не найден LLC-заголовок"),
-         * см. историю диагностики цикла forceReconnect() каждые ~12-15 с без единого успеха.
-         */
+        /** Пауза перед пересборкой сеанса после восстановления GATT (см. reestablishProtocolSession). */
         private const val RECONNECT_SETTLE_DELAY_MS = 1_500L
 
-        /**
-         * [Android-патч] см. applyDecodedBuffer() — OBIS версии ПО в буфере 0.0.21.0.2.255
-         * (без отдельного GET/ассоциации).
-         *
-         * ИСПРАВЛЕНО ПО ПАСПОРТУ ПРИБОРА: раньше в списке кандидатов, кроме верного
-         * 0.0.96.1.2.255, стояли ещё 0.0.96.1.0.255 и 0.0.96.1.1.255 — «другие Device ID того же
-         * класса, вдруг на какой-то модели версия лежит там». Выгрузка объектов прибора это
-         * опровергла: 0.0.96.1.0.255 — это «Серийный номер», 0.0.96.1.1.255 — «Тип прибора», и
-         * оба реально приходят в буфере (в логе: 0.0.96.1.0.255="05000112",
-         * 0.0.96.1.1.255="RIM 189.40", 0.0.96.1.2.255="1.58"). На приборе, где версии ПО в буфере
-         * нет, перебор дошёл бы до них и показал бы пользователю в поле «Версия ПО» серийный
-         * номер — тихо и правдоподобно. Оставлен единственный код, подтверждённый паспортом;
-         * серийный номер и модель читаются отдельно, каждый по своему объекту.
-         */
-        private val FIRMWARE_VERSION_OBIS_CANDIDATES = listOf(
-            "0.0.96.1.2.255",
-        )
-
-        /**
-         * [Android-патч] см. meterReportedSerial/connectBySerialNumber() — серийный номер, который
-         * прибор сообщает о себе сам. По паспорту это «Серийный номер», приходит текстом в том же
-         * буфере индикации; именно по нему проверяется, что подключились к запрошенному ПУ.
-         */
-        private const val SERIAL_NUMBER_OBIS = "0.0.96.1.0.255"
-
-        /**
-         * [Android-патч] Буфер индикации — единственный объект, из которого приложение берёт
-         * ВСЕ показания. Вынесен в константы, потому что теперь запрашивается двумя разными
-         * способами (см. readAndApplyMainBuffer): у РиМ — «плоской» адресацией, у AKROS —
-         * штатной. Сам объект и класс при этом одни и те же: по паспортам обоих приборов это
-         * «Profile | Индикация», класс 7 (Profile Generic), атрибут 2 (буфер).
-         */
+        /** Буфер индикации — «Profile | Индикация» (класс 7, атрибут 2) в паспортах РиМ и AKROS. */
         private const val MAIN_BUFFER_OBIS = "0.0.21.0.2.255"
         private const val MAIN_BUFFER_CLASS_ID = 7
 
-        /**
-         * [Android-патч] Атрибут 3 объекта Profile Generic — capture_objects, описание колонок
-         * буфера (атрибут 2). См. readAkrosCaptureObjects().
-         */
+        /** Атрибут 3 Profile Generic — capture_objects. */
         private const val PROFILE_CAPTURE_OBJECTS_ATTRIBUTE = 3
 
-        /**
-         * [Android-патч] Предел числа блоков одного ответа — защита от зацикливания, см.
-         * assembleDlmsValue(). Самый длинный из реально нужных ответов (описание колонок буфера,
-         * 14 записей по 18 байт) укладывается в три блока по 108 байт; 32 — заведомо с запасом,
-         * но не бесконечность, если прибор из-за рассинхронизации перестанет ставить флаг
-         * последнего блока.
-         */
-        private const val MAX_DLMS_BLOCKS = 32
+        /** Disconnect Control — размыкатель (OBIS из паспорта прибора). */
+        private const val DISCONNECT_CONTROL_OBIS = "0.0.96.3.10.255"
+        private const val DISCONNECT_CONTROL_CLASS_ID = 70
 
         /**
-         * [Android-патч] Адреса AKROS — см. MeterProtocolProfile.AKROS_STANDARD и
-         * establishAkrosSession(). Значения взяты из эталонного лога обмена штатной утилиты:
-         * в эфире это байты 0x41 (клиент) и 0x02 0x21 (сервер); библиотека кодирует переданные
-         * сюда числа ровно в них (AppendBit: 32→0x41, 1→0x02, 16→0x21).
+         * Версия ПО — единственный код, подтверждённый паспортом. 0.0.96.1.0/1.255 в кандидаты
+         * не годятся: это серийный номер и тип прибора, и в поле «Версия ПО» они попали бы молча.
          */
+        private val FIRMWARE_VERSION_OBIS_CANDIDATES = listOf("0.0.96.1.2.255")
+
+        /** «Device ID 1» — имя модели текстом («RIM 189.40»). */
+        private val MODEL_NAME_OBIS_CANDIDATES = listOf("0.0.96.1.1.255")
+
+        private const val SERIAL_NUMBER_OBIS = "0.0.96.1.0.255"
+
+        // Индикаторы экрана «Показания».
+        private const val HDLC_P1_OBIS = "0.0.22.0.0.255"
+        private const val HDLC_P2_OBIS = "0.1.22.0.0.255"
+        private const val OPERATING_TIME_OBIS = "0.0.96.8.0.255"
+
+        /** Предел числа блоков одного ответа; самый длинный нужный ответ укладывается в три. */
+        private const val MAX_DLMS_BLOCKS = 32
+
+        // AKROS: в эфире — байты 0x41 (клиент) и 0x02 0x21 (сервер); библиотека кодирует
+        // переданные числа ровно в них (32→0x41, 1→0x02, 16→0x21).
         private const val AKROS_CLIENT_ADDRESS = 32
         private const val AKROS_LOGICAL_ADDRESS = 1
         private const val AKROS_PHYSICAL_ADDRESS = 16
 
-        /**
-         * [Android-патч] Низкий уровень безопасности (LLS) — в эталонном логе AARQ содержит
-         * mechanism-name 2.16.756.5.8.2.1, это механизм №1, то есть проверка по паролю без
-         * шифрования.
-         */
+        /** LLS — проверка по паролю без шифрования (mechanism-name 2.16.756.5.8.2.1). */
         private const val AKROS_SECURITY_LEVEL_LOW = 1
 
-        /**
-         * [Android-патч] Пароль ассоциации AKROS. Взят из эталонного лога: в AARQ поле
-         * calling-authentication-value содержит строку "Reader" (байты 52 65 61 64 65 72) —
-         * это пароль ассоциации ЧТЕНИЯ, не путать с PIN-кодом BLE-сопряжения, который спрашивает
-         * сам Android при включении notify. Если для другого прибора/ассоциации пароль окажется
-         * другим, его стоит вынести в настройки, а не подбирать здесь.
-         */
+        /** Пароль ассоциации чтения из эталонного лога; не путать с PIN BLE-сопряжения. */
         private const val AKROS_ASSOCIATION_PASSWORD = "Reader"
-
-        /**
-         * [Android-патч] Пароль/ключ ШИФРОВАННОЙ (высокоуровневой) ассоциации AKROS — HLS-GMAC.
-         * Ровно 16 ASCII-символов; используется и как ключ шифрования, и как ключ аутентификации
-         * (для этого прибора они совпадают — подтверждено побайтовым разбором лога). Если у другого
-         * прибора ключ иной, его стоит вынести в настройки. Не путать с паролем LLS "Reader" выше
-         * и с PIN-кодом BLE-сопряжения.
-         */
-        private const val AKROS_HLS_PASSWORD = "SettingRiM_AKROS"
-
-        /**
-         * [Android-патч] Пробовать ли ШИФРОВАННУЮ (высокоуровневую) ассоциацию HLS-GMAC перед
-         * откатом на низкий уровень. По умолчанию false: на текущем приборе высокий уровень
-         * отвергается («authentication-failure»), а всё нужное и так читается на низком уровне из
-         * публичного буфера. Вернуть true, когда будет точный GMAC-ключ этого экземпляра или
-         * свежий лог успешного высокоуровневого обмена штатной программы — см. establishAkrosSession().
-         */
-        private const val AKROS_TRY_HLS = false
-
-        /**
-         * [Android-патч] Имя устройства AKROS (COSEM logical device name), класс 1 Data. В
-         * эталонном логе атрибут 2 этого объекта возвращает "RIMAKROS07200090" — читается только
-         * внутри шифрованной ассоциации, см. readAkrosSoftwareVersion().
-         */
-        private const val AKROS_DEVICE_NAME_OBIS = "0.0.42.0.0.255"
-        private const val AKROS_DEVICE_NAME_CLASS_ID = 1
-
-        /**
-         * [Android-патч] Кандидаты OBIS-кодов версии ПО для чтения ПО ЗАПРОСУ внутри шифрованной
-         * ассоциации (см. readAkrosSoftwareVersion). Порядок = приоритет; берётся первый непустой
-         * ответ. 0.0.0.2.0.255 — стандартный COSEM "active firmware identifier"; 0.0.96.1.2.255 —
-         * распространённый производственный код версии ПО у приборов линейки.
-         */
-        private val AKROS_FIRMWARE_OBIS_CANDIDATES = listOf(
-            "0.0.0.2.0.255",
-            "0.0.96.1.2.255",
-        )
-
-        /**
-         * [Android-патч] см. applyDecodedBuffer() — 0.0.96.1.1.255 ("Device ID 1") подтверждён
-         * логом реального счётчика (модель 189.40, значение "RIM 189.40" прямо текстом).
-         */
-        private val MODEL_NAME_OBIS_CANDIDATES = listOf(
-            "0.0.96.1.1.255",
-        )
     }
 }

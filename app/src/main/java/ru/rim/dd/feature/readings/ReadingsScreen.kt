@@ -52,20 +52,13 @@ import ru.rim.dd.ui.theme.RimGroupReactiveQ4
 import ru.rim.dd.ui.theme.RimHeroGradient
 import ru.rim.dd.ui.theme.RimTheme
 
-/**
- * [Android-патч] Экран «Показания» по обновлённому макету Figma: «геро»-карточка (текущий тариф,
- * дата/время, 4 мини-плитки итогов) и раскрывающиеся аккордеоны по видам энергии с сеткой
- * тарифов. Данные реальные (ViewModel), OBIS-подписи по флагу [showObis].
- */
-
-/** Описание группы энергии для экрана: заголовок, короткое имя, цвет и база OBIS-кода. */
 private data class GroupSpec(
     val category: EnergyCategory,
     val title: String,
     val short: String,
     val unit: String,
     val color: Color,
-    val obisBase: String,   // напр. "1.0.1.8" → тариф n = "1.0.1.8.n.255", итог = "1.0.1.8.0.255"
+    val obisBase: String,   // "1.0.1.8" → тариф n = "1.0.1.8.n.<period>", итог = "1.0.1.8.0.<period>"
 )
 
 private val GROUPS = listOf(
@@ -75,19 +68,23 @@ private val GROUPS = listOf(
     GroupSpec(EnergyCategory.REACTIVE_Q4, "Реактивная Q4 · Отдача", "Реакт. Q4", "квар·ч", RimGroupReactiveQ4, "1.0.4.8"),
 )
 
+private fun total(items: List<Reading>): Double =
+    items.firstOrNull { it.tariff == null }?.valueKwh ?: items.filter { it.tariff != null }.sumOf { it.valueKwh }
+
+private fun unitOf(items: List<Reading>, fallback: String): String =
+    items.firstNotNullOfOrNull { it.unitLabel } ?: fallback
+
 @Composable
 fun ReadingsScreen(showObis: Boolean, viewModel: ReadingsViewModel = hiltViewModel()) {
     val readings by viewModel.readings.collectAsState()
     val meterInfo by viewModel.meterInfo.collectAsState()
     val p = RimTheme.palette
     var refreshing by remember { mutableStateOf(false) }
-    val expanded = remember { mutableStateMapOf(EnergyCategory.ACTIVE_IMPORT to true) }
+    val expanded = remember { mutableStateMapOf("255:${EnergyCategory.ACTIVE_IMPORT}" to true) }
 
-    val byCat = readings.groupBy { it.category }
-    fun items(c: EnergyCategory) = byCat[c].orEmpty()
-    fun total(items: List<Reading>): Double =
-        items.firstOrNull { it.tariff == null }?.valueKwh ?: items.sumOf { it.valueKwh }
-    fun unitOf(spec: GroupSpec) = items(spec.category).firstNotNullOfOrNull { it.unitLabel } ?: spec.unit
+    val current = readings.filter { !it.isRdch }
+    val rdch = readings.filter { it.isRdch }
+    fun catItems(list: List<Reading>, c: EnergyCategory) = list.filter { it.category == c }
 
     Column(
         modifier = Modifier
@@ -99,7 +96,6 @@ fun ReadingsScreen(showObis: Boolean, viewModel: ReadingsViewModel = hiltViewMod
         LaunchedEffect(refreshing) { if (refreshing) { kotlinx.coroutines.delay(900); refreshing = false } }
         ScreenHeader("Показания", onRefresh = { refreshing = true; viewModel.refresh() }, refreshing = refreshing)
 
-        // ---- Геро-карточка ----
         Box(
             modifier = Modifier
                 .fillMaxWidth()
@@ -121,16 +117,16 @@ fun ReadingsScreen(showObis: Boolean, viewModel: ReadingsViewModel = hiltViewMod
                         horizontalAlignment = Alignment.End,
                     ) {
                         Text(formatDate(meterInfo?.deviceClock), color = Color.White.copy(alpha = 0.7f), fontSize = 10.sp)
-                        MonoText(formatTime(meterInfo?.deviceClock), color = Color.White, fontSize = 19.sp)
+                        MonoText(formatTime(meterInfo?.deviceClock), color = Color.White, fontSize = 12.sp)
                     }
                 }
-                // 4 мини-плитки итогов
                 Row(Modifier.fillMaxWidth().padding(top = 16.dp), horizontalArrangement = Arrangement.spacedBy(1.dp)) {
                     GROUPS.forEachIndexed { i, spec ->
+                        val items = catItems(current, spec.category)
                         QuickStat(
                             short = spec.short,
-                            value = formatNumber(total(items(spec.category)), 3),
-                            unit = unitOf(spec),
+                            value = formatNumber(total(items), 3),
+                            unit = unitOf(items, spec.unit),
                             bg = if (i == 0) Color.White.copy(alpha = 0.15f) else Color.White.copy(alpha = 0.07f),
                             modifier = Modifier.weight(1f),
                         )
@@ -142,19 +138,12 @@ fun ReadingsScreen(showObis: Boolean, viewModel: ReadingsViewModel = hiltViewMod
         Box(Modifier.padding(top = 20.dp))
         SectionLabel("Группы по видам энергии")
 
-        // ---- Аккордеоны по видам энергии ----
-        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            GROUPS.forEach { spec ->
-                EnergyAccordion(
-                    spec = spec,
-                    items = items(spec.category),
-                    unit = unitOf(spec),
-                    total = total(items(spec.category)),
-                    open = expanded[spec.category] == true,
-                    onToggle = { expanded[spec.category] = !(expanded[spec.category] ?: false) },
-                    showObis = showObis,
-                )
-            }
+        EnergyGroups(current, "255", "", expanded, showObis)
+
+        if (rdch.isNotEmpty()) {
+            Box(Modifier.padding(top = 20.dp))
+            SectionLabel("Расчётный день (РДЧ)")
+            EnergyGroups(rdch, "101", " (РДЧ)", expanded, showObis)
         }
 
         if (readings.isEmpty()) {
@@ -169,9 +158,28 @@ private fun QuickStat(short: String, value: String, unit: String, bg: Color, mod
         modifier = modifier.background(bg).padding(horizontal = 8.dp, vertical = 10.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Text(short, color = Color.White.copy(alpha = 0.55f), fontSize = 15.sp, maxLines = 1)
-        MonoText(value, color = Color.White, fontSize = 17.sp, modifier = Modifier.padding(top = 3.dp))
-        Text(unit, color = Color.White.copy(alpha = 0.45f), fontSize = 15.sp)
+        Text(short, color = Color.White.copy(alpha = 0.55f), fontSize = 9.sp, maxLines = 1)
+        MonoText(value, color = Color.White, fontSize = 13.sp, modifier = Modifier.padding(top = 3.dp))
+        Text(unit, color = Color.White.copy(alpha = 0.45f), fontSize = 9.sp)
+    }
+}
+
+@Composable
+private fun EnergyGroups(
+    readings: List<Reading>,
+    period: String,
+    titleSuffix: String,
+    expanded: MutableMap<String, Boolean>,
+    showObis: Boolean,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        GROUPS.forEach { spec ->
+            val items = readings.filter { it.category == spec.category }
+            if (items.isNotEmpty()) {
+                val key = "$period:${spec.category}"
+                EnergyAccordion(spec, items, period, titleSuffix, expanded[key] == true, { expanded[key] = !(expanded[key] ?: false) }, showObis)
+            }
+        }
     }
 }
 
@@ -179,14 +187,16 @@ private fun QuickStat(short: String, value: String, unit: String, bg: Color, mod
 private fun EnergyAccordion(
     spec: GroupSpec,
     items: List<Reading>,
-    unit: String,
-    total: Double,
+    period: String,
+    titleSuffix: String,
     open: Boolean,
     onToggle: () -> Unit,
     showObis: Boolean,
 ) {
     val p = RimTheme.palette
     val chevron by animateFloatAsState(if (open) 90f else 0f, label = "chevron")
+    // Только реально пришедшие тарифы (скрываем отсутствующие в буфере).
+    val presentTariffs = items.mapNotNull { it.tariff }.distinct().sorted()
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -194,7 +204,6 @@ private fun EnergyAccordion(
             .background(p.cardSurface)
             .border(1.dp, p.border, RoundedCornerShape(16.dp)),
     ) {
-        // Шапка
         Row(
             modifier = Modifier.fillMaxWidth().clickable { onToggle() }.padding(horizontal = 16.dp, vertical = 14.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -204,25 +213,28 @@ private fun EnergyAccordion(
                 Text("⚡", fontSize = 16.sp)
             }
             Column(Modifier.weight(1f)) {
-                Text(spec.title, color = p.textPrimary, fontSize = 19.sp, fontWeight = FontWeight.Bold)
-                if (showObis) MonoText("${spec.obisBase}.0.255", color = spec.color.copy(alpha = 0.7f), fontSize = 15.sp, weight = FontWeight.Normal, modifier = Modifier.padding(top = 1.dp))
+                Text(spec.title + titleSuffix, color = p.textPrimary, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                if (showObis) MonoText("${spec.obisBase}.0.$period", color = spec.color.copy(alpha = 0.7f), fontSize = 9.sp, weight = FontWeight.Normal, modifier = Modifier.padding(top = 1.dp))
             }
             Column(horizontalAlignment = Alignment.End) {
-                MonoText(formatNumber(total, 3), color = spec.color, fontSize = 16.sp)
-                Text(unit, color = p.textFaint, fontSize = 10.sp)
+                MonoText(formatNumber(total(items), 3), color = spec.color, fontSize = 16.sp)
+                Text(unitOf(items, spec.unit), color = p.textFaint, fontSize = 10.sp)
             }
-            Text("›", color = p.textFaint, fontSize = 40.sp, modifier = Modifier.padding(start = 4.dp).rotate(chevron))
+            if (presentTariffs.isNotEmpty()) {
+                Text("›", color = p.textFaint, fontSize = 16.sp, modifier = Modifier.padding(start = 4.dp).rotate(chevron))
+            }
         }
-        // Раскрытая сетка тарифов
-        if (open) {
+        if (open && presentTariffs.isNotEmpty()) {
             Divider()
             Column(Modifier.padding(start = 12.dp, end = 12.dp, top = 12.dp, bottom = 14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                val tariffs = (1..8).map { t -> t to items.firstOrNull { it.tariff == t } }
-                tariffs.chunked(4).forEach { rowItems ->
+                presentTariffs.chunked(4).forEach { rowTariffs ->
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        rowItems.forEach { (t, r) ->
-                            TariffCell(t, r?.valueKwh ?: 0.0, spec, showObis, Modifier.weight(1f))
+                        rowTariffs.forEach { t ->
+                            val value = items.firstOrNull { it.tariff == t }?.valueKwh ?: 0.0
+                            TariffCell(t, value, spec, period, showObis, Modifier.weight(1f))
                         }
+                        // добиваем ряд пустыми ячейками, чтобы ширина плиток не «прыгала»
+                        repeat(4 - rowTariffs.size) { Box(Modifier.weight(1f)) }
                     }
                 }
             }
@@ -231,7 +243,7 @@ private fun EnergyAccordion(
 }
 
 @Composable
-private fun TariffCell(tariff: Int, value: Double, spec: GroupSpec, showObis: Boolean, modifier: Modifier) {
+private fun TariffCell(tariff: Int, value: Double, spec: GroupSpec, period: String, showObis: Boolean, modifier: Modifier) {
     val p = RimTheme.palette
     Column(
         modifier = modifier
@@ -241,8 +253,8 @@ private fun TariffCell(tariff: Int, value: Double, spec: GroupSpec, showObis: Bo
             .padding(horizontal = 6.dp, vertical = 8.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Text(tariffLabel(tariff), color = spec.color, fontSize = 14.sp, fontWeight = FontWeight.Bold)
-        MonoText(formatNumber(value, 3), color = p.textPrimary, fontSize = 19.sp, modifier = Modifier.padding(top = 3.dp))
-        if (showObis) Text("${spec.obisBase}.$tariff.255", color = spec.color.copy(alpha = 0.5f), fontSize = 10.sp, fontFamily = FontFamily.Monospace, modifier = Modifier.padding(top = 3.dp))
+        Text(tariffLabel(tariff), color = spec.color, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+        MonoText(formatNumber(value, 3), color = p.textPrimary, fontSize = 12.sp, modifier = Modifier.padding(top = 3.dp))
+        if (showObis) Text("${spec.obisBase}.$tariff.$period", color = spec.color.copy(alpha = 0.5f), fontSize = 8.sp, fontFamily = FontFamily.Monospace, modifier = Modifier.padding(top = 3.dp))
     }
 }

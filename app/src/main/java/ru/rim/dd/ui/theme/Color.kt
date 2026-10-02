@@ -2,11 +2,6 @@ package ru.rim.dd.ui.theme
 
 import androidx.compose.ui.graphics.Color
 
-/**
- * [Android-патч] Палитра из макета Figma (перенос дизайна в приложение). Акцентные цвета общие
- * для тёмной и светлой тем, фон/поверхности/текст — свои у каждой (см. RimPalette / RimTheme).
- */
-
 // ---- Акценты (одинаковые в обеих темах) ----
 val RimPrimary = Color(0xFF7C4FF0)
 val RimPrimaryDeep = Color(0xFF6D3EE8)
@@ -24,7 +19,7 @@ val RimSuccess = Color(0xFF4ADE80)
 val RimWarn = Color(0xFFFBBF24)
 val RimError = Color(0xFFF87171)
 
-// Цвета групп энергии на экране «Показания» (из макета Figma)
+// Цвета групп энергии на экране «Показания»
 val RimGroupActiveImport = Color(0xFF7C4FF0)
 val RimGroupActiveExport = Color(0xFF06B6D4)
 val RimGroupReactiveQ1 = Color(0xFFF59E0B)

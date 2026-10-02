@@ -10,8 +10,7 @@ import ru.rim.dd.navigation.AppNavHost
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // [Android-патч] Тема (RimTheme) применяется внутри AppNavHost — она зависит от
-        // пользовательской настройки «Тёмная тема» (AppSettingsViewModel), которую там же и читаем.
+        // Тему (RimTheme) применяет AppNavHost: она зависит от настройки «Тёмная тема».
         setContent {
             AppNavHost()
         }

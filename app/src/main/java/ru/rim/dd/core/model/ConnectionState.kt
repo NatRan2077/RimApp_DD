@@ -1,10 +1,6 @@
 package ru.rim.dd.core.model
 
-/**
- * Состояние связи с ПУ. Повторяет набор статусов из прошивки пульта ДД
- * (MSG_BLE_CONNECT_SUCCESS / ERROR_PINCODE / NOT_FOUND, "НЕТ.ОТВ" и т.д.),
- * чтобы UI показывал пользователю знакомую логику.
- */
+/** Состояние связи с ПУ; набор ошибок повторяет статусы прошивки пульта ДД (MSG_BLE_CONNECT_*, "НЕТ.ОТВ"). */
 sealed class ConnectionState {
     data object Idle : ConnectionState()
     data object Scanning : ConnectionState()

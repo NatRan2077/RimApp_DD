@@ -43,15 +43,14 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.hilt.navigation.compose.hiltViewModel
-import androidx.compose.ui.platform.LocalContext
 import ru.rim.dd.core.ble.BleDevice
 import ru.rim.dd.ui.components.GlassCard
 import ru.rim.dd.ui.components.MonoText
@@ -107,7 +106,6 @@ fun PairingScreen(
 
     Box(Modifier.fillMaxSize().background(p.background)) {
         Column(Modifier.fillMaxSize()) {
-            // ---- Заголовок ----
             Column(Modifier.padding(start = 24.dp, end = 24.dp, top = 48.dp, bottom = 20.dp)) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
@@ -129,7 +127,6 @@ fun PairingScreen(
                 Text("Выберите способ подключения", color = p.textSecondary, fontSize = 13.sp, modifier = Modifier.padding(top = 8.dp))
             }
 
-            // ---- Прокручиваемое содержимое ----
             Column(
                 modifier = Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(horizontal = 20.dp),
                 verticalArrangement = Arrangement.spacedBy(14.dp),
@@ -146,7 +143,6 @@ fun PairingScreen(
                         }
                     }
                 } else {
-                    // Карточка сканирования
                     GlassCard {
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
                             SonarIcon(scanning = state.isScanning)
@@ -173,14 +169,13 @@ fun PairingScreen(
                         }
                     }
 
-                    // Ручной ввод (только серийный номер — PIN не нужен)
+                    // Ручной ввод: только серийный номер, PIN не нужен
                     GlassCard {
                         Text("Ввести номер ПУ", color = p.textPrimary, fontSize = 19.sp, fontWeight = FontWeight.Bold)
                         Text("Серийный номер прибора", color = p.textSecondary, fontSize = 15.sp, modifier = Modifier.padding(bottom = 12.dp))
                         FieldInput(serial, { serial = it }, "Серийный номер", KeyboardType.Number)
                     }
 
-                    // Найденные приборы
                     if (state.foundDevices.isNotEmpty()) {
                         Text(
                             "НАЙДЕНО · ${state.foundDevices.size}",
@@ -203,7 +198,6 @@ fun PairingScreen(
                 }
             }
 
-            // ---- CTA ----
             Box(Modifier.padding(start = 20.dp, end = 20.dp, top = 12.dp, bottom = 32.dp)) {
                 GradientButton(
                     if (state.isConnecting) "Подключение…" else "Подключиться",
@@ -281,20 +275,20 @@ private fun DeviceRow(dev: BleDevice, selected: Boolean, onClick: () -> Unit) {
 }
 
 @Composable
-private fun FieldInput(value: String, onChange: (String) -> Unit, placeholder: String, keyboard: KeyboardType, isPassword: Boolean = false) {
+private fun FieldInput(value: String, onChange: (String) -> Unit, placeholder: String, keyboard: KeyboardType) {
     val p = RimTheme.palette
+    val container = if (p.dark) Color.White.copy(alpha = 0.05f) else RimPrimaryDeep.copy(alpha = 0.04f)
     TextField(
         value = value,
         onValueChange = onChange,
         placeholder = { Text(placeholder, color = p.textFaint, fontFamily = FontFamily.Monospace) },
         singleLine = true,
         textStyle = LocalTextStyle.current.copy(fontFamily = FontFamily.Monospace, fontSize = 14.sp),
-        visualTransformation = if (isPassword) PasswordVisualTransformation() else androidx.compose.ui.text.input.VisualTransformation.None,
         keyboardOptions = KeyboardOptions(keyboardType = keyboard),
         modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)),
         colors = TextFieldDefaults.colors(
-            focusedContainerColor = if (p.dark) Color.White.copy(alpha = 0.05f) else RimPrimaryDeep.copy(alpha = 0.04f),
-            unfocusedContainerColor = if (p.dark) Color.White.copy(alpha = 0.05f) else RimPrimaryDeep.copy(alpha = 0.04f),
+            focusedContainerColor = container,
+            unfocusedContainerColor = container,
             focusedTextColor = p.textPrimary,
             unfocusedTextColor = p.textPrimary,
             focusedIndicatorColor = RimPrimary,

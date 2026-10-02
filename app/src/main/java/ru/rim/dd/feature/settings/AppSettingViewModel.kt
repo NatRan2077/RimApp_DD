@@ -10,12 +10,7 @@ import kotlinx.coroutines.launch
 import ru.rim.dd.data.local.AppSettings
 import javax.inject.Inject
 
-/**
- * [Android-патч] Настройки вида (тема + показ OBIS) на уровне всего приложения. Живёт выше
- * экранов (создаётся в AppNavHost), чтобы: тема применялась ко ВСЕМУ дереву (RimTheme в
- * MainActivity/AppNavHost), а тумблеры на экране «Настройки» и подписи OBIS на остальных
- * экранах читали одно и то же состояние.
- */
+/** Настройки вида (тема, показ OBIS) на уровне приложения: создаётся в AppNavHost и общая для всех экранов. */
 @HiltViewModel
 class AppSettingsViewModel @Inject constructor(
     private val settings: AppSettings,

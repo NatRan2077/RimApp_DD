@@ -12,14 +12,7 @@ import javax.inject.Singleton
 
 private val Context.appSettingsStore by preferencesDataStore(name = "app_settings")
 
-/**
- * [Android-патч] Пользовательские настройки ВИДА приложения (перенос дизайна из Figma):
- *  - showObis   — показывать ли OBIS-коды под величинами (тумблер на экране «Настройки»);
- *  - darkTheme  — тёмная/светлая тема.
- *
- * Отдельно от DeviceStore (сопряжённые приборы) намеренно: это настройки интерфейса, а не
- * данные о приборах. Хранится в DataStore, чтобы выбор пользователя переживал перезапуск.
- */
+/** Настройки интерфейса в DataStore: показ OBIS-кодов и тёмная тема. Отдельно от DeviceStore (данные приборов). */
 @Singleton
 class AppSettings @Inject constructor(
     @ApplicationContext private val context: Context,
@@ -27,7 +20,7 @@ class AppSettings @Inject constructor(
     private val KEY_SHOW_OBIS = booleanPreferencesKey("show_obis")
     private val KEY_DARK_THEME = booleanPreferencesKey("dark_theme")
 
-    /** По умолчанию OBIS-коды скрыты (как в макете), тема — тёмная (как в макете). */
+    /** По умолчанию OBIS-коды скрыты, тема тёмная. */
     val showObis: Flow<Boolean> = context.appSettingsStore.data.map { it[KEY_SHOW_OBIS] ?: false }
     val darkTheme: Flow<Boolean> = context.appSettingsStore.data.map { it[KEY_DARK_THEME] ?: true }
 

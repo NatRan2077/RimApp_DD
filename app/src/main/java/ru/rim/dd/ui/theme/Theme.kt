@@ -1,7 +1,6 @@
 package ru.rim.dd.ui.theme
 
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Typography
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
@@ -9,12 +8,7 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.Color
 
-/**
- * [Android-патч] Расширенная палитра под макет Figma — то, чего нет в стандартной ColorScheme
- * Material3 (полупрозрачные «стеклянные» поверхности, приглушённый текст, цвет рамок и панели
- * навигации). Раздаётся через LocalRimPalette, чтобы экраны брали ТОЧНЫЕ цвета дизайна и в
- * тёмной, и в светлой теме, не переопределяя каждый раз вручную.
- */
+/** Цвета, которых нет в ColorScheme Material3; раздаются через LocalRimPalette. */
 data class RimPalette(
     val dark: Boolean,
     val background: Color,
@@ -27,8 +21,6 @@ data class RimPalette(
     /** Поверхность «стеклянной» карточки (GlassCard). */
     val glassSurface: Color,
     val border: Color,
-    /** Фон плитки/чипа под акцент (полупрозрачный фиолетовый). */
-    val accentSoft: Color,
 )
 
 private val DarkPalette = RimPalette(
@@ -41,7 +33,6 @@ private val DarkPalette = RimPalette(
     cardSurface = Color.White.copy(alpha = 0.05f),
     glassSurface = Color.White.copy(alpha = 0.05f),
     border = Color.White.copy(alpha = 0.08f),
-    accentSoft = RimPrimaryDeep.copy(alpha = 0.15f),
 )
 
 private val LightPalette = RimPalette(
@@ -54,7 +45,6 @@ private val LightPalette = RimPalette(
     cardSurface = Color.White,
     glassSurface = Color.White.copy(alpha = 0.85f),
     border = Color.Black.copy(alpha = 0.06f),
-    accentSoft = RimPrimaryDeep.copy(alpha = 0.08f),
 )
 
 val LocalRimPalette = staticCompositionLocalOf { DarkPalette }
@@ -93,12 +83,8 @@ fun RimTheme(dark: Boolean, content: @Composable () -> Unit) {
     CompositionLocalProvider(LocalRimPalette provides palette) {
         MaterialTheme(
             colorScheme = if (dark) DarkColors else LightColors,
-            typography = RimTypography,
+            typography = rimTypography(),
             content = content,
         )
     }
 }
-
-// Задаётся в Type.kt, но объявлено здесь для читаемости RimTheme выше.
-internal val RimTypography: Typography
-    get() = rimTypography()

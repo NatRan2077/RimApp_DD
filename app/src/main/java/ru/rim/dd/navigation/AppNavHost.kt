@@ -1,7 +1,6 @@
 package ru.rim.dd.navigation
 
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -24,11 +23,13 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.navigation.NavDestination
 import androidx.navigation.NavDestination.Companion.hierarchy
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.compose.NavHost
@@ -42,7 +43,6 @@ import ru.rim.dd.feature.pairing.PairingScreen
 import ru.rim.dd.feature.readings.ReadingsScreen
 import ru.rim.dd.feature.settings.AppSettingsViewModel
 import ru.rim.dd.feature.settings.SettingsScreen
-import ru.rim.dd.ui.theme.RimPrimary
 import ru.rim.dd.ui.theme.RimPrimaryDeep
 import ru.rim.dd.ui.theme.RimTheme
 import ru.rim.dd.ui.theme.RimViolet
@@ -64,12 +64,7 @@ private val bottomTabs = listOf(
     BottomTab(Routes.SETTINGS, "Настройки", Icons.Filled.Settings),
 )
 
-/**
- * [Android-патч] Навигация приложения с оформлением из макета Figma. Тема (тёмная/светлая) и
- * показ OBIS — глобальные настройки (AppSettingsViewModel), поэтому RimTheme оборачивает ВСЁ
- * дерево здесь, а showObis/тумблеры пробрасываются в экраны. Экран подключения — без нижней
- * панели, четыре основных — с кастомной панелью (см. RimBottomBar).
- */
+/** Тема и showObis — глобальные настройки, поэтому RimTheme оборачивает всё дерево здесь. Экран подключения — без нижней панели. */
 @Composable
 fun AppNavHost() {
     val appSettings: AppSettingsViewModel = hiltViewModel()
@@ -136,7 +131,7 @@ fun AppNavHost() {
 
 @Composable
 private fun RimBottomBar(
-    currentRoute: Sequence<androidx.navigation.NavDestination>?,
+    currentRoute: Sequence<NavDestination>?,
     onSelect: (String) -> Unit,
 ) {
     val palette = RimTheme.palette
@@ -153,7 +148,7 @@ private fun RimBottomBar(
                 modifier = Modifier
                     .weight(1f)
                     .clip(RoundedCornerShape(12.dp))
-                    .background(if (active) RimPrimaryDeep.copy(alpha = if (palette.dark) 0.20f else 0.10f) else androidx.compose.ui.graphics.Color.Transparent)
+                    .background(if (active) RimPrimaryDeep.copy(alpha = if (palette.dark) 0.20f else 0.10f) else Color.Transparent)
                     .clickable { onSelect(tab.route) }
                     .padding(vertical = 8.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
@@ -163,7 +158,6 @@ private fun RimBottomBar(
                     tab.icon,
                     contentDescription = tab.label,
                     tint = if (active) RimViolet else palette.textFaint,
-                    modifier = Modifier.padding(0.dp),
                 )
                 Text(
                     tab.label,

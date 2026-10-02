@@ -1,10 +1,10 @@
 package ru.rim.dd.data.local
 
-import dagger.hilt.android.qualifiers.ApplicationContext
 import android.content.Context
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import ru.rim.dd.core.model.PairedDevice
@@ -13,13 +13,7 @@ import javax.inject.Singleton
 
 private val Context.dataStore by preferencesDataStore(name = "device_store")
 
-/**
- * Хранит сопряжённые ПУ и последний активный серийный номер.
- * PIN-коды НЕ хранятся в этом файле — см. SecurePinStore
- * (EncryptedSharedPreferences / Keystore, добавляется отдельным классом
- * на этапе реализации UC-01/UC-02 — вынесено намеренно, чтобы секреты
- * не смешивались с обычными настройками).
- */
+/** Хранит последний активный серийный номер ПУ. PIN-коды здесь не хранятся. */
 @Singleton
 class DeviceStore @Inject constructor(
     @ApplicationContext private val context: Context,

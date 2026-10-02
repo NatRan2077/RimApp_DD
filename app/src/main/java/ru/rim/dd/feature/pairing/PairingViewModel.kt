@@ -39,12 +39,7 @@ class PairingViewModel @Inject constructor(
         _uiState.value = _uiState.value.copy(isScanning = true, foundDevices = emptyList(), errorMessage = null)
         scanJob = viewModelScope.launch {
             repository.scanDevices()
-                // [Android-патч] Раньше фильтр был жёстко по префиксу "RIM" — и счётчик AKROS
-                // (тоже прибор РиМ, но с именем вида "AKROS-07200090") в список вообще не
-                // попадал: выбрать его было физически нельзя. Теперь решение принимает
-                // MeterDeviceName.looksLikeMeter() — оно пропускает и приборы с разобранным
-                // именем любого известного формата, и просто знакомые префиксы. Смысл фильтра
-                // прежний: показывать приборы, а не все BLE-устройства вокруг.
+                // Не фиксированный префикс, а looksLikeMeter: он пропускает и приборы вида AKROS-…
                 .filter { MeterDeviceName.looksLikeMeter(it.name) }
                 .collect { device ->
                     val current = _uiState.value.foundDevices
@@ -62,25 +57,8 @@ class PairingViewModel @Inject constructor(
     }
 
     /**
-     * [Android-патч] НАЙДЕНА причина странного бага "обновление работает при подключении по
-     * номеру, но не при подключении из списка сканирования": stopScan() выше делает
-     * scanJob?.cancel() — это АСИНХРОННАЯ отмена, Job.cancel() не ждёт, пока корутина реально
-     * остановится. А фактическая остановка радио-скана (scanner.stopScan()) происходит в блоке
-     * awaitClose ВНУТРИ MeterBleClient.scan() — он выполняется только когда отмена долетит до
-     * этой корутины, а это не мгновенно. Раньше selectDevice()/connectByNumber() вызывали
-     * stopScan() и СРАЗУ ЖЕ (без ожидания) стартовали GATT-подключение — то есть физический BLE-
-     * скан мог ещё идти в эфире ПАРАЛЛЕЛЬНО с началом GATT-соединения и первым обменом SNRM/GET.
-     * Одновременные скан+GATT — известная проблема стека BLE на Android (нестабильные/потерянные
-     * notify, обрезанные кадры), и именно это, похоже, портило ПЕРВЫЙ буфер после подключения
-     * ЧЕРЕЗ СПИСОК (а дальше "не удалось разобрать DLMS-данные" тянулось на каждое "Обновить",
-     * потому что нативный rx-буфер, скорее всего, остался с "хвостом" от повреждённого кадра).
-     * Подключение по номеру (connectBySerialNumber → ble.connectBySerialNumber()) НЕ страдало этим,
-     * потому что там скан честно suspend-запущенный: scan().first{} не возвращает управление,
-     * пока сам скан не остановлен ПОЛНОСТЬЮ (включая awaitClose) — гонки просто не возникает.
-     *
-     * Исправлено: вместо cancel() используем cancelAndJoin() — он РЕАЛЬНО ждёт, пока предыдущий
-     * scanJob (со всем его awaitClose) завершится, и только потом продолжаем к GATT-подключению.
-     * Вызывается перед ОБОИМИ способами подключения — не только через список.
+     * cancelAndJoin вместо cancel: радио-скан должен реально остановиться до GATT-подключения,
+     * иначе параллельные скан и GATT на Android дают потерянные notify и обрезанные кадры.
      */
     private suspend fun stopScanAndAwait() {
         scanJob?.cancelAndJoin()
@@ -111,6 +89,4 @@ class PairingViewModel @Inject constructor(
                 }
         }
     }
-
-
 }

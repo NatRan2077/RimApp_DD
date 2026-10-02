@@ -2,7 +2,6 @@ package ru.rim.dd.feature.network
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -66,7 +65,6 @@ fun NetworkScreen(showObis: Boolean, viewModel: NetworkViewModel = hiltViewModel
         LaunchedEffect(refreshing) { if (refreshing) { kotlinx.coroutines.delay(900); refreshing = false } }
         ScreenHeader("Параметры сети", onRefresh = { refreshing = true; viewModel.refresh() }, refreshing = refreshing)
 
-        // ---- Фазы ----
         val phaseColors = listOf(RimPrimaryDeep, RimViolet, RimLilac)
         if (params.voltage.isThreePhase) {
             Row(Modifier.fillMaxWidth().padding(bottom = 20.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -87,32 +85,51 @@ fun NetworkScreen(showObis: Boolean, viewModel: NetworkViewModel = hiltViewModel
             }
         }
 
-        // ---- Мощность ----
         SectionLabel("Мощность")
         DataCard {
             PowerRow("Активная", formatNumber(params.power.total, 3), "кВт", "1.0.1.7.0.255", showObis)
-            Divider(Modifier.padding(vertical = 12.dp))
+            RowDivider()
             PowerRow("Реактивная", formatNumber(params.reactivePowerKvar ?: 0.0, 3), "квар", "1.0.3.7.0.255", showObis)
-            Divider(Modifier.padding(vertical = 12.dp))
+            RowDivider()
             PowerRow("Полная", formatNumber(params.apparentPowerKva ?: 0.0, 3), "кВА", "1.0.9.7.0.255", showObis)
         }
 
         Box(Modifier.padding(top = 4.dp))
-        // ---- Дополнительно ----
         SectionLabel("Дополнительно")
         DataCard {
             params.neutralCurrentA?.let {
                 ExtraRow("Ток нейтрали", "${formatNumber(it, 3)} А", "1.0.91.7.0.255", showObis)
-                Divider(Modifier.padding(vertical = 12.dp))
+                RowDivider()
+            }
+            // cos φ и линейные напряжения: строк нет, пока прибор не прислал значения.
+            params.cosPhi?.let { cp ->
+                ExtraRow("cos φ", formatNumber(cp.total, 3), "1.0.13.7.0.255", showObis)
+                RowDivider()
+                if (cp.isThreePhase) {
+                    ExtraRow("cos φ A / B / C", "${formatNumber(cp.l1 ?: 0.0, 3)} / ${formatNumber(cp.l2 ?: 0.0, 3)} / ${formatNumber(cp.l3 ?: 0.0, 3)}", "1.0.33/53/73.7.0.255", showObis)
+                    RowDivider()
+                }
+            }
+            params.lineVoltages?.let { lv ->
+                val codes = if (lv.legacyCodes) listOf("1.0.12.7.1.255", "1.0.12.7.2.255", "1.0.12.7.3.255")
+                else listOf("1.0.124.7.0.255", "1.0.125.7.0.255", "1.0.126.7.0.255")
+                lv.l12?.let {
+                    ExtraRow("Напряжение L1–L2", "${formatNumber(it, 1)} В", codes[0], showObis)
+                    RowDivider()
+                }
+                lv.l23?.let {
+                    ExtraRow("Напряжение L2–L3", "${formatNumber(it, 1)} В", codes[1], showObis)
+                    RowDivider()
+                }
+                lv.l13?.let {
+                    ExtraRow("Напряжение L1–L3", "${formatNumber(it, 1)} В", codes[2], showObis)
+                    RowDivider()
+                }
             }
             ExtraRow("Частота", "${formatNumber(params.frequencyHz ?: 0.0, 2)} Гц", "1.0.14.7.0.255", showObis)
-            Divider(Modifier.padding(vertical = 12.dp))
-            // Реле — статус
+            RowDivider()
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                Column {
-                    Text("Реле", color = p.textSecondary, fontSize = 19.sp)
-                    if (showObis) MonoText("0.0.96.3.10.255", color = RimPrimaryLight, fontSize = 15.sp, weight = FontWeight.Normal)
-                }
+                LabelWithObis("Реле", "0.0.96.3.10.255", showObis)
                 when {
                     relay.source == RelaySource.UNKNOWN -> StatusChip("НЕИЗВЕСТНО", p.textSecondary)
                     relay.isOn -> StatusChip("ВКЛЮЧЕНО", RimSuccess)
@@ -129,14 +146,17 @@ private fun phaseValue(pv: PhaseValues, index: Int): Double = when (index) {
     else -> pv.l3 ?: 0.0
 }
 
+private fun Modifier.accentCard(color: Color, dark: Boolean): Modifier = this
+    .clip(RoundedCornerShape(18.dp))
+    .background(Brush.linearGradient(listOf(color.copy(alpha = if (dark) 0.20f else 0.10f), color.copy(alpha = 0.04f))))
+    .border(1.5.dp, color.copy(alpha = 0.25f), RoundedCornerShape(18.dp))
+
 @Composable
 private fun PhaseCard(ph: String, voltage: Double, current: Double, color: Color, modifier: Modifier) {
     val p = RimTheme.palette
     Column(
         modifier = modifier
-            .clip(RoundedCornerShape(18.dp))
-            .background(Brush.linearGradient(listOf(color.copy(alpha = if (p.dark) 0.20f else 0.10f), color.copy(alpha = 0.04f))))
-            .border(1.5.dp, color.copy(alpha = 0.25f), RoundedCornerShape(18.dp))
+            .accentCard(color, p.dark)
             .padding(horizontal = 10.dp, vertical = 16.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(2.dp),
@@ -144,14 +164,14 @@ private fun PhaseCard(ph: String, voltage: Double, current: Double, color: Color
         Box(
             Modifier.size(28.dp).clip(CircleShape).background(color.copy(alpha = 0.15f)),
             contentAlignment = Alignment.Center,
-        ) { Text("~$ph", color = color, fontSize = 19.sp, fontWeight = FontWeight.ExtraBold) }
-        Text("Напр.", color = p.textSecondary, fontSize = 20.sp, modifier = Modifier.padding(top = 6.dp))
-        MonoText(formatNumber(voltage, 1), color = if (voltage in 0.001..50.0) RimError else p.textPrimary, fontSize = 27.sp)
-        Text("В", color = p.textFaint, fontSize = 20.sp)
+        ) { Text("~$ph", color = color, fontSize = 12.sp, fontWeight = FontWeight.ExtraBold) }
+        Text("Напр.", color = p.textSecondary, fontSize = 10.sp, modifier = Modifier.padding(top = 6.dp))
+        MonoText(formatNumber(voltage, 1), color = if (voltage in 0.001..50.0) RimError else p.textPrimary, fontSize = 15.sp)
+        Text("В", color = p.textFaint, fontSize = 9.sp)
         Divider(Modifier.padding(vertical = 6.dp))
-        Text("Ток", color = p.textSecondary, fontSize = 20.sp)
-        MonoText(formatNumber(current, 3), color = p.textPrimary, fontSize = 27.sp)
-        Text("А", color = p.textFaint, fontSize = 20.sp)
+        Text("Ток", color = p.textSecondary, fontSize = 10.sp)
+        MonoText(formatNumber(current, 3), color = p.textPrimary, fontSize = 14.sp)
+        Text("А", color = p.textFaint, fontSize = 9.sp)
     }
 }
 
@@ -160,9 +180,7 @@ private fun SingleMetric(label: String, value: String, unit: String, color: Colo
     val p = RimTheme.palette
     Column(
         modifier = modifier
-            .clip(RoundedCornerShape(18.dp))
-            .background(Brush.linearGradient(listOf(color.copy(alpha = if (p.dark) 0.20f else 0.10f), color.copy(alpha = 0.04f))))
-            .border(1.5.dp, color.copy(alpha = 0.25f), RoundedCornerShape(18.dp))
+            .accentCard(color, p.dark)
             .padding(16.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
@@ -173,15 +191,25 @@ private fun SingleMetric(label: String, value: String, unit: String, color: Colo
 }
 
 @Composable
+private fun RowDivider() {
+    Divider(Modifier.padding(vertical = 12.dp))
+}
+
+@Composable
+private fun LabelWithObis(label: String, obis: String, showObis: Boolean) {
+    Column {
+        Text(label, color = RimTheme.palette.textSecondary, fontSize = 14.sp)
+        if (showObis) MonoText(obis, color = RimPrimaryLight, fontSize = 10.sp, weight = FontWeight.Normal)
+    }
+}
+
+@Composable
 private fun PowerRow(label: String, value: String, unit: String, obis: String, showObis: Boolean) {
     val p = RimTheme.palette
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-        Column {
-            Text(label, color = p.textSecondary, fontSize = 19.sp)
-            if (showObis) MonoText(obis, color = RimPrimaryLight, fontSize = 15.sp, weight = FontWeight.Normal)
-        }
+        LabelWithObis(label, obis, showObis)
         Row(verticalAlignment = Alignment.Bottom) {
-            MonoText(value, color = p.textPrimary, fontSize = 23.sp)
+            MonoText(value, color = p.textPrimary, fontSize = 15.sp)
             Text(" $unit", color = p.textPrimary.copy(alpha = 0.5f), fontSize = 12.sp)
         }
     }
@@ -191,11 +219,8 @@ private fun PowerRow(label: String, value: String, unit: String, obis: String, s
 private fun ExtraRow(label: String, value: String, obis: String, showObis: Boolean) {
     val p = RimTheme.palette
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-        Column {
-            Text(label, color = p.textSecondary, fontSize = 19.sp)
-            if (showObis) MonoText(obis, color = RimPrimaryLight, fontSize = 15.sp, weight = FontWeight.Normal)
-        }
-        MonoText(value, color = p.textPrimary, fontSize = 23.sp)
+        LabelWithObis(label, obis, showObis)
+        MonoText(value, color = p.textPrimary, fontSize = 15.sp)
     }
 }
 

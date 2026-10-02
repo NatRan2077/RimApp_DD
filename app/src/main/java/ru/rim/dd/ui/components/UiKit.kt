@@ -12,7 +12,6 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -32,18 +31,12 @@ import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import ru.rim.dd.ui.theme.RimPrimary
 import ru.rim.dd.ui.theme.RimPrimaryLight
 import ru.rim.dd.ui.theme.RimTheme
-
-/**
- * [Android-патч] Переиспользуемые элементы дизайна из макета Figma: «стеклянные» и «плотные»
- * карточки, заголовки секций, подписи OBIS, тумблер, заголовок экрана с кнопкой обновления.
- * Все берут цвета из RimTheme.palette, поэтому одинаково работают в тёмной и светлой теме.
- */
 
 @Composable
 fun GlassCard(modifier: Modifier = Modifier, content: @Composable () -> Unit) {
@@ -83,18 +76,6 @@ fun SectionLabel(text: String, modifier: Modifier = Modifier) {
     )
 }
 
-/** Подпись OBIS-кода мелким моно-шрифтом — показывается только когда включён тумблер OBIS. */
-@Composable
-fun ObisLabel(code: String, modifier: Modifier = Modifier) {
-    Text(
-        text = code,
-        color = RimPrimaryLight.copy(alpha = 0.6f),
-        fontSize = 10.sp,
-        fontFamily = FontFamily.Monospace,
-        modifier = modifier.padding(start = 2.dp, bottom = 6.dp),
-    )
-}
-
 @Composable
 fun Divider(modifier: Modifier = Modifier) {
     val p = RimTheme.palette
@@ -102,7 +83,6 @@ fun Divider(modifier: Modifier = Modifier) {
         modifier
             .fillMaxWidth()
             .height(1.dp)
-            .padding(vertical = 0.dp)
             .background(p.border),
     )
 }
@@ -131,7 +111,7 @@ fun ToggleRow(
     }
 }
 
-/** Тумблер в стиле макета: фиолетовый градиент во включённом состоянии. */
+/** Тумблер: акцентный цвет трека во включённом состоянии. */
 @Composable
 fun Switchy(value: Boolean, onChange: (Boolean) -> Unit) {
     val p = RimTheme.palette
@@ -191,12 +171,12 @@ fun ScreenHeader(title: String, onRefresh: () -> Unit, refreshing: Boolean) {
     }
 }
 
-/** Число моноширинным шрифтом (напряжение, коды, время) — как var(--font-mono) в макете. */
+/** Число или код моноширинным шрифтом (напряжение, OBIS, время). */
 @Composable
 fun MonoText(
     text: String,
     color: Color,
-    fontSize: androidx.compose.ui.unit.TextUnit,
+    fontSize: TextUnit,
     modifier: Modifier = Modifier,
     weight: FontWeight = FontWeight.Bold,
 ) {
@@ -218,6 +198,3 @@ fun StatusChip(text: String, color: Color, modifier: Modifier = Modifier) {
         Text(text, color = color, fontSize = 12.sp, fontWeight = FontWeight.Bold)
     }
 }
-
-/** Внутренние отступы контента экрана под макет (сверху 20, по бокам 16, снизу — под навбар). */
-val ScreenContentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 20.dp, bottom = 24.dp)

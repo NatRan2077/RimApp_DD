@@ -8,6 +8,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import ru.rim.dd.core.model.ConnectionState
+import ru.rim.dd.core.model.MeterInfo
 import ru.rim.dd.core.model.Reading
 import ru.rim.dd.data.repository.MeterRepository
 import javax.inject.Inject
@@ -18,19 +19,13 @@ class SettingsViewModel @Inject constructor(
     private val repository: MeterRepository,
 ) : ViewModel() {
 
-    // [Android-патч] см. disconnect()/signalStrengthDbm() ниже — состояние связи нужно, чтобы
-    // не показывать кнопку «Отключиться» и уровень сигнала, когда соединения и так нет.
     val connectionState: StateFlow<ConnectionState> = repository.connectionState()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), ConnectionState.Idle)
 
-    // [Android-патч] см. MeterRepository.signalStrengthDbm() — обновляется тем же циклом
-    // автообновления, что и показания/сеть/пломбы, отдельного опроса не требует.
     val signalStrengthDbm: StateFlow<Int?> = repository.signalStrengthDbm()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
 
-    // [Android-патч] Для карточки соединения (перенос дизайна) — модель и серийник подключённого
-    // прибора.
-    val meterInfo: StateFlow<ru.rim.dd.core.model.MeterInfo?> = repository.meterInfo()
+    val meterInfo: StateFlow<MeterInfo?> = repository.meterInfo()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
 
     fun history(serialNumber: String): StateFlow<List<Reading>> =
@@ -41,10 +36,7 @@ class SettingsViewModel @Inject constructor(
         viewModelScope.launch { repository.forgetDevice(serialNumber) }
     }
 
-    /**
-     * [Android-патч] Кнопка «Отключиться» — закрывает BLE-сеанс, НЕ забывая прибор (в отличие
-     * от forgetDevice() выше). См. MeterRepository.disconnect().
-     */
+    /** Закрывает BLE-сеанс, не забывая прибор (в отличие от forgetDevice). */
     fun disconnect() {
         viewModelScope.launch { repository.disconnect() }
     }

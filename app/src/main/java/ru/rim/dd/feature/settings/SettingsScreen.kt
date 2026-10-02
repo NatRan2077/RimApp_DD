@@ -35,11 +35,6 @@ import ru.rim.dd.ui.theme.RimError
 import ru.rim.dd.ui.theme.RimIconGradient
 import ru.rim.dd.ui.theme.RimTheme
 
-/**
- * [Android-патч] Экран «Настройки» по макету Figma: карточка соединения с кнопкой «Отключиться»,
- * тумблеры «OBIS коды» и «Тёмная тема», ссылки раздела «Приложение», подпись версии.
- * Тумблеры управляют глобальными настройками ([showObis]/[dark] приходят из AppSettingsViewModel).
- */
 @Composable
 fun SettingsScreen(
     showObis: Boolean,
@@ -66,7 +61,6 @@ fun SettingsScreen(
             Text("Управление подключением и видом", color = p.textSecondary, fontSize = 13.sp, modifier = Modifier.padding(top = 3.dp))
         }
 
-        // ---- Соединение ----
         SectionLabel("Соединение")
         DataCard(noPad = true) {
             Row(
@@ -103,7 +97,6 @@ fun SettingsScreen(
         }
 
         Box(Modifier.padding(top = 4.dp))
-        // ---- Отображение ----
         SectionLabel("Отображение")
         DataCard(noPad = true) {
             ToggleRow("OBIS коды", "Показывать коды параметров", showObis, onShowObisChange)

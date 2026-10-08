@@ -1,5 +1,6 @@
 package ru.rim.dd.core.ble
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
@@ -10,6 +11,7 @@ import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.util.Log
+import androidx.annotation.RequiresPermission
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -348,6 +350,9 @@ private class MeterGattManager(
     private var rxCharacteristic: BluetoothGattCharacteristic? = null
     private var txCharacteristic: BluetoothGattCharacteristic? = null
 
+    /** Набор UUID, найденный на приборе; от него зависит, нужно ли сопряжение (см. initialize()). */
+    private var activeProfile: MeterUartProfile? = null
+
     /**
      * Входящие notify-кадры. Именно SharedFlow(replay=0) с большим буфером, а не StateFlow:
      * StateFlow отдаёт новому подписчику последний кадр прошлой сессии (после переподключения
@@ -418,6 +423,7 @@ private class MeterGattManager(
             }
             rxCharacteristic = rx
             txCharacteristic = tx
+            activeProfile = profile
             Log.i("MeterGattManager", "Профиль обмена: ${profile.label}")
             Log.d(
                 "MeterGattManager",
@@ -436,11 +442,22 @@ private class MeterGattManager(
         return false
     }
 
+    @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
     override fun initialize() {
         requestMtu(247)
             .done { mtu -> Log.d("MeterGattManager", "MTU согласован: $mtu") }
             .fail { _, status -> Log.w("MeterGattManager", "requestMtu не удался, status=$status (не критично — .split() всё равно спасёт большие записи)") }
             .enqueue()
+        if (activeProfile == GattUuids.PROFILE_ABF0) {
+            val alreadyBonded = bluetoothDevice?.bondState == BluetoothDevice.BOND_BONDED
+            Log.d("MeterGattManager", "AKROS: сопряжение, уже сопряжены=$alreadyBonded")
+            if (!alreadyBonded) {
+                createBond()
+                    .done { Log.d("MeterGattManager", "AKROS: сопряжение выполнено") }
+                    .fail { _, status -> Log.e("MeterGattManager", "AKROS: сопряжение не удалось, status=$status") }
+                    .enqueue()
+            }
+        }
         setNotificationCallback(txCharacteristic).with { _, data ->
             data.value?.let {
                 Log.d("MeterGattManager", "<< notify (${it.size} байт): ${it.toHex()}")
@@ -454,6 +471,7 @@ private class MeterGattManager(
             }
         }
         enableNotifications(txCharacteristic)
+            .before { Log.d("MeterGattManager", "Включаем notify на TX") }
             .done { Log.d("MeterGattManager", "Notifications на TX включены успешно") }
             .fail { _, status -> Log.e("MeterGattManager", "enableNotifications провалился, status=$status") }
             .enqueue()

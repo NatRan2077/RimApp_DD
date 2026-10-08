@@ -250,6 +250,13 @@ Java_ru_rim_dd_core_bridge_SpodesClientBridge_nativeGetRequestFlatAddress(
                                          static_cast<uint8_t>(srcAddress)) ? JNI_TRUE : JNI_FALSE;
 }
 
+extern "C" JNIEXPORT jboolean JNICALL
+Java_ru_rim_dd_core_bridge_SpodesClientBridge_nativeGetNextBlockRequestFlatAddress(
+        JNIEnv* /*env*/, jobject /*thiz*/, jlong handle, jint blockNumber) {
+    return AsClient(handle)->GetNextBlockRequestFlatAddress(static_cast<uint32_t>(blockNumber))
+           ? JNI_TRUE : JNI_FALSE;
+}
+
 JNIEXPORT jboolean JNICALL
 Java_ru_rim_dd_core_bridge_SpodesClientBridge_nativeActionRequestFlatAddress(
         JNIEnv* env, jobject /*thiz*/, jlong handle, jint classId, jstring obisCode,

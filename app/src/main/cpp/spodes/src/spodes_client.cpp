@@ -850,6 +850,15 @@ bool SpodesClient::GetRequestFlatAddress (const RequestParams &params, const uin
         return false;
     body.push_back(0); // без selective access, как в обычном GetRequest
 
+    return SendFlatInformationFrame(body, dest_address, src_address);
+}
+
+// Собирает I-кадр с «плоской» однобайтовой адресацией вокруг готового тела (LLC + APDU) и
+// отправляет его. Нумерация N(S)/N(R) — общая для всего соединения (как у пульта РиМ 040.40:
+// N(S) растёт после каждого I-кадра, N(R) обновляется по принятым ответам в ReadResponse()).
+bool SpodesClient::SendFlatInformationFrame (const std::vector<uint8_t> &body, const uint8_t &dest_address, const uint8_t &src_address)
+{
+    ServiceFunctions serv_funcs;
     uint8_t control_field = serv_funcs.CalculateControlField(send_sequence_number_, receive_sequence_number_, 1);
     std::vector<uint8_t> request = {0x7E, 0, 0, dest_address, src_address, control_field, 0, 0};
     request.insert(request.end(), body.begin(), body.end());
@@ -874,6 +883,21 @@ bool SpodesClient::GetRequestFlatAddress (const RequestParams &params, const uin
         return false;
     send_sequence_number_++;
     return true;
+}
+
+// Запрос следующего блока ответа (get-request-next: E6 E6 00 C0 02 <invoke> <номер блока:4>) с той
+// же «плоской» адресацией и тем же invoke-id, что и у исходного GET — так просит блоки пульт
+// (extractNumbBlock()/dlmsCosemFormingRequest() в прошивке 1.1.6). block_number — номер
+// последнего ПОЛУЧЕННОГО блока. Адреса берутся из последнего GetRequestFlatAddress().
+bool SpodesClient::GetNextBlockRequestFlatAddress (const uint32_t &block_number)
+{
+    uint8_t invoke_id_and_priority = flat_invoke_id_ | (1 << 7);
+    std::vector<uint8_t> body = {0xE6, 0xE6, 0, 0xC0, 0x02, invoke_id_and_priority,
+                                 static_cast<uint8_t>((block_number >> 24) & 0xFF),
+                                 static_cast<uint8_t>((block_number >> 16) & 0xFF),
+                                 static_cast<uint8_t>((block_number >> 8) & 0xFF),
+                                 static_cast<uint8_t>(block_number & 0xFF)};
+    return SendFlatInformationFrame(body, flat_dest_address_, flat_src_address_);
 }
 
 // [Android-патч] см. ActionRequestFlatAddress() в spodes_client.h — тот же принцип сборки

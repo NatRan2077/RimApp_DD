@@ -38,8 +38,8 @@ import ru.rim.dd.core.dlms.kiloUnitLabelOf
 import ru.rim.dd.core.dlms.longOrBoolValueOf
 import ru.rim.dd.core.dlms.parseActionResponseResult
 import ru.rim.dd.core.dlms.parseGetResponseBlock
-import ru.rim.dd.core.dlms.parseGetResponseTariffs
 import ru.rim.dd.core.dlms.parseGetResponseValue
+import ru.rim.dd.core.dlms.readingsOf
 import ru.rim.dd.core.dlms.scalerUnitOf
 import ru.rim.dd.core.dlms.textValueOf
 import ru.rim.dd.core.dlms.unitLabelOf
@@ -61,6 +61,7 @@ import ru.rim.dd.data.local.DeviceStore
 import ru.rim.dd.data.local.ReadingDao
 import java.io.ByteArrayOutputStream
 import java.time.Instant
+import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.LocalTime
 import javax.inject.Inject
@@ -96,21 +97,24 @@ class MeterRepositoryImpl @Inject constructor(
      */
     private var meterReportedSerial: String? = null
 
-    /**
-     * Диалект подключённого прибора. Определяется по имени один раз при подключении:
-     * после разрыва сеанс должен пересобираться тем же способом, иначе AKROS вернётся
-     * без ассоциации и перестанет отдавать данные.
-     */
-    private var activeProfile: MeterProtocolProfile = MeterProtocolProfile.RIM_FLAT
+    /** AKROS определяется по BLE-имени один раз при подключении; для РиМ всегда false. */
+    private var isAkros = false
 
     /**
-     * Колонки буфера AKROS в порядке следования значений (см. [readAkrosCaptureObjects]);
-     * null — OBIS колонки не разобран, её значение пропускается без сдвига остальных.
-     * Состав буфера зависит от прибора, поэтому очищается при каждом подключении.
+     * true — AKROS читается запасным путём (SNRM + AARQ «Reader», компактный буфер); false —
+     * путь пульта без ассоциации. Выбирается при подключении: сначала путь пульта, при отсутствии
+     * ответа — ассоциация (см. [establishSessionAndReadFirst]); после разрыва сеанс
+     * пересобирается тем же способом.
+     */
+    private var akrosAssociation = false
+
+    /**
+     * Колонки компактного буфера AKROS (только при [akrosAssociation]): значения идут подряд без
+     * OBIS, смысл колонок читается из capture_objects. null — колонка не разобрана и пропускается.
      */
     private var akrosCaptureObis: List<CaptureColumn?> = emptyList()
 
-    /** Единицы измерения колонок буфера AKROS по OBIS (см. [readAkrosScalerUnits]). */
+    /** Единицы измерения колонок компактного буфера AKROS по OBIS (атрибут scaler_unit). */
     private var akrosScalerUnits: Map<String, ScalerUnit> = emptyMap()
 
     private val repositoryScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -156,7 +160,7 @@ class MeterRepositoryImpl @Inject constructor(
     private var consecutiveForceReconnectsWithoutData = 0
 
     init {
-        // GATT переподключает сам Android (autoConnect); здесь только протокольная часть:
+        // GATT переподключает MeterBleClient (свой цикл); здесь только протокольная часть:
         // при обрыве останавливаем обмен, при восстановлении пересобираем DLMS-сеанс.
         repositoryScope.launch {
             ble.unexpectedDisconnects.collect {
@@ -248,18 +252,58 @@ class MeterRepositoryImpl @Inject constructor(
         startAutoRefresh()
     }
 
-    /** Общая часть подключения: профиль, нативный клиент, HDLC-канал и первое чтение буфера. */
+    /**
+     * Общая часть подключения: нативный клиент, сеанс и первое чтение буфера. Основной путь — как
+     * у штатного пульта: без SNRM и ассоциации сразу I-кадры с GET «плоской» адресацией; нумерацию
+     * N(S)/N(R) ведёт нативный клиент. Для AKROS есть запасной путь, см. [establishSessionAndReadFirst].
+     */
     private suspend fun openProtocolSession(deviceName: String?) {
-        activeProfile = MeterProtocolProfile.forDeviceName(deviceName)
-        Log.i(TAG, "Профиль обмена для \"$deviceName\": $activeProfile")
+        isAkros = MeterProtocolProfile.forDeviceName(deviceName) == MeterProtocolProfile.AKROS_STANDARD
+        akrosAssociation = false
+        Log.i(TAG, "Обмен с \"$deviceName\": ${if (isAkros) "AKROS" else "РиМ"}")
         spodes.createClient()
         startTransportPump()
-        withContext(Dispatchers.IO) { establishHdlcChannel() }
-        if (!readMainBuffer()) {
+        if (!establishSessionAndReadFirst()) {
             stopTransportPump()
             ble.disconnect()
             throw IllegalStateException(lastProtocolError ?: "неизвестная ошибка")
         }
+    }
+
+    /**
+     * Сеанс и первое чтение буфера (клиент создан, «насос» запущен). РиМ и AKROS читаются путём
+     * пульта. Если AKROS на него не ответил (пустой ответ или нечитаемый буфер), клиент
+     * пересоздаётся и AKROS читается через ассоциацию — этот путь проверен на реальном приборе.
+     * Выбранный путь запоминается в [akrosAssociation], после обрыва связи используется он же.
+     * Бросает исключение (через [abortSession]), если ассоциация не установилась.
+     */
+    private suspend fun establishSessionAndReadFirst(): Boolean {
+        if (isAkros && akrosAssociation) {
+            withContext(Dispatchers.IO) { establishAkrosSession() }
+            return readMainBuffer()
+        }
+        consecutiveEmptyOrFailedReads = 0
+        val ok = readMainBuffer()
+        if (!isAkros || (ok && consecutiveEmptyOrFailedReads == 0)) return ok
+
+        Log.w(TAG, "AKROS не ответил на запрос без ассоциации ($lastProtocolError) — пробуем ассоциацию (SNRM + AARQ)")
+        // Насос останавливаем до destroyClient(): иначе входящий пакет попал бы в уничтоженный клиент.
+        // Пока он остановлен, запоздавшие ответы на прежние кадры отбрасываются.
+        stopTransportPump()
+        delay(AKROS_FALLBACK_SETTLE_DELAY_MS)
+        protocolMutex.withLock {
+            withContext(Dispatchers.IO) {
+                spodes.destroyClient()
+                spodes.createClient()
+            }
+        }
+        startTransportPump()
+        withContext(Dispatchers.IO) { establishAkrosSession() }
+        akrosAssociation = true
+        consecutiveEmptyOrFailedReads = 0
+        val fallbackOk = readMainBuffer()
+        if (!fallbackOk || consecutiveEmptyOrFailedReads > 0) akrosAssociation = false
+        return fallbackOk
     }
 
     /** Закрывает транспорт и бросает исключение — для сбоев при установлении сеанса. */
@@ -296,19 +340,21 @@ class MeterRepositoryImpl @Inject constructor(
      * GET буфера индикации 0.0.21.0.2.255 (класс 7, атрибут 2) и разбор ответа в StateFlow'ы.
      * Общий код для первого чтения, автообновления и кнопки «Обновить».
      *
-     * У РиМ запрос идёт «плоской» адресацией (dest 0x03 / src 0x43, invoke-id 0x81, как у
-     * штатного пульта) — библиотека умеет её только через getRequestFlatAddress(). У AKROS
-     * адреса стандартные и уже сохранены в клиенте после SNRM, поэтому обычный getRequest().
+     * Основной путь — механизм штатного пульта (прошивка РиМ 040.40), одинаковый для РиМ и AKROS:
+     * «плоская» адресация (dest 0x03 / src 0x43), без SNRM и ассоциации; HDLC-сегменты ответа
+     * дочитывает нативный клиент (RR-кадры), DLMS-блоки — [assembleDlmsValue]; склеенное значение
+     * разбирается [readingsOf]. Запасной путь AKROS ([akrosAssociation]) — стандартная адресация
+     * и компактный буфер.
      *
      * Возвращает false, только если запрос не удалось отправить. Пустой ответ и ошибка разбора
      * считаются неудачей в [consecutiveEmptyOrFailedReads], но связь не рвут.
      */
     private fun readAndApplyMainBuffer(): Boolean {
-        val sent = if (activeProfile == MeterProtocolProfile.AKROS_STANDARD) {
-            Log.d(TAG, "GET-request буфера AKROS")
+        val sent = if (akrosAssociation) {
+            Log.d(TAG, "GET буфера AKROS (стандартная адресация, после ассоциации)")
             spodes.getRequest(MAIN_BUFFER_CLASS_ID, MAIN_BUFFER_OBIS, attributeId = 2)
         } else {
-            Log.d(TAG, "GET-request через GetRequestFlatAddress (плоская адресация, invoke-id=0x81, как у пульта)")
+            Log.d(TAG, "GET буфера индикации (плоская адресация, как у пульта)")
             spodes.getRequestFlatAddress(
                 classId = MAIN_BUFFER_CLASS_ID,
                 obisCode = MAIN_BUFFER_OBIS,
@@ -333,19 +379,24 @@ class MeterRepositoryImpl @Inject constructor(
         // Именно ответ транспорта — надёжный признак, что сеанс реально поднялся.
         protocolSessionEstablished = true
         try {
-            val all = if (activeProfile == MeterProtocolProfile.AKROS_STANDARD) {
-                // Буфер AKROS приходит блоками; дочитываем сразу, пока канал не занят «хвостом»
-                // этого ответа, иначе следующий запрос разъедется с ним.
-                val buffer = assembleDlmsValue(raw, "буфер индикации")
+            // Блоки дочитываем сразу, пока канал не занят «хвостом» этого ответа, иначе
+            // следующий запрос разъедется с ним.
+            val buffer = assembleDlmsValue(raw, "буфер индикации", flat = !akrosAssociation)
+            if (buffer == null) {
+                consecutiveEmptyOrFailedReads++
+                Log.w(TAG, "GET-response: буфер не получен (подряд неудач: $consecutiveEmptyOrFailedReads)")
+                return true
+            }
+            val all = if (akrosAssociation) {
                 if (akrosCaptureObis.isEmpty()) {
                     // Без описания колонок значения не с чем сопоставить; этот цикл потерян,
                     // следующее автообновление разберёт буфер полностью.
                     Log.w(TAG, "AKROS: описания буфера ещё нет — запрашиваем capture_objects повторно")
                     readAkrosCaptureObjects()
                 }
-                buffer?.let { compactReadingsOf(it, akrosCaptureObis, akrosScalerUnits) } ?: emptyList()
+                compactReadingsOf(buffer, akrosCaptureObis, akrosScalerUnits)
             } else {
-                parseGetResponseTariffs(raw)
+                readingsOf(buffer)
             }
             Log.d(TAG, "GET-response: разобрано ${all.size} элементов буфера: $all")
             applyDecodedBuffer(all)
@@ -570,6 +621,26 @@ class MeterRepositoryImpl @Inject constructor(
         )
     }
 
+    /** Разобранный date-time (12 байт) объекта часов 0.0.1.0.0.255; любая часть может быть null. */
+    private class ClockFields(val date: LocalDate?, val time: LocalTime?, val status: Int?)
+
+    /**
+     * date-time объекта часов 0.0.1.0.0.255 (12 байт): год(2), месяц, день, день недели, часы,
+     * минуты, секунды, сотые, отклонение(2), статус. Год 0xFFFF — «не задан» (как в прошивке
+     * пульта) — такие часы пропускаются; статус 0xFF — «не указан». Дату читает [decodeCosemDate]
+     * (байты 0–4), время — [decodeCosemTime] (байты 5–8).
+     */
+    private fun clockFieldsOf(bytes: ByteArray?): ClockFields? {
+        if (bytes == null || bytes.size != 12) return null
+        if (bytes[0] == 0xFF.toByte() && bytes[1] == 0xFF.toByte()) return null
+        val status = (bytes[11].toInt() and 0xFF).takeIf { it != 0xFF }
+        return ClockFields(
+            date = decodeCosemDate(bytes.copyOfRange(0, 5)),
+            time = decodeCosemTime(bytes.copyOfRange(5, 9)),
+            status = status,
+        )
+    }
+
     /**
      * Сведения о приборе. Поля, не пришедшие в этом цикле, сохраняют прежнее значение;
      * OBIS-подпись хранится вместе со значением, чтобы не отвязаться от источника.
@@ -578,13 +649,26 @@ class MeterRepositoryImpl @Inject constructor(
         val temperatureC = all.byObis("0.0.96.9.0.255")?.value
         val backupVoltageV = all.byObis("0.0.96.6.3.255")?.value
 
-        val dateBytes = all.byObis("0.0.0.9.2.255")?.octetValue
-        val timeBytes = all.byObis("0.0.0.9.1.255")?.octetValue
-        val deviceClock = if (dateBytes != null && timeBytes != null) {
-            val date = decodeCosemDate(dateBytes)
-            val time = decodeCosemTime(timeBytes)
-            if (date != null && time != null) LocalDateTime.of(date, time) else null
-        } else null
+        // Дата и время прибора. Одни приборы присылают их отдельными объектами (0.0.0.9.2.255 дата,
+        // 0.0.0.9.1.255 время — иногда только один из двух), современные — одним объектом часов
+        // 0.0.1.0.0.255. Каждая часть берётся независимо: отдельный объект приоритетнее (как в
+        // прошивке пульта), недостающая часть добирается из часов 0.0.1.0.0.255. OBIS-источник
+        // запоминается для подписи на экране.
+        val separateDate = all.byObis(DATE_OBIS)?.octetValue?.let { decodeCosemDate(it) }
+        val separateTime = all.byObis(TIME_OBIS)?.octetValue?.let { decodeCosemTime(it) }
+        val clock = clockFieldsOf(all.firstOrNull { it.obisCode == CLOCK_STATUS_OBIS && it.octetValue != null }?.octetValue)
+        val deviceDate = separateDate ?: clock?.date
+        val deviceDateObis = when {
+            separateDate != null -> DATE_OBIS
+            clock?.date != null -> CLOCK_STATUS_OBIS
+            else -> null
+        }
+        val deviceTime = separateTime ?: clock?.time
+        val deviceTimeObis = when {
+            separateTime != null -> TIME_OBIS
+            clock?.time != null -> CLOCK_STATUS_OBIS
+            else -> null
+        }
 
         // Состав буфера зависит от модели; текстовые поля логируем, чтобы версию ПО под
         // незнакомым OBIS было видно сразу.
@@ -607,7 +691,11 @@ class MeterRepositoryImpl @Inject constructor(
         if (serialFromBuffer != null) meterReportedSerial = serialFromBuffer
 
         val currentTariff = all.byObis(CURRENT_TARIFF_OBIS)?.rawValue?.toInt()
-        val clockValid = all.byObis(CLOCK_STATUS_OBIS)?.rawValue?.let { isClockStatusValid(it) }
+        // Тот же OBIS у AKROS несёт ещё и сами часы (octetValue != null) — статус только у позиционного поля.
+        // Достоверность часов: статус часов (позиционное поле буфера) либо, если его нет, байт статуса
+        // из date-time объекта 0.0.1.0.0.255.
+        val clockValid = (all.firstOrNull { it.obisCode == CLOCK_STATUS_OBIS && it.octetValue == null }?.rawValue
+            ?: clock?.status?.toLong())?.let { isClockStatusValid(it) }
 
         // Раскладка «как в прошивке пульта»: направление энергии — байт 3 поля «Значки ДД»,
         // статус фаз — отдельное позиционное поле.
@@ -617,20 +705,22 @@ class MeterRepositoryImpl @Inject constructor(
             Log.d(TAG, "Буфер: статус фаз ($DD_PHASE_DISPLAY_OBIS) = $phaseStatus, направление энергии = $energyDirection")
         }
 
-        val rdchDate = all.byObis("0.0.0.9.2.101")?.octetValue?.let { decodeCosemDate(it) }
-        val rdchTime = all.byObis("0.0.0.9.1.101")?.octetValue?.let { decodeCosemTime(it) }
-        val rdchDateTime = rdchDate?.let { LocalDateTime.of(it, rdchTime ?: LocalTime.MIDNIGHT) }
+//        val rdchDate = all.byObis("0.0.0.9.2.101")?.octetValue?.let { decodeCosemDate(it) }
+ //       val rdchTime = all.byObis("0.0.0.9.1.101")?.octetValue?.let { decodeCosemTime(it) }
+//        val rdchDateTime = rdchDate?.let { LocalDateTime.of(it, rdchTime ?: LocalTime.MIDNIGHT) }
 
-        val hdlcP1 = all.byObis(HDLC_P1_OBIS)?.rawValue
-        val hdlcP2 = all.byObis(HDLC_P2_OBIS)?.rawValue
+        val hdlcP1 = all.byObis(HDLC_P1_OBIS)?.let { describeHdlcSetup(it) }
+        val hdlcP2 = all.byObis(HDLC_P2_OBIS)?.let { describeHdlcSetup(it) }
+        val hdlcP3 = all.byObis(HDLC_P3_OBIS)?.let { describeHdlcSetup(it) }
+        val hdlcP4 = all.byObis(HDLC_P4_OBIS)?.let { describeHdlcSetup(it) }
         val operatingTimeReading = all.byObis(OPERATING_TIME_OBIS)
         val operatingTime = operatingTimeReading?.value
         val operatingTimeUnit = unitLabelOf(operatingTimeReading?.unit)
 
-        if (temperatureC == null && backupVoltageV == null && deviceClock == null && firmwareVersion == null &&
+        if (temperatureC == null && backupVoltageV == null && deviceDate == null && deviceTime == null && firmwareVersion == null &&
             modelName == null && currentTariff == null && clockValid == null && serialFromBuffer == null &&
-            hdlcP1 == null && hdlcP2 == null && operatingTime == null &&
-            rdchDateTime == null && phaseStatus == null && energyDirection == null
+            hdlcP1 == null && hdlcP2 == null && hdlcP3 == null && hdlcP4 == null && operatingTime == null
+//            rdchDateTime == null && phaseStatus == null && energyDirection == null
         ) return
 
         val prev = _meterInfo.value
@@ -640,7 +730,10 @@ class MeterRepositoryImpl @Inject constructor(
             serialNumber = serialFromBuffer ?: activeSerialNumber ?: prev?.serialNumber ?: "—",
             temperatureC = temperatureC,
             backupVoltageV = backupVoltageV,
-            deviceClock = deviceClock,
+            deviceDate = deviceDate,
+            deviceDateObis = deviceDateObis,
+            deviceTime = deviceTime,
+            deviceTimeObis = deviceTimeObis,
             lastSeenAt = Instant.now(),
             firmwareVersion = firmwareVersion ?: prev?.firmwareVersion ?: "—",
             currentTariff = currentTariff ?: prev?.currentTariff,
@@ -650,36 +743,62 @@ class MeterRepositoryImpl @Inject constructor(
             serialNumberObis = if (serialFromBuffer != null) SERIAL_NUMBER_OBIS else prev?.serialNumberObis,
             hdlcP1 = hdlcP1 ?: prev?.hdlcP1,
             hdlcP2 = hdlcP2 ?: prev?.hdlcP2,
+            hdlcP3 = hdlcP3 ?: prev?.hdlcP3,
+            hdlcP4 = hdlcP4 ?: prev?.hdlcP4,
             operatingTime = operatingTime ?: prev?.operatingTime,
             operatingTimeUnit = operatingTimeUnit ?: prev?.operatingTimeUnit,
-            rdchDateTime = rdchDateTime ?: prev?.rdchDateTime,
+//            rdchDateTime = rdchDateTime ?: prev?.rdchDateTime,
             phaseStatus = phaseStatus ?: prev?.phaseStatus,
             energyDirection = energyDirection ?: prev?.energyDirection,
         )
     }
 
     /**
-     * РиМ не отвечает на SNRM и не использует ассоциацию: пульт сразу шлёт I-кадры с GET.
-     * SNRM отправляем без ожидания UA — оно гарантированно упиралось в 3-секундный таймаут
-     * транспорта на каждом подключении. Рабочий путь строит HDLC-заголовки сам (*FlatAddress),
-     * connection_addr_ из SetNormalResponseMode ему не нужен.
-     *
-     * sourceAddress=16 — единственное значение, которое пропускает библиотека (16/32/48);
-     * logical/physical=1 — как в реальных кадрах.
+     * Текст для объекта HDLC-настройки (класс 23): скорость (enum атрибута 2) и адрес устройства
+     * (атрибут 8). Формат значения в буфере у разных приборов может отличаться, поэтому разбор
+     * терпимый: Structure → enum как скорость, число как адрес; OctetString → hex; иначе число.
+     * Сырое значение пишется в лог, чтобы можно было уточнить раскладку по реальному ответу.
      */
-    private fun establishHdlcChannel() {
-        if (activeProfile == MeterProtocolProfile.AKROS_STANDARD) {
-            establishAkrosSession()
-            return
+    private fun describeHdlcSetup(r: ObisReading): String {
+        val items = r.structItems
+        val text = when {
+            // Раскладка буфера: [speed, window_tx, window_rx, max_info_tx, max_info_rx,
+            // inter_octet_timeout, inactivity_timeout, device_address].
+            items != null && items.size >= 8 && items.first() is DlmsValue.EnumVal -> {
+                val speed = hdlcSpeedLabel((items.first() as DlmsValue.EnumVal).value)
+                val address = when (val last = items.last()) {
+                    is DlmsValue.U16 -> last.value.toLong()
+                    is DlmsValue.U32 -> last.value
+                    is DlmsValue.U8 -> last.value.toLong()
+                    else -> null
+                }
+                if (address != null) "$speed, адрес $address" else speed
+            }
+            items != null -> items.joinToString(", ") { describeDlmsValue(it) }
+            r.textValue != null -> r.textValue
+            r.octetValue != null -> r.octetValue.joinToString(" ") { "%02X".format(it.toInt() and 0xFF) }
+            else -> r.rawValue.toString()
         }
-        Log.d(TAG, "SNRM: отправляем (source=$HDLC_SOURCE_ADDRESS, logical=$HDLC_LOGICAL_ADDRESS, physical=$HDLC_PHYSICAL_ADDRESS)")
-        val snrmOk = spodes.setNormalResponseMode(
-            sourceAddress = HDLC_SOURCE_ADDRESS,
-            logicalAddress = HDLC_LOGICAL_ADDRESS,
-            physicalAddress = HDLC_PHYSICAL_ADDRESS,
-        )
-        Log.d(TAG, "SNRM: setNormalResponseMode вернул $snrmOk")
-        if (!snrmOk) abortSession("Не удалось сформировать SNRM-кадр: ${spodes.lastErrorMessage()}")
+        Log.d(TAG, "HDLC ${r.obisCode}: атрибуты=${items?.joinToString(prefix = "[", postfix = "]") { describeDlmsValue(it) } ?: "raw=${r.rawValue}"} → \"$text\"")
+        return text
+    }
+
+    /** Значение enum comm_speed из IEC HDLC setup (IEC 62056-6-2, класс 23) в бодах. */
+    private fun hdlcSpeedLabel(code: Int): String {
+        val baud = when (code) {
+            0 -> 300
+            1 -> 600
+            2 -> 1200
+            3 -> 2400
+            4 -> 4800
+            5 -> 9600
+            6 -> 19200
+            7 -> 38400
+            8 -> 57600
+            9 -> 115200
+            else -> return "скорость код $code"
+        }
+        return "$baud скорость"
     }
 
     /**
@@ -738,37 +857,47 @@ class MeterRepositoryImpl @Inject constructor(
             Log.w(TAG, "AKROS: пустой ответ на $label (${spodes.lastErrorMessage()})")
             return null
         }
-        return assembleDlmsValue(first, label)
+        return assembleDlmsValue(first, label, flat = false)
     }
 
     /**
-     * Склейка блоков для случая, когда первый кадр уже прочитан вызывающим кодом.
+     * Склейка DLMS-блоков ответа, когда первый кадр уже прочитан вызывающим кодом: прибор
+     * (AKROS ограничивает информационное поле 128 байтами) отвечает «C4 02» — блок с флагом
+     * последнего блока вместо «C4 01». Следующий блок запрашивается get-request-next с номером
+     * последнего полученного блока: при [flat] — как у пульта, плоской адресацией, иначе — стандартной
+     * (запасной путь AKROS). Обычный (не блочный) ответ проходит насквозь.
+     *
      * Неполный ответ не разбираем: обрывок декодировался бы «успешно», но в неверные значения.
      * [MAX_DLMS_BLOCKS] защищает от бесконечного обмена, если прибор перестанет ставить флаг
      * последнего блока.
      */
-    private fun assembleDlmsValue(first: ByteArray, label: String): DlmsValue? {
+    private fun assembleDlmsValue(first: ByteArray, label: String, flat: Boolean): DlmsValue? {
         var block = parseGetResponseBlock(first)
             ?: return runCatching { parseGetResponseValue(first) }
-                .onFailure { Log.w(TAG, "AKROS: ответ на $label не разобран: ${it.message}") }
+                .onFailure { Log.w(TAG, "Ответ на $label не разобран: ${it.message}") }
                 .getOrNull()
 
         val data = ByteArrayOutputStream()
         data.write(block.data)
         var blocks = 1
         while (!block.lastBlock && blocks < MAX_DLMS_BLOCKS) {
-            if (!spodes.sendReadyToReceive(block.blockNumber)) {
-                Log.w(TAG, "AKROS: запрос блока ${block.blockNumber + 1} ($label) не ушёл: ${spodes.lastErrorMessage()}")
+            val requested = if (flat) {
+                spodes.getNextBlockRequestFlatAddress(block.blockNumber)
+            } else {
+                spodes.sendReadyToReceive(block.blockNumber)
+            }
+            if (!requested) {
+                Log.w(TAG, "Запрос блока ${block.blockNumber + 1} ($label) не ушёл: ${spodes.lastErrorMessage()}")
                 break
             }
             val raw = spodes.getResponseRawBytes()
             if (raw.isEmpty()) {
-                Log.w(TAG, "AKROS: пустой ответ на блок ${block.blockNumber + 1} ($label) (${spodes.lastErrorMessage()})")
+                Log.w(TAG, "Пустой ответ на блок ${block.blockNumber + 1} ($label) (${spodes.lastErrorMessage()})")
                 break
             }
             val next = parseGetResponseBlock(raw)
             if (next == null) {
-                Log.w(TAG, "AKROS: блок ${block.blockNumber + 1} ($label) пришёл в неожиданном формате")
+                Log.w(TAG, "Блок ${block.blockNumber + 1} ($label) пришёл в неожиданном формате")
                 break
             }
             data.write(next.data)
@@ -777,13 +906,13 @@ class MeterRepositoryImpl @Inject constructor(
         }
 
         if (!block.lastBlock) {
-            Log.w(TAG, "AKROS: $label получен не полностью — оборвались на блоке ${block.blockNumber} из $blocks")
+            Log.w(TAG, "$label получен не полностью — оборвались на блоке ${block.blockNumber} из $blocks")
             return null
         }
         val bytes = data.toByteArray()
-        Log.d(TAG, "AKROS: $label собран из $blocks блок(ов), ${bytes.size} байт данных")
+        Log.d(TAG, "$label собран из $blocks блок(ов), ${bytes.size} байт данных")
         return runCatching { decodeDlmsValue(bytes) }
-            .onFailure { Log.w(TAG, "AKROS: $label не разобран после склейки блоков: ${it.message}") }
+            .onFailure { Log.w(TAG, "$label не разобран после склейки блоков: ${it.message}") }
             .getOrNull()
     }
 
@@ -923,7 +1052,7 @@ class MeterRepositoryImpl @Inject constructor(
      * же, что при первом подключении, но без поиска устройства и разбора имени.
      *
      * Пауза перед началом нужна счётчику: после резкого обрыва HDLC-сессии он ещё не готов
-     * принять новый SNRM, и первый GET почти гарантированно проваливался.
+     * принять первый кадр новой сессии, и первый GET почти гарантированно проваливался.
      * Клиент уничтожается под [protocolMutex] — иначе destroyClient() обнулил бы handle под
      * выполняющимся чтением (см. [lastProtocolError]).
      *
@@ -942,8 +1071,7 @@ class MeterRepositoryImpl @Inject constructor(
                     }
                 }
                 startTransportPump()
-                withContext(Dispatchers.IO) { establishHdlcChannel() }
-                val connected = readMainBuffer()
+                val connected = establishSessionAndReadFirst()
                 startAutoRefresh()
                 if (connected) {
                     Log.d(TAG, "Протокольный сеанс восстановлен после автопереподключения")
@@ -1086,18 +1214,14 @@ class MeterRepositoryImpl @Inject constructor(
         meterReportedSerial = null
         protocolSessionEstablished = false
         consecutiveEmptyOrFailedReads = 0
+        isAkros = false
+        akrosAssociation = false
     }
 
     companion object {
         private const val TAG = "MeterRepository"
 
-        // РиМ: sourceAddress=16 — единственное значение, которое пропускает библиотека;
-        // logical/physical=1 — как в реальных кадрах обмена.
-        private const val HDLC_SOURCE_ADDRESS = 16
-        private const val HDLC_LOGICAL_ADDRESS = 1
-        private const val HDLC_PHYSICAL_ADDRESS = 1
-
-        // «Плоская» однобайтовая адресация РиМ, подтверждённая на реальном приборе.
+        // «Плоская» однобайтовая адресация штатного пульта (HDLC_DEST_ADDR/HDLC_SRC_ADDR в прошивке).
         private const val FLAT_DEST_ADDRESS = 0x03
         private const val FLAT_SRC_ADDRESS = 0x43
 
@@ -1117,9 +1241,6 @@ class MeterRepositoryImpl @Inject constructor(
         private const val MAIN_BUFFER_OBIS = "0.0.21.0.2.255"
         private const val MAIN_BUFFER_CLASS_ID = 7
 
-        /** Атрибут 3 Profile Generic — capture_objects. */
-        private const val PROFILE_CAPTURE_OBJECTS_ATTRIBUTE = 3
-
         /** Disconnect Control — размыкатель (OBIS из паспорта прибора). */
         private const val DISCONNECT_CONTROL_OBIS = "0.0.96.3.10.255"
         private const val DISCONNECT_CONTROL_CLASS_ID = 70
@@ -1135,10 +1256,22 @@ class MeterRepositoryImpl @Inject constructor(
 
         private const val SERIAL_NUMBER_OBIS = "0.0.96.1.0.255"
 
+        /** Дата и время отдельными объектами (у одних приборов оба, у других один, у новых — ни одного). */
+        private const val DATE_OBIS = "0.0.0.9.2.255"
+        private const val TIME_OBIS = "0.0.0.9.1.255"
+
         // Индикаторы экрана «Показания».
         private const val HDLC_P1_OBIS = "0.0.22.0.0.255"
         private const val HDLC_P2_OBIS = "0.1.22.0.0.255"
+        private const val HDLC_P3_OBIS = "0.2.22.0.0.255"
+        private const val HDLC_P4_OBIS = "0.3.22.0.0.255"
         private const val OPERATING_TIME_OBIS = "0.0.96.8.0.255"
+
+        /** Пауза между попыткой без ассоциации и ассоциацией AKROS, чтобы запоздавшие ответы не попали в новый сеанс. */
+        private const val AKROS_FALLBACK_SETTLE_DELAY_MS = 300L
+
+        /** Атрибут 3 Profile Generic — capture_objects. */
+        private const val PROFILE_CAPTURE_OBJECTS_ATTRIBUTE = 3
 
         /** Предел числа блоков одного ответа; самый длинный нужный ответ укладывается в три. */
         private const val MAX_DLMS_BLOCKS = 32

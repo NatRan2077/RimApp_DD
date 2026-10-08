@@ -21,10 +21,15 @@ data class ObisReading(
      */
     val textValue: String? = null,
     /**
-     * Вместо rawValue/scaler для значения, пришедшего готовым float (теги 0x17/0x18, без пары
-     * {scaler, unit}) — так отдаёт AKROS. Хранится как есть, [value] отдаёт ему предпочтение.
+     * Вместо rawValue/scaler для значения, пришедшего float (теги 0x17/0x18) — так отдаёт AKROS.
+     * Множитель scaler_unit уже применён, [value] отдаёт этому полю предпочтение.
      */
     val floatValue: Double? = null,
+    /**
+     * Атрибуты объекта HDLC-настройки (0.x.22.0.0.255) после OBIS: скорость (Enum), окна, размеры
+     * кадров, таймауты, адрес устройства (последний элемент).
+     */
+    val structItems: List<DlmsValue>? = null,
 ) {
     /** rawValue * 10^scaler — значение в базовой единице (Вт, В, А, Гц, °C, Вт·ч, вар·ч...). */
     val value: Double get() = floatValue ?: (rawValue * Math.pow(10.0, scaler.toDouble()))
@@ -204,14 +209,13 @@ fun decodeCosemTime(bytes: ByteArray): LocalTime? {
 }
 
 /**
- * Разбирает «сырой» HDLC-кадр GET-response в список показаний. Значение — массив/структура
- * из повторяющихся троек {OctetString(6) OBIS, число, Structure(2){Integer scaler, Enum unit}},
- * по одной на тариф.
- *
- * @throws DlmsDecodeException если LLC-заголовок не найден или разбор данных не удался.
+ * Раскладывает значение буфера индикации (одно или склеенное из блоков) в список показаний.
+ * Механизм пульта РиМ 040.40, одинаковый для всех приборов: сначала пять позиционных полей
+ * (статус часов, control_state реле, статус фаз, тариф, «Значки ДД»), затем структуры
+ * {OctetString(6) OBIS, значение, Structure(2){Integer scaler, Enum unit}}. Значение — целое,
+ * вещественное (AKROS), текст или дата-время.
  */
-fun parseGetResponseTariffs(rawFrame: ByteArray): List<ObisReading> {
-    val root = parseGetResponseValue(rawFrame)
+fun readingsOf(root: DlmsValue): List<ObisReading> {
     val readings = mutableListOf<ObisReading>()
     collectReadings(root, readings)
     return readings
@@ -279,7 +283,7 @@ private fun findLlcHeader(frame: ByteArray): Int? {
 }
 
 /**
- * Рекурсивно собирает тройки {OBIS(6 байт), число, [scaler, unit]} и пары {OBIS, OctetString |
+ * Рекурсивно собирает тройки {OBIS(6 байт), число или float, [scaler, unit]} и пары {OBIS, OctetString |
  * VisibleString} (дата/время устройства, текстовые поля). Следующая за значением Structure(2),
  * если есть, пропускается как scaler-unit.
  */
@@ -325,6 +329,21 @@ private fun collectReadings(value: DlmsValue, out: MutableList<ObisReading>) {
         val obisItem = items[i]
         if (obisItem is DlmsValue.OctetStr && obisItem.bytes.size == 6) {
             val valueItem = items.getOrNull(i + 1)
+            // Объект HDLC-настройки (класс 23, 0.x.22.0.0.255) в буфере — плоская структура:
+            // {OBIS, comm_speed(Enum), window_tx(U8), window_rx(U8), max_info_tx(U16), max_info_rx(U16),
+            //  inter_octet_timeout(U16), inactivity_timeout(U16), device_address(U16)}. Всё после OBIS —
+            // атрибуты объекта, а не одно значение, поэтому забираем остаток структуры целиком.
+            if (obisItem.bytes[2].toInt() == HDLC_OBIS_GROUP_C && valueItem is DlmsValue.EnumVal) {
+                out.add(ObisReading(obisCodeOf(obisItem.bytes), 0L, 0, null, structItems = items.subList(i + 1, items.size).toList()))
+                i = items.size
+                continue
+            }
+            val floatReading = floatReadingOf(obisItem.bytes, valueItem, items.getOrNull(i + 2))
+            if (floatReading != null) {
+                out.add(floatReading)
+                i += 3
+                continue
+            }
             val rawValue = numericValueOf(valueItem)
             if (rawValue != null) {
                 val scalerUnit = items.getOrNull(i + 2)
@@ -356,6 +375,9 @@ private fun collectReadings(value: DlmsValue, out: MutableList<ObisReading>) {
         i += 1
     }
 }
+
+/** Группа C в OBIS объектов HDLC-настройки: 0.0.22.0.0.255, 0.1.22.0.0.255, ... */
+private const val HDLC_OBIS_GROUP_C = 22
 
 internal fun obisCodeOf(bytes: ByteArray): String = bytes.joinToString(".") { (it.toInt() and 0xFF).toString() }
 
@@ -439,6 +461,30 @@ private fun numericValueOf(value: DlmsValue?): Long? = when (value) {
     is DlmsValue.U64 -> value.value
     is DlmsValue.I64 -> value.value
     else -> null
+}
+
+/**
+ * Вещественное значение (теги 0x17/0x18) с множителем из следующей Structure(2){scaler, unit}:
+ * AKROS отдаёт так напряжение, ток, мощность и энергию. Множитель по стандарту применяется и к
+ * вещественным значениям (прошивка пульта делает так же). null — значение не вещественное.
+ * Без пары {scaler, unit} значение берётся как есть, единица неизвестна.
+ */
+private fun floatReadingOf(obisBytes: ByteArray, value: DlmsValue?, scalerUnitItem: DlmsValue?): ObisReading? {
+    val raw = when (value) {
+        is DlmsValue.Float32Val -> value.value.toDouble()
+        is DlmsValue.Float64Val -> value.value
+        else -> return null
+    }
+    var scaler = 0
+    var unit: Int? = null
+    if (scalerUnitItem is DlmsValue.Struct && scalerUnitItem.items.size == 2) {
+        val scalerValue = (scalerUnitItem.items[0] as? DlmsValue.I8)?.value
+        if (scalerValue != null) {
+            scaler = scalerValue
+            unit = (scalerUnitItem.items[1] as? DlmsValue.EnumVal)?.value
+        }
+    }
+    return ObisReading(obisCodeOf(obisBytes), 0L, 0, unit, floatValue = raw * Math.pow(10.0, scaler.toDouble()))
 }
 
 /** Structure(2){Integer scaler, Enum unit}; при другом формате — scaler=0, unit=Wh. */

@@ -1,5 +1,7 @@
 package ru.rim.dd.feature.info
 
+
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
@@ -28,12 +30,21 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import ru.rim.dd.ui.components.formatUptime
 import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
+import ru.rim.dd.core.model.EnergyDirection
 import ru.rim.dd.core.model.PhaseCondition
 import ru.rim.dd.core.model.PhaseStatus
 import ru.rim.dd.core.model.TamperCondition
@@ -43,8 +54,10 @@ import ru.rim.dd.ui.components.MonoText
 import ru.rim.dd.ui.components.ScreenHeader
 import ru.rim.dd.ui.components.SectionLabel
 import ru.rim.dd.ui.components.StatusChip
+import ru.rim.dd.ui.components.formatDate
 import ru.rim.dd.ui.components.formatDateTime
 import ru.rim.dd.ui.components.formatNumber
+import ru.rim.dd.ui.components.formatTime
 import ru.rim.dd.ui.components.tariffLabel
 import ru.rim.dd.ui.theme.RimError
 import ru.rim.dd.ui.theme.RimIconGradient
@@ -80,7 +93,10 @@ fun InfoScreen(showObis: Boolean, viewModel: InfoViewModel = hiltViewModel()) {
                     contentAlignment = Alignment.Center,
                 ) { Text("⚡", fontSize = 26.sp) }
                 Column(Modifier.weight(1f)) {
-                    MonoText(info?.model ?: "—", color = p.textPrimary, fontSize = 22.sp, weight = FontWeight.ExtraBold)
+                    MonoText("РиМ · ${info?.model ?: "—"} ",
+                        color = p.textPrimary,
+                        fontSize = 22.sp,
+                        weight = FontWeight.ExtraBold)
                     MonoText("№ ${info?.serialNumber ?: "—"}", color = p.textSecondary, fontSize = 12.sp, weight = FontWeight.Normal, modifier = Modifier.padding(top = 2.dp))
                     Box(Modifier.padding(top = 8.dp)) {
                         val sig = signal?.let { " · $it дБм" } ?: ""
@@ -97,11 +113,9 @@ fun InfoScreen(showObis: Boolean, viewModel: InfoViewModel = hiltViewModel()) {
             RowDivider()
             InfoRow("Напряжение батарейки", info?.backupVoltageV?.let { "${formatNumber(it, 3)} В" } ?: "—", "0.0.96.6.3.255", showObis)
             RowDivider()
-            InfoRow("Часы прибора", formatDateTime(info?.deviceClock), "0.0.0.9.1.255", showObis, mono = true)
-            inf?.clockValid?.let { valid ->
-                RowDivider()
-                InfoRow("Достоверность часов", if (valid) "Достоверны" else "Недостоверны", "0.0.1.0.0.255", showObis)
-            }
+            InfoRow("Дата", formatDate(info?.deviceDate), info?.deviceDateObis, showObis, mono = true)
+            RowDivider()
+            InfoRow("Время", formatTime(info?.deviceTime), info?.deviceTimeObis, showObis, mono = true)
             inf?.rdchDateTime?.let { dt ->
                 RowDivider()
                 InfoRow("Расчётный день (РДЧ)", formatDateTime(dt), "0.0.0.9.2.101", showObis, mono = true)
@@ -110,30 +124,18 @@ fun InfoScreen(showObis: Boolean, viewModel: InfoViewModel = hiltViewModel()) {
             InfoRow("Версия ПО", info?.firmwareVersion?.takeIf { it.isNotBlank() && it != "—" } ?: "—", info?.firmwareVersionObis, showObis)
             RowDivider()
             InfoRow("Текущий тариф", tariffLabel(info?.currentTariff), "0.0.96.14.0.255", showObis)
-            // HDLC-счётчики и время работы: строка появляется, только если прибор прислал значение.
-            info?.operatingTime?.let {
-                RowDivider()
-                val u = info?.operatingTimeUnit?.let { unit -> " $unit" } ?: ""
-                InfoRow("Время работы", "${formatNumber(it, 0)}$u", "0.0.96.8.0.255", showObis, mono = true)
-            }
-            info?.hdlcP1?.let {
-                RowDivider()
-                InfoRow("HDLC P1", it.toString(), "0.0.22.0.0.255", showObis, mono = true)
-            }
-            info?.hdlcP2?.let {
-                RowDivider()
-                InfoRow("HDLC P2", it.toString(), "0.1.22.0.0.255", showObis, mono = true)
-            }
-            // Версия ЖКИ — биты 6..7 поля «Значки ДД»; от неё зависит раскладка датчиков.
-            if (!tamper.unknown) {
-                RowDivider()
-                val lcd = when (tamper.lcdVersion) {
-                    0 -> "0 (до 890 пост.)"
-                    1 -> "1 (890 пост.)"
-                    else -> tamper.lcdVersion.toString()
-                }
-                InfoRow("Версия ЖКИ", lcd, "0.0.96.50.170.255", showObis)
-            }
+            // Время работы и HDLC-счётчики показываем всегда; «—», пока прибор не прислал значение.
+            RowDivider()
+            InfoRow(
+                "Время работы", info?.operatingTime?.let { formatUptime(it.toLong()) } ?: "—", "0.0.96.8.0.255", showObis, mono = true)
+            RowDivider()
+            InfoRow("HDLC P1", info?.hdlcP1?.toString() ?: "—", "0.0.22.0.0.255", showObis, mono = true)
+            RowDivider()
+            InfoRow("HDLC P2", info?.hdlcP2?.toString() ?: "—", "0.1.22.0.0.255", showObis, mono = true)
+            RowDivider()
+            InfoRow("HDLC P3", info?.hdlcP3?.toString() ?: "—", "0.2.22.0.0.255", showObis, mono = true)
+            RowDivider()
+            InfoRow("HDLC P4", info?.hdlcP4?.toString() ?: "—", "0.3.22.0.0.255", showObis, mono = true)
         }
 
         val grid = inf?.phaseStatus
@@ -162,16 +164,11 @@ fun InfoScreen(showObis: Boolean, viewModel: InfoViewModel = hiltViewModel()) {
                 }
                 if (dir != null) {
                     if (grid != null) RowDivider()
-                    ChipRow("Направление энергии", "0.0.96.50.170.255", showObis) {
-                        if (dir.none) {
-                            StatusChip("Нет", p.textSecondary)
-                        } else {
-                            if (dir.activePlus) StatusChip("A+", RimPrimaryLight)
-                            if (dir.activeMinus) StatusChip("A−", RimPrimaryLight)
-                            if (dir.reactivePlus) StatusChip("R+", RimPrimaryLight)
-                            if (dir.reactiveMinus) StatusChip("R−", RimPrimaryLight)
-                        }
+                    Row(Modifier.fillMaxWidth()) {
+                        LabelWithObis("Квадранты энергии", "0.0.96.50.170.255", showObis)
                     }
+                    Box(Modifier.padding(top = 8.dp))
+                    EnergyQuadrants(dir)
                 }
             }
         }
@@ -203,6 +200,199 @@ private fun ChipRow(label: String, obis: String?, showObis: Boolean, chips: @Com
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
         LabelWithObis(label, obis, showObis)
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) { chips() }
+    }
+}
+
+/**
+ * Квадранты энергии, как сегменты ЖКИ пульта (ShowEnergyDirection): I = A+ R+, II = A− R+,
+ * III = A− R−, IV = A+ R−. Квадрант подсвечен, когда активны оба его знака; верхний ряд —
+ * реактивная R+, правый столбец — активная A+. Если прибор показывает только одну энергию
+ * (например, только A+), квадрант не определён — в подписи называются сами знаки.
+ */
+@Composable
+private fun EnergyQuadrants(dir: EnergyDirection) {
+    val p = RimTheme.palette
+
+    val up    = dir.activePlus      // ↑ P+ активная импорт
+    val right = dir.reactivePlus    // → Q+ реактивная импорт
+    val down  = dir.activeMinus     // ↓ P− активная экспорт
+    val left  = dir.reactiveMinus   // ← Q− реактивная экспорт
+
+    val activeColor   = RimPrimaryLight
+    val inactiveColor = p.textPrimary.copy(alpha = 0.28f)
+    val activeFill    = RimPrimaryLight.copy(alpha = 0.20f)
+    val inactiveFill  = p.textPrimary.copy(alpha = 0.04f)
+
+    Column(
+        Modifier.fillMaxWidth(),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Box(
+            modifier = Modifier.size(260.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                val cx = size.width / 2f
+                val cy = size.height / 2f
+
+                // Стрелка НЕ доходит до центра — зазор
+                val gap        = size.minDimension * 0.10f
+                val armLen     = size.minDimension * 0.36f
+                val headLen    = size.minDimension * 0.14f
+                val headWidth  = size.minDimension * 0.17f
+                val shaftW     = size.minDimension * 0.07f
+
+                fun drawArrow(angleDeg: Float, active: Boolean) {
+                    val color  = if (active) activeColor else inactiveColor
+                    val fill   = if (active) activeFill else inactiveFill
+                    val stroke = Stroke(width = 1.5.dp.toPx())
+
+                    rotate(degrees = angleDeg, pivot = Offset(cx, cy)) {
+                        // Тело стрелки — от (gap) до (armLen - headLen)
+                        val shaft = Path().apply {
+                            addRect(
+                                Rect(
+                                    offset = Offset(cx - shaftW / 2f, cy - armLen + headLen),
+                                    size   = Size(shaftW, armLen - headLen - gap)
+                                )
+                            )
+                        }
+                        drawPath(shaft, color = fill)
+                        drawPath(shaft, color = color, style = stroke)
+
+                        // Голова
+                        val head = Path().apply {
+                            moveTo(cx, cy - armLen)
+                            lineTo(cx - headWidth / 2f, cy - armLen + headLen)
+                            lineTo(cx + headWidth / 2f, cy - armLen + headLen)
+                            close()
+                        }
+                        drawPath(head, color = fill)
+                        drawPath(head, color = color, style = stroke)
+                    }
+                }
+
+                drawArrow(0f,   up)
+                drawArrow(90f,  right)
+                drawArrow(180f, down)
+                drawArrow(270f, left)
+            }
+
+            // ── Буквы по углам, по диагонали ──
+
+            // ↖ Q+ / S3
+            AxisLetter(
+                letter = "Q", sign = "+", sub = "S3",
+                active = up || left,
+                activeColor = activeColor,
+                inactiveColor = inactiveColor,
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(start = 4.dp, top = 8.dp)
+            )
+
+            // ↗ P+ / S4
+            AxisLetter(
+                letter = "P", sign = "+", sub = "S4",
+                active = up || right,
+                activeColor = activeColor,
+                inactiveColor = inactiveColor,
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(end = 4.dp, top = 8.dp)
+            )
+
+            // ↙ P− / S5
+            AxisLetter(
+                letter = "P", sign = "−", sub = "S5",
+                active = down || left,
+                activeColor = activeColor,
+                inactiveColor = inactiveColor,
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .padding(start = 4.dp, bottom = 8.dp)
+            )
+
+            // ↘ Q− / S6
+            AxisLetter(
+                letter = "Q", sign = "−", sub = "S6",
+                active = down || right,
+                activeColor = activeColor,
+                inactiveColor = inactiveColor,
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(end = 4.dp, bottom = 8.dp)
+            )
+        }
+    }
+}
+
+/**
+ * Буква с знаком и подписью S3..S6, как на чертеже:
+ *   Q⁺
+ *   ── S3
+ */
+@Composable
+private fun AxisLetter(
+    letter: String,
+    sign: String,
+    sub: String,
+    active: Boolean,
+    activeColor: Color,
+    inactiveColor: Color,
+    modifier: Modifier = Modifier,
+) {
+    val color = if (active) activeColor else inactiveColor
+
+    Column(
+        modifier = modifier,
+        horizontalAlignment = Alignment.Start
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = letter,
+                color = color,
+                fontSize = 34.sp,
+                fontWeight = FontWeight.ExtraBold,
+            )
+            Text(
+                text = sign,
+                color = color,
+                fontSize = 22.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.padding(start = 2.dp)
+            )
+        }
+    }
+}
+
+@Composable
+private fun QuadrantLabel(
+    text: String,
+    active: Boolean,
+    activeColor: Color,
+    inactiveColor: Color,
+    modifier: Modifier = Modifier,
+) {
+    Text(
+        text = text,
+        color = if (active) activeColor else inactiveColor,
+        fontSize = 14.sp,
+        fontWeight = FontWeight.Bold,
+        modifier = modifier,
+    )
+}
+
+private fun energyQuadrantCaption(dir: EnergyDirection, lit: List<Boolean>): String {
+    val quadrants = listOf("I", "II", "III", "IV").filterIndexed { i, _ -> lit[i] }
+    return when {
+        dir.none -> "Нет"
+        quadrants.size == 1 -> "Квадрант ${quadrants.first()}"
+        quadrants.isNotEmpty() -> "Квадранты ${quadrants.joinToString(", ")}"
+        else -> listOfNotNull(
+            "A+".takeIf { dir.activePlus }, "A−".takeIf { dir.activeMinus },
+            "R+".takeIf { dir.reactivePlus }, "R−".takeIf { dir.reactiveMinus },
+        ).joinToString(" ")
     }
 }
 

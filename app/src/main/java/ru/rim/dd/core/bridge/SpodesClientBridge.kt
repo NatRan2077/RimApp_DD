@@ -26,13 +26,9 @@ class SpodesClientBridge @Inject constructor() {
     /** Передать байты, полученные по BLE-notify, обратно в библиотеку на разбор. */
     fun pushIncomingBytes(bytes: ByteArray) = nativePushIncoming(nativeHandle, bytes)
 
-    /** SNRM для РиМ. Библиотека принимает sourceAddress только 16/32/48. */
-    fun setNormalResponseMode(sourceAddress: Int, logicalAddress: Int, physicalAddress: Int): Boolean =
-        nativeSetNormalResponseMode(nativeHandle, sourceAddress, logicalAddress, physicalAddress)
-
     /**
-     * Корректный SNRM (с согласованием max-info) для AKROS. Вариант без Standard шлёт кадр
-     * с лишним LLC-заголовком и неверной FCS: РиМ это не замечает, AKROS такой кадр отбрасывает.
+     * Запасной путь AKROS (стандартная ассоциация): корректный SNRM с согласованием max-info.
+     * Библиотека принимает sourceAddress только 16/32/48.
      */
     fun setNormalResponseModeStandard(
         sourceAddress: Int,
@@ -49,10 +45,6 @@ class SpodesClientBridge @Inject constructor() {
         maxInfoReceive,
     )
 
-    /** Запрос следующего блока при блочной передаче ответа. */
-    fun sendReadyToReceive(blockNumber: Int): Boolean =
-        nativeSendReadyToReceive(nativeHandle, blockNumber)
-
     /** Ожидание ответа на SNRM: 1 — UA, 2 — DM, 0 — ошибка/таймаут. */
     fun receiveUnnumberedAcknowledge(): Int = nativeReceiveUnnumberedAcknowledge(nativeHandle)
 
@@ -60,17 +52,29 @@ class SpodesClientBridge @Inject constructor() {
     fun establishConnection(securityLevel: Int, password: String?): Boolean =
         nativeEstablishConnection(nativeHandle, securityLevel, password)
 
-    /** GET атрибута со стандартной адресацией (AKROS). */
+    /** GET атрибута со стандартной адресацией (запасной путь AKROS после ассоциации). */
     fun getRequest(classId: Int, obisCode: String, attributeId: Int): Boolean =
         nativeGetRequest(nativeHandle, classId, obisCode, attributeId)
 
+    /** Запрос следующего блока ответа со стандартной адресацией (запасной путь AKROS). */
+    fun sendReadyToReceive(blockNumber: Int): Boolean =
+        nativeSendReadyToReceive(nativeHandle, blockNumber)
+
     /**
      * GET с «плоской» однобайтовой HDLC-адресацией и invoke-id 0x81 — так обращается к
-     * счётчику штатный пульт РиМ. Обычный [getRequest] пишет двухбайтовый адрес и invoke-id 0xC1;
-     * такие кадры РиМ молча игнорирует. destAddress/srcAddress — готовые (несдвинутые) байты.
+     * счётчику штатный пульт РиМ (РиМ и AKROS, без SNRM и ассоциации). Нумерацию кадров N(S)/N(R)
+     * ведёт нативный клиент. destAddress/srcAddress — готовые (несдвинутые) байты.
      */
     fun getRequestFlatAddress(classId: Int, obisCode: String, attributeId: Int, destAddress: Int, srcAddress: Int): Boolean =
         nativeGetRequestFlatAddress(nativeHandle, classId, obisCode, attributeId, destAddress, srcAddress)
+
+    /**
+     * Запрос следующего блока ответа («плоская» адресация, invoke-id последнего GET): так пульт
+     * дочитывает ответ, разбитый прибором на DLMS-блоки. [lastBlockNumber] — номер последнего
+     * полученного блока.
+     */
+    fun getNextBlockRequestFlatAddress(lastBlockNumber: Int): Boolean =
+        nativeGetNextBlockRequestFlatAddress(nativeHandle, lastBlockNumber)
 
     /**
      * ACTION с той же «плоской» адресацией. Для Disconnect Control methodId: 1 — remote_disconnect,
@@ -103,7 +107,6 @@ class SpodesClientBridge @Inject constructor() {
     private external fun nativeDestroy(handle: Long)
     private external fun nativePullOutgoing(handle: Long): ByteArray
     private external fun nativePushIncoming(handle: Long, bytes: ByteArray)
-    private external fun nativeSetNormalResponseMode(handle: Long, sourceAddress: Int, logicalAddress: Int, physicalAddress: Int): Boolean
     private external fun nativeSetNormalResponseModeStandard(
         handle: Long,
         sourceAddress: Int,
@@ -117,6 +120,7 @@ class SpodesClientBridge @Inject constructor() {
     private external fun nativeEstablishConnection(handle: Long, securityLevel: Int, password: String?): Boolean
     private external fun nativeGetRequest(handle: Long, classId: Int, obisCode: String, attributeId: Int): Boolean
     private external fun nativeGetRequestFlatAddress(handle: Long, classId: Int, obisCode: String, attributeId: Int, destAddress: Int, srcAddress: Int): Boolean
+    private external fun nativeGetNextBlockRequestFlatAddress(handle: Long, blockNumber: Int): Boolean
     private external fun nativeActionRequestFlatAddress(
         handle: Long, classId: Int, obisCode: String, methodId: Int, hasParameter: Boolean,
         parameterType: Int, parameterValue: Int, destAddress: Int, srcAddress: Int,

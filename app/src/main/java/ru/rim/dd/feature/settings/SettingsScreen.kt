@@ -73,7 +73,7 @@ fun SettingsScreen(
                     contentAlignment = Alignment.Center,
                 ) { Text("⚡", fontSize = 18.sp) }
                 Column(Modifier.weight(1f)) {
-                    Text(info?.model ?: "Не подключено", color = p.textPrimary, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                    Text("RIM · ${info?.model ?: "Не подключено"}", color = p.textPrimary, fontSize = 14.sp, fontWeight = FontWeight.Bold)
                     val sig = signal?.let { " · $it дБм" } ?: ""
                     MonoText("№${info?.serialNumber ?: "—"}$sig", color = p.textSecondary, fontSize = 11.sp, weight = FontWeight.Normal)
                 }

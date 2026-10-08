@@ -116,8 +116,8 @@ fun ReadingsScreen(showObis: Boolean, viewModel: ReadingsViewModel = hiltViewMod
                             .padding(horizontal = 14.dp, vertical = 8.dp),
                         horizontalAlignment = Alignment.End,
                     ) {
-                        Text(formatDate(meterInfo?.deviceClock), color = Color.White.copy(alpha = 0.7f), fontSize = 10.sp)
-                        MonoText(formatTime(meterInfo?.deviceClock), color = Color.White, fontSize = 12.sp)
+                        Text(formatDate(meterInfo?.deviceDate), color = Color.White.copy(alpha = 0.7f), fontSize = 10.sp)
+                        MonoText(formatTime(meterInfo?.deviceTime), color = Color.White, fontSize = 12.sp)
                     }
                 }
                 Row(Modifier.fillMaxWidth().padding(top = 16.dp), horizontalArrangement = Arrangement.spacedBy(1.dp)) {

@@ -243,6 +243,15 @@ public:
     bool GetRequestFlatAddress(const RequestParams &params, const uint8_t &dest_address, const uint8_t &src_address);
 
     /**
+     * @brief Запрос следующего блока ответа (get-request-next, E6 E6 00 C0 02 <invoke> <номер:4>)
+     * с «плоской» адресацией и invoke-id последнего GetRequestFlatAddress() — так пульт РиМ 040.40
+     * дочитывает ответ, разбитый прибором на DLMS-блоки (у AKROS информационное поле 128 байт).
+     * @param block_number - номер последнего ПОЛУЧЕННОГО блока
+     * @return - true, если кадр собран и отправлен
+     */
+    bool GetNextBlockRequestFlatAddress(const uint32_t &block_number);
+
+    /**
      * @brief [Android-патч] ACTION-запрос (управление объектом, напр. размыкателем/реле) с той
      * же "плоской" однобайтовой HDLC-адресацией и собственным счётчиком invoke-id, что и
      * GetRequestFlatAddress() — по тем же причинам (этот счётчик игнорирует стандартные кадры
@@ -709,6 +718,13 @@ private:
      * @return - true, если кадр успешно собран и отправлен
      */
     bool SendReadyToReceiveFlatAddress();
+
+    /**
+     * @brief Собирает и отправляет I-кадр с «плоской» адресацией вокруг готового тела (LLC + APDU);
+     * после отправки увеличивает N(S). Общая часть GetRequestFlatAddress() и
+     * GetNextBlockRequestFlatAddress().
+     */
+    bool SendFlatInformationFrame(const std::vector<uint8_t> &body, const uint8_t &dest_address, const uint8_t &src_address);
 
     /**
      * @brief Получение запроса на продолжение записи данных (для длинных запросов)

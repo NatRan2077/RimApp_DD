@@ -187,7 +187,7 @@ class MeterRepositoryImpl @Inject constructor(
     override suspend fun connectByAddress(address: String, pin: String, remember: Boolean, deviceName: String?) {
         // Номер от прибора относится к конкретному сеансу — не тащим его с прошлого подключения.
         meterReportedSerial = null
-        withContext(Dispatchers.IO) { ble.connectByAddress(address) }
+        withContext(Dispatchers.IO) { ble.connectByAddress(address, deviceName) }
         openProtocolSession(deviceName)
 
         // Сбрасываем до разбора имени: иначе при неудачном разборе остался бы номер прошлого прибора.
@@ -705,9 +705,9 @@ class MeterRepositoryImpl @Inject constructor(
             Log.d(TAG, "Буфер: статус фаз ($DD_PHASE_DISPLAY_OBIS) = $phaseStatus, направление энергии = $energyDirection")
         }
 
-//        val rdchDate = all.byObis("0.0.0.9.2.101")?.octetValue?.let { decodeCosemDate(it) }
- //       val rdchTime = all.byObis("0.0.0.9.1.101")?.octetValue?.let { decodeCosemTime(it) }
-//        val rdchDateTime = rdchDate?.let { LocalDateTime.of(it, rdchTime ?: LocalTime.MIDNIGHT) }
+        val rdchDate = all.byObis("0.0.0.9.2.101")?.octetValue?.let { decodeCosemDate(it) }
+        val rdchTime = all.byObis("0.0.0.9.1.101")?.octetValue?.let { decodeCosemTime(it) }
+        val rdchDateTime = rdchDate?.let { LocalDateTime.of(it, rdchTime ?: LocalTime.MIDNIGHT) }
 
         val hdlcP1 = all.byObis(HDLC_P1_OBIS)?.let { describeHdlcSetup(it) }
         val hdlcP2 = all.byObis(HDLC_P2_OBIS)?.let { describeHdlcSetup(it) }
@@ -719,8 +719,8 @@ class MeterRepositoryImpl @Inject constructor(
 
         if (temperatureC == null && backupVoltageV == null && deviceDate == null && deviceTime == null && firmwareVersion == null &&
             modelName == null && currentTariff == null && clockValid == null && serialFromBuffer == null &&
-            hdlcP1 == null && hdlcP2 == null && hdlcP3 == null && hdlcP4 == null && operatingTime == null
-//            rdchDateTime == null && phaseStatus == null && energyDirection == null
+            hdlcP1 == null && hdlcP2 == null && hdlcP3 == null && hdlcP4 == null && operatingTime == null &&
+            rdchDateTime == null && phaseStatus == null && energyDirection == null
         ) return
 
         val prev = _meterInfo.value
@@ -747,7 +747,7 @@ class MeterRepositoryImpl @Inject constructor(
             hdlcP4 = hdlcP4 ?: prev?.hdlcP4,
             operatingTime = operatingTime ?: prev?.operatingTime,
             operatingTimeUnit = operatingTimeUnit ?: prev?.operatingTimeUnit,
-//            rdchDateTime = rdchDateTime ?: prev?.rdchDateTime,
+            rdchDateTime = rdchDateTime ?: prev?.rdchDateTime,
             phaseStatus = phaseStatus ?: prev?.phaseStatus,
             energyDirection = energyDirection ?: prev?.energyDirection,
         )
@@ -798,7 +798,7 @@ class MeterRepositoryImpl @Inject constructor(
             9 -> 115200
             else -> return "скорость код $code"
         }
-        return "$baud скорость"
+        return "$baud бод"
     }
 
     /**

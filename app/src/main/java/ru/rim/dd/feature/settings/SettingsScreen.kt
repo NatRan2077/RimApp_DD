@@ -57,8 +57,8 @@ fun SettingsScreen(
             .padding(start = 16.dp, end = 16.dp, top = 20.dp, bottom = 24.dp),
     ) {
         Column(Modifier.padding(bottom = 20.dp)) {
-            Text("Настройки", color = p.textPrimary, fontSize = 26.sp, fontWeight = FontWeight.ExtraBold)
-            Text("Управление подключением и видом", color = p.textSecondary, fontSize = 13.sp, modifier = Modifier.padding(top = 3.dp))
+            Text("Настройки", color = p.textPrimary, fontSize = 28.sp, fontWeight = FontWeight.ExtraBold)
+            Text("Управление подключением и видом", color = p.textSecondary, fontSize = 15.sp, modifier = Modifier.padding(top = 3.dp))
         }
 
         SectionLabel("Соединение")
@@ -73,9 +73,9 @@ fun SettingsScreen(
                     contentAlignment = Alignment.Center,
                 ) { Text("⚡", fontSize = 18.sp) }
                 Column(Modifier.weight(1f)) {
-                    Text("RIM · ${info?.model ?: "Не подключено"}", color = p.textPrimary, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                    Text(info?.model ?: "Не подключено", color = p.textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Bold)
                     val sig = signal?.let { " · $it дБм" } ?: ""
-                    MonoText("№${info?.serialNumber ?: "—"}$sig", color = p.textSecondary, fontSize = 11.sp, weight = FontWeight.Normal)
+                    MonoText("№${info?.serialNumber ?: "—"}$sig", color = p.textSecondary, fontSize = 13.sp, weight = FontWeight.Normal)
                 }
             }
             if (connected) {
@@ -90,7 +90,7 @@ fun SettingsScreen(
                             .padding(vertical = 11.dp),
                         contentAlignment = Alignment.Center,
                     ) {
-                        Text("Отключиться", color = RimError, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                        Text("Отключиться", color = RimError, fontSize = 16.sp, fontWeight = FontWeight.Bold)
                     }
                 }
             }
@@ -106,7 +106,7 @@ fun SettingsScreen(
 
         Text(
             "Дистанционный дисплей РиМ · v0.0.1 · 2026",
-            color = p.textFaint, fontSize = 12.sp,
+            color = p.textFaint, fontSize = 14.sp,
             modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
             textAlign = androidx.compose.ui.text.style.TextAlign.Center,
         )

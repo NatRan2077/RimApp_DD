@@ -106,7 +106,7 @@ fun ReadingsScreen(showObis: Boolean, viewModel: ReadingsViewModel = hiltViewMod
             Column {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.Top) {
                     Column {
-                        Text("ТЕКУЩИЙ ТАРИФ", color = Color.White.copy(alpha = 0.6f), fontSize = 11.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 0.7.sp)
+                        Text("ТЕКУЩИЙ ТАРИФ", color = Color.White.copy(alpha = 0.6f), fontSize = 13.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 0.7.sp)
                         MonoText(tariffLabel(meterInfo?.currentTariff), color = Color.White, fontSize = 48.sp, weight = FontWeight.ExtraBold)
                     }
                     Column(
@@ -116,8 +116,8 @@ fun ReadingsScreen(showObis: Boolean, viewModel: ReadingsViewModel = hiltViewMod
                             .padding(horizontal = 14.dp, vertical = 8.dp),
                         horizontalAlignment = Alignment.End,
                     ) {
-                        Text(formatDate(meterInfo?.deviceDate), color = Color.White.copy(alpha = 0.7f), fontSize = 10.sp)
-                        MonoText(formatTime(meterInfo?.deviceTime), color = Color.White, fontSize = 12.sp)
+                        Text(formatDate(meterInfo?.deviceDate), color = Color.White.copy(alpha = 0.7f), fontSize = 13.sp)
+                        MonoText(formatTime(meterInfo?.deviceTime), color = Color.White, fontSize = 14.sp)
                     }
                 }
                 Row(Modifier.fillMaxWidth().padding(top = 16.dp), horizontalArrangement = Arrangement.spacedBy(1.dp)) {
@@ -147,7 +147,7 @@ fun ReadingsScreen(showObis: Boolean, viewModel: ReadingsViewModel = hiltViewMod
         }
 
         if (readings.isEmpty()) {
-            Text("Нет данных — потяните «Обновить»", color = p.textSecondary, fontSize = 13.sp, modifier = Modifier.padding(top = 12.dp))
+            Text("Нет данных — потяните «Обновить»", color = p.textSecondary, fontSize = 15.sp, modifier = Modifier.padding(top = 12.dp))
         }
     }
 }
@@ -158,9 +158,9 @@ private fun QuickStat(short: String, value: String, unit: String, bg: Color, mod
         modifier = modifier.background(bg).padding(horizontal = 8.dp, vertical = 10.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Text(short, color = Color.White.copy(alpha = 0.55f), fontSize = 9.sp, maxLines = 1)
-        MonoText(value, color = Color.White, fontSize = 13.sp, modifier = Modifier.padding(top = 3.dp))
-        Text(unit, color = Color.White.copy(alpha = 0.45f), fontSize = 9.sp)
+        Text(short, color = Color.White.copy(alpha = 0.55f), fontSize = 11.sp, maxLines = 1)
+        MonoText(value, color = Color.White, fontSize = 14.sp, modifier = Modifier.padding(top = 3.dp))
+        Text(unit, color = Color.White.copy(alpha = 0.45f), fontSize = 11.sp)
     }
 }
 
@@ -213,12 +213,12 @@ private fun EnergyAccordion(
                 Text("⚡", fontSize = 16.sp)
             }
             Column(Modifier.weight(1f)) {
-                Text(spec.title + titleSuffix, color = p.textPrimary, fontSize = 13.sp, fontWeight = FontWeight.Bold)
-                if (showObis) MonoText("${spec.obisBase}.0.$period", color = spec.color.copy(alpha = 0.7f), fontSize = 9.sp, weight = FontWeight.Normal, modifier = Modifier.padding(top = 1.dp))
+                Text(spec.title + titleSuffix, color = p.textPrimary, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                if (showObis) MonoText("${spec.obisBase}.0.$period", color = spec.color.copy(alpha = 0.7f), fontSize = 11.sp, weight = FontWeight.Normal, modifier = Modifier.padding(top = 1.dp))
             }
             Column(horizontalAlignment = Alignment.End) {
-                MonoText(formatNumber(total(items), 3), color = spec.color, fontSize = 16.sp)
-                Text(unitOf(items, spec.unit), color = p.textFaint, fontSize = 10.sp)
+                MonoText(formatNumber(total(items), 3), color = spec.color, fontSize = 18.sp)
+                Text(unitOf(items, spec.unit), color = p.textFaint, fontSize = 13.sp)
             }
             if (presentTariffs.isNotEmpty()) {
                 Text("›", color = p.textFaint, fontSize = 16.sp, modifier = Modifier.padding(start = 4.dp).rotate(chevron))
@@ -227,14 +227,14 @@ private fun EnergyAccordion(
         if (open && presentTariffs.isNotEmpty()) {
             Divider()
             Column(Modifier.padding(start = 12.dp, end = 12.dp, top = 12.dp, bottom = 14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                presentTariffs.chunked(4).forEach { rowTariffs ->
+                presentTariffs.chunked(3).forEach { rowTariffs ->
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         rowTariffs.forEach { t ->
                             val value = items.firstOrNull { it.tariff == t }?.valueKwh ?: 0.0
                             TariffCell(t, value, spec, period, showObis, Modifier.weight(1f))
                         }
                         // добиваем ряд пустыми ячейками, чтобы ширина плиток не «прыгала»
-                        repeat(4 - rowTariffs.size) { Box(Modifier.weight(1f)) }
+                        repeat(3 - rowTariffs.size) { Box(Modifier.weight(1f)) }
                     }
                 }
             }
@@ -253,8 +253,8 @@ private fun TariffCell(tariff: Int, value: Double, spec: GroupSpec, period: Stri
             .padding(horizontal = 6.dp, vertical = 8.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Text(tariffLabel(tariff), color = spec.color, fontSize = 10.sp, fontWeight = FontWeight.Bold)
-        MonoText(formatNumber(value, 3), color = p.textPrimary, fontSize = 12.sp, modifier = Modifier.padding(top = 3.dp))
-        if (showObis) Text("${spec.obisBase}.$tariff.$period", color = spec.color.copy(alpha = 0.5f), fontSize = 8.sp, fontFamily = FontFamily.Monospace, modifier = Modifier.padding(top = 3.dp))
+        Text(tariffLabel(tariff), color = spec.color, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+        MonoText(formatNumber(value, 3), color = p.textPrimary, fontSize = 14.sp, modifier = Modifier.padding(top = 3.dp))
+        if (showObis) Text("${spec.obisBase}.$tariff.$period", color = spec.color.copy(alpha = 0.5f), fontSize = 11.sp, fontFamily = FontFamily.Monospace, modifier = Modifier.padding(top = 3.dp))
     }
 }

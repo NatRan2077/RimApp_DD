@@ -1,5 +1,7 @@
 package ru.rim.dd.navigation
 
+import android.app.Activity
+import android.graphics.drawable.ColorDrawable
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -18,13 +20,16 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -73,6 +78,13 @@ fun AppNavHost() {
 
     RimTheme(dark = dark) {
         val palette = RimTheme.palette
+        // Фон окна под вырезом/скрытой шторкой по умолчанию белый (светлая системная тема) —
+        // красим его в цвет текущей темы приложения, чтобы не было светлой полосы сверху.
+        val hostView = LocalView.current
+        SideEffect {
+            (hostView.context as? Activity)?.window
+                ?.setBackgroundDrawable(ColorDrawable(palette.background.toArgb()))
+        }
         val navController = rememberNavController()
         val backStackEntry by navController.currentBackStackEntryAsState()
         val currentRoute = backStackEntry?.destination?.route
@@ -162,7 +174,7 @@ private fun RimBottomBar(
                 Text(
                     tab.label,
                     color = if (active) RimViolet else palette.textFaint,
-                    fontSize = 10.sp,
+                    fontSize = 12.sp,
                     fontWeight = if (active) FontWeight.Bold else FontWeight.Normal,
                 )
             }

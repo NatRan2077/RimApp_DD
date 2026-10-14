@@ -1,6 +1,5 @@
 package ru.rim.dd.core.ble
 
-import android.Manifest
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
@@ -9,11 +8,16 @@ import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.os.Build
 import android.util.Log
-import androidx.annotation.RequiresPermission
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -28,13 +32,16 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.async
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.withTimeoutOrNull
 import no.nordicsemi.android.ble.BleManager
 import no.nordicsemi.android.ble.observer.ConnectionObserver
 import ru.rim.dd.core.model.ConnectionState
 import ru.rim.dd.core.model.MeterDeviceName
+import ru.rim.dd.core.model.MeterProtocolProfile
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -79,6 +86,15 @@ class MeterBleClient @Inject constructor(
      */
     private var userInitiatedDisconnect = false
 
+    /**
+     * «Битая» связь: система считает прибор сопряжённым, но ключи не подходят (прибор забыл их,
+     * или связь осталась от старой установки). Запрос PIN тогда не появляется вовсе — Android
+     * не пересопрягает уже сопряжённое устройство. Один раз за подключение удаляем связь и
+     * даём сопряжению пройти заново. Если удалить не удалось — подсказка пользователю.
+     */
+    private var staleBondHandled = false
+    private var stalePairingHint: String? = null
+
     private var gattManager: MeterGattManager? = null
 
     /**
@@ -117,31 +133,148 @@ class MeterBleClient @Inject constructor(
 
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            // Новые приборы (AKROS-17…) рекламируются расширенными объявлениями Bluetooth 5
+            // (Advertising Extension, вторичный PHY LE 2M). По умолчанию Android показывает только
+            // «старые» (legacy) объявления — такие приборы в поиске не появлялись.
+            .setLegacy(false)
             .build()
 
         _connectionState.value = ConnectionState.Scanning
         scanner.startScan(null, settings, callback)
 
-        awaitClose { scanner.stopScan(callback) }
+        awaitClose {
+            scanner.stopScan(callback)
+            // Поиск остановлен (кнопка «Стоп» или найден нужный прибор): не оставляем «Scanning»,
+            // но и не затираем Connecting, если подключение уже началось.
+            if (_connectionState.value is ConnectionState.Scanning) _connectionState.value = ConnectionState.Idle
+        }
     }
 
     /** Подключение к устройству (UC-01/UC-02). BLUETOOTH_CONNECT запрашивает PairingScreen. */
     @SuppressLint("MissingPermission")
-    suspend fun connect(device: BluetoothDevice) {
+    suspend fun connect(device: BluetoothDevice, nameHint: String? = null) {
         userInitiatedDisconnect = false
+        staleBondHandled = false
+        stalePairingHint = null
         reconnectJob?.cancel()
         _connectionState.value = ConnectionState.Connecting(device.address)
+        Log.d("MeterBleClient", "Подключение к ${device.address}, состояние сопряжения в системе: ${bondStateName(device.bondState)}")
         val manager = MeterGattManager(
             context,
             onStateChanged = { state -> _connectionState.value = state },
             onRssiRead = { rssi -> _signalStrengthDbm.value = rssi },
             onDisconnected = { reason -> handleDisconnected(device, reason) },
+            onEncryptionFailure = { handleStaleBond(device) },
+            nameHint = nameHint,
         )
         gattManager = manager
-        manager.connect(device)
-            .retry(3, 200)
-            .useAutoConnect(false)
-            .await()
+        awaitConnectWatchingBond(manager, device)
+    }
+
+    /**
+     * Подключение с контролем сопряжения. Если пользователь нажал «Отмена» в системном окне PIN
+     * (или ввёл неверный PIN), Android шлёт переход BONDING → NONE. Очередь Nordic при этом может
+     * дойти до «готово» или перезапускать попытки (retry) — приложение тогда делало вид, что
+     * подключилось, и снова просило PIN. Поэтому отказ от сопряжения ловим сами и сразу рвём
+     * соединение без повторов.
+     */
+    @SuppressLint("MissingPermission")
+    private suspend fun awaitConnectWatchingBond(manager: MeterGattManager, device: BluetoothDevice) {
+        val bondRejected = CompletableDeferred<Unit>()
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context, intent: Intent) {
+                if (intent.action != BluetoothDevice.ACTION_BOND_STATE_CHANGED) return
+                val changed = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE)
+                }
+                if (changed?.address != device.address) return
+                val state = intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.ERROR)
+                val previous = intent.getIntExtra(BluetoothDevice.EXTRA_PREVIOUS_BOND_STATE, BluetoothDevice.ERROR)
+                Log.d("MeterBleClient", "Сопряжение ${device.address}: $previous → $state")
+                if (state == BluetoothDevice.BOND_NONE && previous == BluetoothDevice.BOND_BONDING) {
+                    bondRejected.complete(Unit)
+                }
+            }
+        }
+        context.registerReceiver(receiver, IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED))
+        // await() у Nordic — блокирующий вызов, поэтому его гоним в отдельной корутине на IO и не
+        // делаем дочерней: при отказе от сопряжения ждать его завершения нельзя, сначала рвём связь.
+        val connecting = clientScope.async(Dispatchers.IO) {
+            manager.connect(device)
+                .retry(3, 200)
+                .useAutoConnect(false)
+                .await()
+        }
+        try {
+            try {
+                select<Unit> {
+                    connecting.onAwait { }
+                    bondRejected.onAwait { throw BondRejectedException() }
+                }
+            } catch (ex: CancellationException) {
+                connecting.cancel()
+                throw ex
+            }
+            // Подключение могло завершиться раньше, чем дошла рассылка об отказе.
+            if (bondRejected.isCompleted) throw BondRejectedException()
+        } catch (ex: BondRejectedException) {
+            Log.w("MeterBleClient", "Сопряжение с ${device.address} отменено или не удалось — разрываем соединение")
+            // Флаг ставим до disconnect(): иначе разрыв сочтётся неожиданным и запустит переподключение.
+            userInitiatedDisconnect = true
+            reconnectJob?.cancel()
+            connecting.cancel()
+            manager.disconnect().enqueue()
+            gattManager = null
+            _connectionState.value = ConnectionState.Idle
+            _signalStrengthDbm.value = null
+            throw IllegalStateException(
+                "Сопряжение не выполнено: окно ввода PIN-кода закрыто или PIN неверный. " +
+                        "Повторите подключение и введите PIN-код прибора",
+            )
+        } catch (ex: CancellationException) {
+            throw ex
+        } catch (ex: Exception) {
+            val hint = stalePairingHint
+            if (hint != null) throw IllegalStateException(hint)
+            throw ex
+        } finally {
+            runCatching { context.unregisterReceiver(receiver) }
+        }
+    }
+
+    private class BondRejectedException : Exception()
+
+    private fun bondStateName(state: Int): String = when (state) {
+        BluetoothDevice.BOND_NONE -> "не сопряжён"
+        BluetoothDevice.BOND_BONDING -> "идёт сопряжение"
+        BluetoothDevice.BOND_BONDED -> "сопряжён"
+        else -> "неизвестно ($state)"
+    }
+
+    /**
+     * Прибор числится сопряжённым, но шифрованный обмен не состоялся — связь «битая». Удаляем её
+     * (скрытый метод removeBond: публичного аналога у Android нет) и рвём GATT, чтобы следующая
+     * попытка прошла с нуля и система показала запрос PIN.
+     */
+    @SuppressLint("MissingPermission")
+    private fun handleStaleBond(device: BluetoothDevice) {
+        if (staleBondHandled) return
+        staleBondHandled = true
+        Log.w("MeterBleClient", "Прибор сопряжён, но шифрованный обмен не удался — удаляем старую связь и сопрягаем заново")
+        val removed = try {
+            device.javaClass.getMethod("removeBond").invoke(device) as? Boolean ?: false
+        } catch (ex: Exception) {
+            Log.w("MeterBleClient", "removeBond недоступен: ${ex.message}")
+            false
+        }
+        if (!removed) {
+            stalePairingHint = "Не удалось пересопрячься с прибором. Откройте настройки Bluetooth телефона, " +
+                    "удалите прибор из списка сопряжённых устройств и подключитесь заново"
+        }
+        gattManager?.disconnect()?.enqueue()
     }
 
     /**
@@ -243,8 +376,8 @@ class MeterBleClient @Inject constructor(
     }
 
     /** Подключение по MAC-адресу без сканирования; присутствие в эфире проверит уже connect(). */
-    suspend fun connectByAddress(address: String) {
-        connect(remoteDevice(address))
+    suspend fun connectByAddress(address: String, nameHint: String? = null) {
+        connect(remoteDevice(address), nameHint)
     }
 
     private fun remoteDevice(address: String): BluetoothDevice =
@@ -267,7 +400,7 @@ class MeterBleClient @Inject constructor(
         } ?: throw IllegalStateException(
             "Устройство с именем на \"$namePrefix\" не найдено за ${timeoutMs / 1000} с — убедитесь, что пульт включён и рядом"
         )
-        connect(remoteDevice(found.address))
+        connect(remoteDevice(found.address), found.name)
         return found
     }
 
@@ -290,7 +423,7 @@ class MeterBleClient @Inject constructor(
                     "убедитесь, что прибор включён и находится рядом"
         )
         Log.i("MeterBleClient", "Найден прибор учёта № $wanted: \"${found.name}\" (${found.address})")
-        connect(remoteDevice(found.address))
+        connect(remoteDevice(found.address), found.name)
         return found
     }
 
@@ -345,6 +478,9 @@ private class MeterGattManager(
     private val onStateChanged: (ConnectionState) -> Unit,
     private val onRssiRead: (Int) -> Unit,
     private val onDisconnected: (reason: Int) -> Unit,
+    private val onEncryptionFailure: () -> Unit,
+    /** Имя из рекламы (у неспаренного прибора device.name часто null). */
+    private val nameHint: String? = null,
 ) : BleManager(context) {
 
     private var rxCharacteristic: BluetoothGattCharacteristic? = null
@@ -352,6 +488,13 @@ private class MeterGattManager(
 
     /** Набор UUID, найденный на приборе; от него зависит, нужно ли сопряжение (см. initialize()). */
     private var activeProfile: MeterUartProfile? = null
+
+    /** Тип записи в RX: WRITE_NO_RESPONSE, если характеристика его поддерживает, иначе запись с ответом. */
+    private var rxWriteType: Int = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+
+    private fun isAkrosPeer(): Boolean =
+        activeProfile == GattUuids.PROFILE_ABF0 ||
+                (nameHint ?: bluetoothDevice?.name)?.contains(MeterProtocolProfile.AKROS_NAME_MARKER, ignoreCase = true) == true
 
     /**
      * Входящие notify-кадры. Именно SharedFlow(replay=0) с большим буфером, а не StateFlow:
@@ -409,6 +552,14 @@ private class MeterGattManager(
         Log.println(priority, "MeterGattManager", message)
     }
     override fun isRequiredServiceSupported(gatt: BluetoothGatt): Boolean {
+        // Полный список сервисов и характеристик — чтобы по логу можно было добавить новую ревизию платы.
+        for (service in gatt.services) {
+            Log.d(
+                "MeterGattManager",
+                "Сервис ${service.uuid}: " + service.characteristics.joinToString { "${it.uuid} props=${it.properties}" },
+            )
+        }
+        val found = mutableListOf<Triple<MeterUartProfile, BluetoothGattCharacteristic, BluetoothGattCharacteristic>>()
         for (profile in GattUuids.ALL) {
             val service = gatt.getService(profile.service) ?: continue
             val rx = service.getCharacteristic(profile.rxWrite)
@@ -421,36 +572,87 @@ private class MeterGattManager(
                 )
                 continue
             }
-            rxCharacteristic = rx
-            txCharacteristic = tx
-            activeProfile = profile
-            Log.i("MeterGattManager", "Профиль обмена: ${profile.label}")
-            Log.d(
-                "MeterGattManager",
-                "RX(write)=${rx.uuid}, props=${rx.properties}; " +
-                        "TX(notify)=${tx.uuid}, props=${tx.properties}, " +
-                        "descriptors=${tx.descriptors.map { it.uuid }}",
-            )
-            return true
+            found += Triple(profile, rx, tx)
         }
-        Log.e(
+        // Если на приборе несколько известных наборов (новый AKROS может нести и FFE0, и ABF0),
+        // для прибора с «AKROS» в имени берём набор AKROS, для остальных — первый по порядку.
+        val akrosName = (nameHint ?: bluetoothDevice?.name)
+            ?.contains(MeterProtocolProfile.AKROS_NAME_MARKER, ignoreCase = true) == true
+        val chosen = (if (akrosName) found.firstOrNull { it.first == GattUuids.PROFILE_ABF0 } else null)
+            ?: found.firstOrNull()
+            ?: findGenericUart(gatt)
+        if (chosen == null) {
+            Log.e(
+                "MeterGattManager",
+                "Ни один из известных профилей обмена не найден на устройстве " +
+                        "(искали: ${GattUuids.ALL.joinToString { it.label }}), и сервиса вида «UART» тоже нет. " +
+                        "Сервисы прибора: " + gatt.services.joinToString { it.uuid.toString() },
+            )
+            return false
+        }
+        val (profile, rx, tx) = chosen
+        rxCharacteristic = rx
+        txCharacteristic = tx
+        activeProfile = profile
+        rxWriteType = if (rx.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0) {
+            BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+        } else {
+            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        }
+        Log.i("MeterGattManager", "Профиль обмена: ${profile.label}")
+        Log.d(
             "MeterGattManager",
-            "Ни один из известных профилей обмена не найден на устройстве " +
-                    "(искали: ${GattUuids.ALL.joinToString { it.label }}). Сервисы прибора: " +
-                    gatt.services.joinToString { it.uuid.toString() },
+            "RX(write)=${rx.uuid}, props=${rx.properties}; " +
+                    "TX(notify)=${tx.uuid}, props=${tx.properties}, " +
+                    "descriptors=${tx.descriptors.map { it.uuid }}",
         )
-        return false
+        return true
     }
 
-    @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
+    /**
+     * Запасной поиск «прозрачного UART» для неизвестной ревизии платы: первый нестандартный сервис,
+     * где есть характеристика с notify (прибор → телефон) и характеристика на запись.
+     */
+    private fun findGenericUart(
+        gatt: BluetoothGatt,
+    ): Triple<MeterUartProfile, BluetoothGattCharacteristic, BluetoothGattCharacteristic>? {
+        for (service in gatt.services) {
+            val id = service.uuid.toString().lowercase()
+            if (id.startsWith("00001800") || id.startsWith("00001801") || id.startsWith("0000180a")) continue
+            val tx = service.characteristics.firstOrNull {
+                it.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0
+            } ?: continue
+            val rx = service.characteristics.firstOrNull {
+                it !== tx && it.properties and
+                        (BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE or BluetoothGattCharacteristic.PROPERTY_WRITE) != 0
+            } ?: continue
+            Log.w(
+                "MeterGattManager",
+                "Известный профиль не найден — берём сервис ${service.uuid} как UART: " +
+                        "RX=${rx.uuid}, TX=${tx.uuid} (автоопределение)",
+            )
+            return Triple(MeterUartProfile("авто ${service.uuid}", service.uuid, tx.uuid, rx.uuid), rx, tx)
+        }
+        return null
+    }
+
     override fun initialize() {
         requestMtu(247)
             .done { mtu -> Log.d("MeterGattManager", "MTU согласован: $mtu") }
             .fail { _, status -> Log.w("MeterGattManager", "requestMtu не удался, status=$status (не критично — .split() всё равно спасёт большие записи)") }
             .enqueue()
-        if (activeProfile == GattUuids.PROFILE_ABF0) {
+        // Как у пульта: AKROS принимает данные только после сопряжения (LE Secure Connections с
+        // PIN, при legacy-сопряжении разрывает связь с кодом 0x13), а notify включается уже ПОСЛЕ
+        // него. PIN запрашивает системное окно Android. Очередь Nordic выполняется по порядку, так
+        // что enableNotifications() ниже стартует только когда bond установлен. Явный createBond()
+        // (только если связи ещё нет), а не ensureBond(): на ensureBond() очередь после сопряжения
+        // зависала — запрос не завершался, хотя bond уже был создан.
+        if (isAkrosPeer()) {
             val alreadyBonded = bluetoothDevice?.bondState == BluetoothDevice.BOND_BONDED
-            Log.d("MeterGattManager", "AKROS: сопряжение, уже сопряжены=$alreadyBonded")
+            Log.d(
+                "MeterGattManager",
+                "AKROS: сопряжение, уже сопряжены=$alreadyBonded (состояние системы: ${bluetoothDevice?.bondState})",
+            )
             if (!alreadyBonded) {
                 createBond()
                     .done { Log.d("MeterGattManager", "AKROS: сопряжение выполнено") }
@@ -473,7 +675,14 @@ private class MeterGattManager(
         enableNotifications(txCharacteristic)
             .before { Log.d("MeterGattManager", "Включаем notify на TX") }
             .done { Log.d("MeterGattManager", "Notifications на TX включены успешно") }
-            .fail { _, status -> Log.e("MeterGattManager", "enableNotifications провалился, status=$status") }
+            .fail { _, status ->
+                Log.e("MeterGattManager", "enableNotifications провалился, status=$status")
+                // У AKROS notify доступен только по шифрованной связи: отказ при «сопряжённом» приборе
+                // значит, что ключи не подходят — запрос PIN сам не появится, связь надо пересоздать.
+                if (isAkrosPeer() && bluetoothDevice?.bondState == BluetoothDevice.BOND_BONDED) {
+                    onEncryptionFailure()
+                }
+            }
             .enqueue()
     }
 
@@ -485,7 +694,7 @@ private class MeterGattManager(
         writeCharacteristic(
             rxCharacteristic,
             bytes,
-            BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE,
+            rxWriteType,
         )
             .split()
             .done { Log.d("MeterGattManager", ">> write подтверждён (enqueue done)") }

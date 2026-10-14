@@ -40,6 +40,20 @@ object MeterDeviceName {
             else -> null
         }
     }
+    /**
+     * Тип прибора для карточки в списке найденных: "RIM4894604664030" → "РиМ 489.46",
+     * "AKROS-17200010" → "AKROS". null — имя не разобрано, показывать как есть.
+     */
+    fun typeLabel(name: String?): String? {
+        val model = parse(name)?.model ?: return null
+        return when {
+            model == "—" -> null
+            model.first().isDigit() -> "РиМ $model"
+            model.equals("RIM", ignoreCase = true) -> "РиМ"
+            else -> model.uppercase()
+        }
+    }
+
     fun normalizeSerial(input: String?): String? {
         val digits = input?.filter { it.isDigit() } ?: return null
         return when {

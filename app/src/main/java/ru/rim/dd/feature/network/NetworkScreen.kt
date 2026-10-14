@@ -164,14 +164,14 @@ private fun PhaseCard(ph: String, voltage: Double, current: Double, color: Color
         Box(
             Modifier.size(28.dp).clip(CircleShape).background(color.copy(alpha = 0.15f)),
             contentAlignment = Alignment.Center,
-        ) { Text("~$ph", color = color, fontSize = 12.sp, fontWeight = FontWeight.ExtraBold) }
-        Text("Напр.", color = p.textSecondary, fontSize = 10.sp, modifier = Modifier.padding(top = 6.dp))
-        MonoText(formatNumber(voltage, 1), color = if (voltage in 0.001..50.0) RimError else p.textPrimary, fontSize = 15.sp)
-        Text("В", color = p.textFaint, fontSize = 9.sp)
+        ) { Text("~$ph", color = color, fontSize = 14.sp, fontWeight = FontWeight.ExtraBold) }
+        Text("Напр.", color = p.textSecondary, fontSize = 13.sp, modifier = Modifier.padding(top = 6.dp))
+        MonoText(formatNumber(voltage, 1), color = if (voltage in 0.001..50.0) RimError else p.textPrimary, fontSize = 17.sp)
+        Text("В", color = p.textFaint, fontSize = 11.sp)
         Divider(Modifier.padding(vertical = 6.dp))
-        Text("Ток", color = p.textSecondary, fontSize = 10.sp)
-        MonoText(formatNumber(current, 3), color = p.textPrimary, fontSize = 14.sp)
-        Text("А", color = p.textFaint, fontSize = 9.sp)
+        Text("Ток", color = p.textSecondary, fontSize = 13.sp)
+        MonoText(formatNumber(current, 3), color = p.textPrimary, fontSize = 16.sp)
+        Text("А", color = p.textFaint, fontSize = 11.sp)
     }
 }
 
@@ -184,9 +184,9 @@ private fun SingleMetric(label: String, value: String, unit: String, color: Colo
             .padding(16.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Text(label, color = p.textSecondary, fontSize = 11.sp)
-        MonoText(value, color = if (warn) RimError else p.textPrimary, fontSize = 24.sp, modifier = Modifier.padding(top = 4.dp))
-        Text(unit, color = p.textFaint, fontSize = 10.sp)
+        Text(label, color = p.textSecondary, fontSize = 13.sp)
+        MonoText(value, color = if (warn) RimError else p.textPrimary, fontSize = 28.sp, modifier = Modifier.padding(top = 4.dp))
+        Text(unit, color = p.textFaint, fontSize = 13.sp)
     }
 }
 
@@ -198,8 +198,8 @@ private fun RowDivider() {
 @Composable
 private fun LabelWithObis(label: String, obis: String, showObis: Boolean) {
     Column {
-        Text(label, color = RimTheme.palette.textSecondary, fontSize = 14.sp)
-        if (showObis) MonoText(obis, color = RimPrimaryLight, fontSize = 10.sp, weight = FontWeight.Normal)
+        Text(label, color = RimTheme.palette.textSecondary, fontSize = 16.sp)
+        if (showObis) MonoText(obis, color = RimPrimaryLight, fontSize = 13.sp, weight = FontWeight.Normal)
     }
 }
 
@@ -209,8 +209,8 @@ private fun PowerRow(label: String, value: String, unit: String, obis: String, s
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
         LabelWithObis(label, obis, showObis)
         Row(verticalAlignment = Alignment.Bottom) {
-            MonoText(value, color = p.textPrimary, fontSize = 15.sp)
-            Text(" $unit", color = p.textPrimary.copy(alpha = 0.5f), fontSize = 12.sp)
+            MonoText(value, color = p.textPrimary, fontSize = 17.sp)
+            Text(" $unit", color = p.textPrimary.copy(alpha = 0.5f), fontSize = 14.sp)
         }
     }
 }
@@ -220,7 +220,7 @@ private fun ExtraRow(label: String, value: String, obis: String, showObis: Boole
     val p = RimTheme.palette
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
         LabelWithObis(label, obis, showObis)
-        MonoText(value, color = p.textPrimary, fontSize = 15.sp)
+        MonoText(value, color = p.textPrimary, fontSize = 17.sp)
     }
 }
 

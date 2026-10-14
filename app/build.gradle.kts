@@ -9,9 +9,12 @@ android {
     namespace = "ru.rim.dd"
     compileSdk = 34
 
+    // NDK r28+: нативные библиотеки (включая libc++_shared.so) выровнены под 16 КБ страницы памяти.
+    ndkVersion = "28.0.13004108"
+
     defaultConfig {
         applicationId = "ru.rim.dd"
-        minSdk = 26
+        minSdk = 28
         targetSdk = 34
         versionCode = 1
         versionName = "0.1.0"
@@ -33,6 +36,13 @@ android {
         cmake {
             path = file("src/main/cpp/CMakeLists.txt")
             version = "3.22.1"
+        }
+    }
+
+    // .so хранятся в APK без сжатия и выровнены по 16 КБ (нужен AGP 8.5.1+).
+    packaging {
+        jniLibs {
+            useLegacyPackaging = false
         }
     }
 
@@ -88,7 +98,8 @@ dependencies {
     implementation("androidx.room:room-runtime:2.6.1")
     implementation("androidx.room:room-ktx:2.6.1")
     ksp("androidx.room:room-compiler:2.6.1")
-    implementation("androidx.datastore:datastore-preferences:1.1.1")
+    // 1.1.1 → 1.1.4: libdatastore_shared_counter.so не проходила проверку 16 КБ
+    implementation("androidx.datastore:datastore-preferences:1.1.4")
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
 
     // ---- Тесты ----

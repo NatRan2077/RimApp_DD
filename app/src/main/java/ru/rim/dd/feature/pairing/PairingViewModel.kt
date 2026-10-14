@@ -6,12 +6,15 @@ import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import ru.rim.dd.core.ble.BleDevice
 import ru.rim.dd.core.model.MeterDeviceName
+import ru.rim.dd.data.local.DeviceStore
 import ru.rim.dd.data.repository.MeterRepository
 import javax.inject.Inject
 
@@ -27,19 +30,27 @@ data class PairingUiState(
 @HiltViewModel
 class PairingViewModel @Inject constructor(
     private val repository: MeterRepository,
+    private val deviceStore: DeviceStore,
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(PairingUiState())
     val uiState: StateFlow<PairingUiState> = _uiState.asStateFlow()
 
+    /** Три последних вручную введённых номера ПУ — для быстрого набора. */
+    val recentSerials: StateFlow<List<String>> = deviceStore.recentEnteredSerials
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
     private var scanJob: Job? = null
+
+    fun reportError(message: String) {
+        _uiState.value = _uiState.value.copy(errorMessage = message)
+    }
 
     fun scan() {
         scanJob?.cancel()
         _uiState.value = _uiState.value.copy(isScanning = true, foundDevices = emptyList(), errorMessage = null)
         scanJob = viewModelScope.launch {
             repository.scanDevices()
-                // Не фиксированный префикс, а looksLikeMeter: он пропускает и приборы вида AKROS-…
                 .filter { MeterDeviceName.looksLikeMeter(it.name) }
                 .collect { device ->
                     val current = _uiState.value.foundDevices
@@ -47,6 +58,10 @@ class PairingViewModel @Inject constructor(
                         _uiState.value = _uiState.value.copy(foundDevices = current + device)
                     }
                 }
+            _uiState.value = _uiState.value.copy(
+                isScanning = false,
+                errorMessage = "Не удалось начать поиск — проверьте, что Bluetooth включён",
+            )
         }
     }
 
@@ -81,6 +96,7 @@ class PairingViewModel @Inject constructor(
     fun connectByNumber(serialNumber: String, pin: String, remember: Boolean) {
         _uiState.value = _uiState.value.copy(isConnecting = true, errorMessage = null)
         viewModelScope.launch {
+            deviceStore.addRecentEnteredSerial(serialNumber)
             stopScanAndAwait()
             runCatching { repository.connectBySerialNumber(serialNumber, pin, remember) }
                 .onSuccess { _uiState.value = _uiState.value.copy(isConnecting = false, isConnected = true) }

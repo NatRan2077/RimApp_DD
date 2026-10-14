@@ -1,7 +1,5 @@
 package ru.rim.dd.feature.info
 
-
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
@@ -30,18 +28,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Rect
-import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import ru.rim.dd.ui.components.formatUptime
 import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import ru.rim.dd.core.model.EnergyDirection
@@ -93,11 +84,8 @@ fun InfoScreen(showObis: Boolean, viewModel: InfoViewModel = hiltViewModel()) {
                     contentAlignment = Alignment.Center,
                 ) { Text("⚡", fontSize = 26.sp) }
                 Column(Modifier.weight(1f)) {
-                    MonoText("РиМ · ${info?.model ?: "—"} ",
-                        color = p.textPrimary,
-                        fontSize = 22.sp,
-                        weight = FontWeight.ExtraBold)
-                    MonoText("№ ${info?.serialNumber ?: "—"}", color = p.textSecondary, fontSize = 12.sp, weight = FontWeight.Normal, modifier = Modifier.padding(top = 2.dp))
+                    MonoText(info?.model ?: "—", color = p.textPrimary, fontSize = 24.sp, weight = FontWeight.ExtraBold)
+                    MonoText("№ ${info?.serialNumber ?: "—"}", color = p.textSecondary, fontSize = 14.sp, weight = FontWeight.Normal, modifier = Modifier.padding(top = 2.dp))
                     Box(Modifier.padding(top = 8.dp)) {
                         val sig = signal?.let { " · $it дБм" } ?: ""
                         StatusChip("Подключён$sig", RimSuccess)
@@ -113,9 +101,9 @@ fun InfoScreen(showObis: Boolean, viewModel: InfoViewModel = hiltViewModel()) {
             RowDivider()
             InfoRow("Напряжение батарейки", info?.backupVoltageV?.let { "${formatNumber(it, 3)} В" } ?: "—", "0.0.96.6.3.255", showObis)
             RowDivider()
-            InfoRow("Дата", formatDate(info?.deviceDate), info?.deviceDateObis, showObis, mono = true)
+            InfoRow("Дата прибора", formatDate(info?.deviceDate), info?.deviceDateObis, showObis, mono = true)
             RowDivider()
-            InfoRow("Время", formatTime(info?.deviceTime), info?.deviceTimeObis, showObis, mono = true)
+            InfoRow("Время прибора", formatTime(info?.deviceTime), info?.deviceTimeObis, showObis, mono = true)
             inf?.rdchDateTime?.let { dt ->
                 RowDivider()
                 InfoRow("Расчётный день (РДЧ)", formatDateTime(dt), "0.0.0.9.2.101", showObis, mono = true)
@@ -126,8 +114,8 @@ fun InfoScreen(showObis: Boolean, viewModel: InfoViewModel = hiltViewModel()) {
             InfoRow("Текущий тариф", tariffLabel(info?.currentTariff), "0.0.96.14.0.255", showObis)
             // Время работы и HDLC-счётчики показываем всегда; «—», пока прибор не прислал значение.
             RowDivider()
-            InfoRow(
-                "Время работы", info?.operatingTime?.let { formatUptime(it.toLong()) } ?: "—", "0.0.96.8.0.255", showObis, mono = true)
+            val opUnit = info?.operatingTimeUnit?.let { unit -> " $unit" } ?: ""
+            InfoRow("Время работы", info?.operatingTime?.let { "${formatNumber(it, 0)}$opUnit" } ?: "—", "0.0.96.8.0.255", showObis, mono = true)
             RowDivider()
             InfoRow("HDLC P1", info?.hdlcP1?.toString() ?: "—", "0.0.22.0.0.255", showObis, mono = true)
             RowDivider()
@@ -154,7 +142,7 @@ fun InfoScreen(showObis: Boolean, viewModel: InfoViewModel = hiltViewModel()) {
                             PhaseChip("C", grid.c)
                         }
                         phaseProblemText(grid)?.let {
-                            Text(it, color = RimError, fontSize = 12.sp, modifier = Modifier.padding(top = 6.dp))
+                            Text(it, color = RimError, fontSize = 14.sp, modifier = Modifier.padding(top = 6.dp))
                         }
                         RowDivider()
                         ChipRow("Чередование фаз", "1.0.96.50.0.255", showObis) {
@@ -212,175 +200,46 @@ private fun ChipRow(label: String, obis: String?, showObis: Boolean, chips: @Com
 @Composable
 private fun EnergyQuadrants(dir: EnergyDirection) {
     val p = RimTheme.palette
-
-    val up    = dir.activePlus      // ↑ P+ активная импорт
-    val right = dir.reactivePlus    // → Q+ реактивная импорт
-    val down  = dir.activeMinus     // ↓ P− активная экспорт
-    val left  = dir.reactiveMinus   // ← Q− реактивная экспорт
-
-    val activeColor   = RimPrimaryLight
-    val inactiveColor = p.textPrimary.copy(alpha = 0.28f)
-    val activeFill    = RimPrimaryLight.copy(alpha = 0.20f)
-    val inactiveFill  = p.textPrimary.copy(alpha = 0.04f)
-
-    Column(
-        Modifier.fillMaxWidth(),
-        horizontalAlignment = Alignment.CenterHorizontally
-    ) {
-        Box(
-            modifier = Modifier.size(260.dp),
-            contentAlignment = Alignment.Center
-        ) {
-            Canvas(modifier = Modifier.fillMaxSize()) {
-                val cx = size.width / 2f
-                val cy = size.height / 2f
-
-                // Стрелка НЕ доходит до центра — зазор
-                val gap        = size.minDimension * 0.10f
-                val armLen     = size.minDimension * 0.36f
-                val headLen    = size.minDimension * 0.14f
-                val headWidth  = size.minDimension * 0.17f
-                val shaftW     = size.minDimension * 0.07f
-
-                fun drawArrow(angleDeg: Float, active: Boolean) {
-                    val color  = if (active) activeColor else inactiveColor
-                    val fill   = if (active) activeFill else inactiveFill
-                    val stroke = Stroke(width = 1.5.dp.toPx())
-
-                    rotate(degrees = angleDeg, pivot = Offset(cx, cy)) {
-                        // Тело стрелки — от (gap) до (armLen - headLen)
-                        val shaft = Path().apply {
-                            addRect(
-                                Rect(
-                                    offset = Offset(cx - shaftW / 2f, cy - armLen + headLen),
-                                    size   = Size(shaftW, armLen - headLen - gap)
-                                )
-                            )
+    val lit = listOf(
+        dir.activePlus && dir.reactivePlus,
+        dir.activeMinus && dir.reactivePlus,
+        dir.activeMinus && dir.reactiveMinus,
+        dir.activePlus && dir.reactiveMinus,
+    )
+    val names = listOf("I", "II", "III", "IV")
+    val signs = listOf("A+ R+", "A− R+", "A− R−", "A+ R−")
+    val shape = RoundedCornerShape(10.dp)
+    Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+        Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+            listOf(listOf(1, 0), listOf(2, 3)).forEach { rowQuadrants ->
+                Row(horizontalArrangement = Arrangement.spacedBy(3.dp)) {
+                    rowQuadrants.forEach { i ->
+                        val on = lit[i]
+                        val color = if (on) RimPrimaryLight else p.textPrimary.copy(alpha = 0.3f)
+                        Column(
+                            modifier = Modifier
+                                .size(width = 76.dp, height = 56.dp)
+                                .clip(shape)
+                                .background(if (on) RimPrimaryLight.copy(alpha = 0.22f) else p.textPrimary.copy(alpha = 0.05f))
+                                .border(if (on) 1.5.dp else 0.dp, if (on) RimPrimaryLight else Color.Transparent, shape),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.Center,
+                        ) {
+                            Text(names[i], color = color, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                            Text(signs[i], color = color, fontSize = 13.sp)
                         }
-                        drawPath(shaft, color = fill)
-                        drawPath(shaft, color = color, style = stroke)
-
-                        // Голова
-                        val head = Path().apply {
-                            moveTo(cx, cy - armLen)
-                            lineTo(cx - headWidth / 2f, cy - armLen + headLen)
-                            lineTo(cx + headWidth / 2f, cy - armLen + headLen)
-                            close()
-                        }
-                        drawPath(head, color = fill)
-                        drawPath(head, color = color, style = stroke)
                     }
                 }
-
-                drawArrow(0f,   up)
-                drawArrow(90f,  right)
-                drawArrow(180f, down)
-                drawArrow(270f, left)
             }
-
-            // ── Буквы по углам, по диагонали ──
-
-            // ↖ Q+ / S3
-            AxisLetter(
-                letter = "Q", sign = "+", sub = "S3",
-                active = up || left,
-                activeColor = activeColor,
-                inactiveColor = inactiveColor,
-                modifier = Modifier
-                    .align(Alignment.TopStart)
-                    .padding(start = 4.dp, top = 8.dp)
-            )
-
-            // ↗ P+ / S4
-            AxisLetter(
-                letter = "P", sign = "+", sub = "S4",
-                active = up || right,
-                activeColor = activeColor,
-                inactiveColor = inactiveColor,
-                modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .padding(end = 4.dp, top = 8.dp)
-            )
-
-            // ↙ P− / S5
-            AxisLetter(
-                letter = "P", sign = "−", sub = "S5",
-                active = down || left,
-                activeColor = activeColor,
-                inactiveColor = inactiveColor,
-                modifier = Modifier
-                    .align(Alignment.BottomStart)
-                    .padding(start = 4.dp, bottom = 8.dp)
-            )
-
-            // ↘ Q− / S6
-            AxisLetter(
-                letter = "Q", sign = "−", sub = "S6",
-                active = down || right,
-                activeColor = activeColor,
-                inactiveColor = inactiveColor,
-                modifier = Modifier
-                    .align(Alignment.BottomEnd)
-                    .padding(end = 4.dp, bottom = 8.dp)
-            )
         }
+        Text(
+            energyQuadrantCaption(dir, lit),
+            color = p.textPrimary,
+            fontSize = 15.sp,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.padding(top = 8.dp),
+        )
     }
-}
-
-/**
- * Буква с знаком и подписью S3..S6, как на чертеже:
- *   Q⁺
- *   ── S3
- */
-@Composable
-private fun AxisLetter(
-    letter: String,
-    sign: String,
-    sub: String,
-    active: Boolean,
-    activeColor: Color,
-    inactiveColor: Color,
-    modifier: Modifier = Modifier,
-) {
-    val color = if (active) activeColor else inactiveColor
-
-    Column(
-        modifier = modifier,
-        horizontalAlignment = Alignment.Start
-    ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(
-                text = letter,
-                color = color,
-                fontSize = 34.sp,
-                fontWeight = FontWeight.ExtraBold,
-            )
-            Text(
-                text = sign,
-                color = color,
-                fontSize = 22.sp,
-                fontWeight = FontWeight.Bold,
-                modifier = Modifier.padding(start = 2.dp)
-            )
-        }
-    }
-}
-
-@Composable
-private fun QuadrantLabel(
-    text: String,
-    active: Boolean,
-    activeColor: Color,
-    inactiveColor: Color,
-    modifier: Modifier = Modifier,
-) {
-    Text(
-        text = text,
-        color = if (active) activeColor else inactiveColor,
-        fontSize = 14.sp,
-        fontWeight = FontWeight.Bold,
-        modifier = modifier,
-    )
 }
 
 private fun energyQuadrantCaption(dir: EnergyDirection, lit: List<Boolean>): String {
@@ -425,8 +284,8 @@ private fun RowDivider() {
 @Composable
 private fun RowScope.LabelWithObis(label: String, obis: String?, showObis: Boolean) {
     Column(Modifier.weight(1f)) {
-        Text(label, color = RimTheme.palette.textSecondary, fontSize = 13.sp)
-        if (showObis && obis != null) MonoText(obis, color = RimPrimaryLight, fontSize = 9.sp, weight = FontWeight.Normal, modifier = Modifier.padding(top = 1.dp))
+        Text(label, color = RimTheme.palette.textSecondary, fontSize = 15.sp)
+        if (showObis && obis != null) MonoText(obis, color = RimPrimaryLight, fontSize = 11.sp, weight = FontWeight.Normal, modifier = Modifier.padding(top = 1.dp))
     }
 }
 
@@ -436,9 +295,9 @@ private fun InfoRow(label: String, value: String, obis: String?, showObis: Boole
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.Bottom) {
         LabelWithObis(label, obis, showObis)
         if (mono) {
-            MonoText(value, color = p.textPrimary, fontSize = 14.sp)
+            MonoText(value, color = p.textPrimary, fontSize = 16.sp)
         } else {
-            Text(value, color = p.textPrimary, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+            Text(value, color = p.textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Bold)
         }
     }
 }
@@ -466,8 +325,8 @@ private fun SensorRow(label: String, condition: TamperCondition, unknown: Boolea
             if (condition == TamperCondition.ACTIVE && !unknown) {
                 Icon(Icons.Filled.Warning, contentDescription = null, tint = color, modifier = Modifier.size(18.dp))
             }
-            Text(label, color = p.textPrimary, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+            Text(label, color = p.textPrimary, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
         }
-        Text(text, color = color, fontSize = 12.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Default)
+        Text(text, color = color, fontSize = 14.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Default)
     }
 }

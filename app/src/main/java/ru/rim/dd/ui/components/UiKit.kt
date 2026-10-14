@@ -69,7 +69,7 @@ fun SectionLabel(text: String, modifier: Modifier = Modifier) {
     Text(
         text = text.uppercase(),
         color = RimPrimaryLight,
-        fontSize = 11.sp,
+        fontSize = 13.sp,
         fontWeight = FontWeight.Bold,
         letterSpacing = 1.sp,
         modifier = modifier.padding(start = 2.dp, bottom = 8.dp, top = 4.dp),
@@ -104,8 +104,8 @@ fun ToggleRow(
         horizontalArrangement = Arrangement.SpaceBetween,
     ) {
         Column(Modifier.weight(1f)) {
-            Text(label, color = p.textPrimary, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-            Text(desc, color = p.textSecondary, fontSize = 12.sp)
+            Text(label, color = p.textPrimary, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+            Text(desc, color = p.textSecondary, fontSize = 14.sp)
         }
         Switchy(value, onChange)
     }
@@ -151,7 +151,7 @@ fun ScreenHeader(title: String, onRefresh: () -> Unit, refreshing: Boolean) {
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween,
     ) {
-        Text(title, color = p.textPrimary, fontSize = 26.sp, fontWeight = FontWeight.ExtraBold)
+        Text(title, color = p.textPrimary, fontSize = 28.sp, fontWeight = FontWeight.ExtraBold)
         Box(
             modifier = Modifier
                 .size(40.dp)
@@ -195,6 +195,6 @@ fun StatusChip(text: String, color: Color, modifier: Modifier = Modifier) {
         horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         Box(Modifier.size(6.dp).clip(CircleShape).background(color))
-        Text(text, color = color, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+        Text(text, color = color, fontSize = 14.sp, fontWeight = FontWeight.Bold)
     }
 }

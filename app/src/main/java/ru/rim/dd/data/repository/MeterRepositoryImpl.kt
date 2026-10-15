@@ -1226,7 +1226,7 @@ class MeterRepositoryImpl @Inject constructor(
         private const val FLAT_SRC_ADDRESS = 0x43
 
         private const val PUMP_POLL_INTERVAL_MS = 20L
-        private const val AUTO_REFRESH_INTERVAL_MS = 5_000L
+        private const val AUTO_REFRESH_INTERVAL_MS = 1_000L
 
         /** Три цикла × 5 с = 15 с: не реагируем на единичный сбой, но и не держим мёртвое «Подключено». */
         private const val MAX_CONSECUTIVE_PROTOCOL_FAILURES = 3

@@ -1,18 +1,23 @@
 package ru.rim.dd.feature.info
 
+import android.annotation.SuppressLint
+import androidx.compose.animation.animateContentSize
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Warning
@@ -28,10 +33,14 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.graphics.drawscope.Fill
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
@@ -42,6 +51,7 @@ import ru.rim.dd.core.model.TamperCondition
 import ru.rim.dd.ui.components.DataCard
 import ru.rim.dd.ui.components.Divider
 import ru.rim.dd.ui.components.MonoText
+import ru.rim.dd.ui.components.RimShapes
 import ru.rim.dd.ui.components.ScreenHeader
 import ru.rim.dd.ui.components.SectionLabel
 import ru.rim.dd.ui.components.StatusChip
@@ -51,8 +61,7 @@ import ru.rim.dd.ui.components.formatNumber
 import ru.rim.dd.ui.components.formatTime
 import ru.rim.dd.ui.components.tariffLabel
 import ru.rim.dd.ui.theme.RimError
-import ru.rim.dd.ui.theme.RimIconGradient
-import ru.rim.dd.ui.theme.RimPrimaryLight
+import ru.rim.dd.ui.theme.RimFonts
 import ru.rim.dd.ui.theme.RimSuccess
 import ru.rim.dd.ui.theme.RimTheme
 import ru.rim.dd.ui.theme.RimWarn
@@ -79,13 +88,9 @@ fun InfoScreen(showObis: Boolean, viewModel: InfoViewModel = hiltViewModel()) {
 
         DataCard {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                Box(
-                    Modifier.size(62.dp).clip(RoundedCornerShape(16.dp)).background(Brush.linearGradient(RimIconGradient)),
-                    contentAlignment = Alignment.Center,
-                ) { Text("⚡", fontSize = 26.sp) }
                 Column(Modifier.weight(1f)) {
-                    MonoText(info?.model ?: "—", color = p.textPrimary, fontSize = 24.sp, weight = FontWeight.ExtraBold)
-                    MonoText("№ ${info?.serialNumber ?: "—"}", color = p.textSecondary, fontSize = 14.sp, weight = FontWeight.Normal, modifier = Modifier.padding(top = 2.dp))
+                    Text(info?.model ?: "—", color = p.textSecondary, fontSize = 18.sp, fontWeight = FontWeight.Bold, fontFamily = RimFonts.Raleway)
+                    MonoText("№ ${info?.serialNumber ?: "—"}", color = p.textPrimary, fontSize = 28.sp, weight = FontWeight.SemiBold, modifier = Modifier.padding(top = 2.dp))
                     Box(Modifier.padding(top = 8.dp)) {
                         val sig = signal?.let { " · $it дБм" } ?: ""
                         StatusChip("Подключён$sig", RimSuccess)
@@ -94,36 +99,40 @@ fun InfoScreen(showObis: Boolean, viewModel: InfoViewModel = hiltViewModel()) {
             }
         }
 
-        Box(Modifier.padding(top = 4.dp))
-        SectionLabel("Параметры прибора")
-        DataCard {
-            InfoRow("Температура", info?.temperatureC?.let { "${formatNumber(it, 1)} °C" } ?: "—", info?.let { "0.0.96.9.0.255" }, showObis)
-            RowDivider()
-            InfoRow("Напряжение батарейки", info?.backupVoltageV?.let { "${formatNumber(it, 3)} В" } ?: "—", "0.0.96.6.3.255", showObis)
-            RowDivider()
-            InfoRow("Дата прибора", formatDate(info?.deviceDate), info?.deviceDateObis, showObis, mono = true)
-            RowDivider()
-            InfoRow("Время прибора", formatTime(info?.deviceTime), info?.deviceTimeObis, showObis, mono = true)
-            inf?.rdchDateTime?.let { dt ->
-                RowDivider()
-                InfoRow("Расчётный день (РДЧ)", formatDateTime(dt), "0.0.0.9.2.101", showObis, mono = true)
+        // Параметры прибора показываются только когда прибор их прислал: нет значения — нет строки,
+        // пришло в очередной цикл — строка появляется сама.
+        val paramRows = buildList<@Composable () -> Unit> {
+            if (inf == null) return@buildList
+            inf.temperatureC?.let { add { InfoRow("Температура", "${formatNumber(it, 1)} °C", "0.0.96.9.0.255", showObis) } }
+            inf.backupVoltageV?.let { add { InfoRow("Напряжение батарейки", "${formatNumber(it, 3)} В", "0.0.96.6.3.255", showObis) } }
+            inf.deviceDate?.let { add { InfoRow("Дата прибора", formatDate(it), inf.deviceDateObis, showObis, mono = true) } }
+            inf.deviceTime?.let { add { InfoRow("Время прибора", formatTime(it), inf.deviceTimeObis, showObis, mono = true) } }
+            inf.rdchDateTime?.let { add { InfoRow("Расчётный день (РДЧ)", formatDateTime(it), "0.0.0.9.2.101", showObis, mono = true) } }
+            inf.firmwareVersion.takeIf { it.isNotBlank() && it != "—" }?.let { add { InfoRow("Версия ПО", it, inf.firmwareVersionObis, showObis) } }
+            inf.currentTariff?.let { add { InfoRow("Текущий тариф", tariffLabel(it), "0.0.96.14.0.255", showObis) } }
+            inf.operatingTime?.let { t ->
+                add {
+                    val unit = inf.operatingTimeUnit?.let { u -> " $u" } ?: ""
+                    InfoRow("Время работы", "${formatNumber(t, 0)}$unit", "0.0.96.8.0.255", showObis, mono = true)
+                }
             }
-            RowDivider()
-            InfoRow("Версия ПО", info?.firmwareVersion?.takeIf { it.isNotBlank() && it != "—" } ?: "—", info?.firmwareVersionObis, showObis)
-            RowDivider()
-            InfoRow("Текущий тариф", tariffLabel(info?.currentTariff), "0.0.96.14.0.255", showObis)
-            // Время работы и HDLC-счётчики показываем всегда; «—», пока прибор не прислал значение.
-            RowDivider()
-            val opUnit = info?.operatingTimeUnit?.let { unit -> " $unit" } ?: ""
-            InfoRow("Время работы", info?.operatingTime?.let { "${formatNumber(it, 0)}$opUnit" } ?: "—", "0.0.96.8.0.255", showObis, mono = true)
-            RowDivider()
-            InfoRow("HDLC P1", info?.hdlcP1?.toString() ?: "—", "0.0.22.0.0.255", showObis, mono = true)
-            RowDivider()
-            InfoRow("HDLC P2", info?.hdlcP2?.toString() ?: "—", "0.1.22.0.0.255", showObis, mono = true)
-            RowDivider()
-            InfoRow("HDLC P3", info?.hdlcP3?.toString() ?: "—", "0.2.22.0.0.255", showObis, mono = true)
-            RowDivider()
-            InfoRow("HDLC P4", info?.hdlcP4?.toString() ?: "—", "0.3.22.0.0.255", showObis, mono = true)
+            inf.hdlcP1?.let { add { InfoRow("HDLC P1", it, "0.0.22.0.0.255", showObis, mono = true) } }
+            inf.hdlcP2?.let { add { InfoRow("HDLC P2", it, "0.1.22.0.0.255", showObis, mono = true) } }
+            inf.hdlcP3?.let { add { InfoRow("HDLC P3", it, "0.2.22.0.0.255", showObis, mono = true) } }
+            inf.hdlcP4?.let { add { InfoRow("HDLC P4", it, "0.3.22.0.0.255", showObis, mono = true) } }
+        }
+        Box(Modifier.padding(top = 4.dp).animateContentSize()) {
+            Column {
+                if (paramRows.isNotEmpty()) {
+                    SectionLabel("Параметры прибора")
+                    DataCard {
+                        paramRows.forEachIndexed { index, row ->
+                            if (index > 0) RowDivider()
+                            row()
+                        }
+                    }
+                }
+            }
         }
 
         val grid = inf?.phaseStatus
@@ -161,26 +170,42 @@ fun InfoScreen(showObis: Boolean, viewModel: InfoViewModel = hiltViewModel()) {
             }
         }
 
-        Box(Modifier.padding(top = 4.dp))
-        // Набор датчиков зависит от версии ЖКИ: у версии 0 только магнит и ПКЭ, у версии ≥ 1 — полный набор.
-        SectionLabel("Пломбы и датчики")
-        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            if (tamper.lcdVersion == 0 && !tamper.unknown) {
-                SensorRow("Магнитное поле", tamper.magnet, tamper.unknown)
-                SensorRow("ПКЭ", tamper.eqi, tamper.unknown)
-            } else {
-                SensorRow("Пломба корпуса", tamper.cover, tamper.unknown)
-                SensorRow("Пломба клеммника", tamper.meter, tamper.unknown)
-                SensorRow("Магнитное поле", tamper.magnet, tamper.unknown)
-                SensorRow("Батарея", tamper.battery, tamper.unknown)
-                SensorRow("ВЧ поле", tamper.rf, tamper.unknown)
-                SensorRow("Самодиагностика", tamper.selfDiagnosticsFault, tamper.unknown)
-                SensorRow("ПКЭ", tamper.eqi, tamper.unknown)
-                SensorRow("Небаланс", tamper.unbalance, tamper.unknown)
+        // Разделы появляются, когда прибор прислал статус пломб и датчиков («Значки ДД»).
+        // Датчики разнесены по смыслу: пломбы (вскрытие), датчики воздействия, состояние прибора,
+        // качество сети. Набор зависит от версии ЖКИ: у версии 0 только магнит и ПКЭ, у версии ≥ 1 — полный.
+        if (!tamper.unknown) {
+            val full = tamper.lcdVersion != 0
+            if (full) {
+                SensorGroup("Пломбы") {
+                    SensorRow("Пломба корпуса", tamper.cover, false)
+                    SensorRow("Пломба клеммника", tamper.meter, false)
+                }
             }
-            if (tamper.powerLimitExceeded) SensorRow("Превышен лимит мощности", TamperCondition.ACTIVE, false)
+            SensorGroup("Датчики воздействия") {
+                SensorRow("Магнитное поле", tamper.magnet, false)
+                if (full) SensorRow("ВЧ поле", tamper.rf, false)
+            }
+            if (full) {
+                SensorGroup("Состояние прибора") {
+                    SensorRow("Батарея", tamper.battery, false)
+                    SensorRow("Самодиагностика", tamper.selfDiagnosticsFault, false)
+                    if (tamper.powerLimitExceeded) SensorRow("Превышен лимит мощности", TamperCondition.ACTIVE, false)
+                }
+            }
+            SensorGroup("Качество сети") {
+                SensorRow("ПКЭ", tamper.eqi, false)
+                if (full) SensorRow("Небаланс", tamper.unbalance, false)
+            }
         }
     }
+}
+
+/** Смысловая группа датчиков: заголовок и строки карточками. */
+@Composable
+private fun SensorGroup(title: String, content: @Composable () -> Unit) {
+    Box(Modifier.padding(top = 4.dp))
+    SectionLabel(title)
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) { content() }
 }
 
 @Composable
@@ -192,67 +217,131 @@ private fun ChipRow(label: String, obis: String?, showObis: Boolean, chips: @Com
 }
 
 /**
- * Квадранты энергии, как сегменты ЖКИ пульта (ShowEnergyDirection): I = A+ R+, II = A− R+,
- * III = A− R−, IV = A+ R−. Квадрант подсвечен, когда активны оба его знака; верхний ряд —
- * реактивная R+, правый столбец — активная A+. Если прибор показывает только одну энергию
- * (например, только A+), квадрант не определён — в подписи называются сами знаки.
+ * Квадранты энергии — символ с ЖКИ прибора (ДД): четыре стрелки, P — активная, Q — реактивная
+ * энергия. Каждый сегмент включает букву, знак и стрелку целиком:
+ * Q+ — вверх, P+ — вправо, P− — влево, Q− — вниз. Включённый сегмент залит
+ * фирменным синим, выключенный — тонкий контур. Биты берутся из «Значков ДД» (байт 3, EnergyDirection).
+ * Чертёж рисуется в условных единицах 720×480 и масштабируется по ширине экрана.
  */
+@SuppressLint("UnusedBoxWithConstraintsScope")
 @Composable
 private fun EnergyQuadrants(dir: EnergyDirection) {
     val p = RimTheme.palette
-    val lit = listOf(
-        dir.activePlus && dir.reactivePlus,
-        dir.activeMinus && dir.reactivePlus,
-        dir.activeMinus && dir.reactiveMinus,
-        dir.activePlus && dir.reactiveMinus,
-    )
-    val names = listOf("I", "II", "III", "IV")
-    val signs = listOf("A+ R+", "A− R+", "A− R−", "A+ R−")
-    val shape = RoundedCornerShape(10.dp)
+    val density = LocalDensity.current
+    val on = p.accent
+    val off = p.textPrimary.copy(alpha = 0.30f)
     Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
-        Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
-            listOf(listOf(1, 0), listOf(2, 3)).forEach { rowQuadrants ->
-                Row(horizontalArrangement = Arrangement.spacedBy(3.dp)) {
-                    rowQuadrants.forEach { i ->
-                        val on = lit[i]
-                        val color = if (on) RimPrimaryLight else p.textPrimary.copy(alpha = 0.3f)
-                        Column(
-                            modifier = Modifier
-                                .size(width = 76.dp, height = 56.dp)
-                                .clip(shape)
-                                .background(if (on) RimPrimaryLight.copy(alpha = 0.22f) else p.textPrimary.copy(alpha = 0.05f))
-                                .border(if (on) 1.5.dp else 0.dp, if (on) RimPrimaryLight else Color.Transparent, shape),
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            verticalArrangement = Arrangement.Center,
-                        ) {
-                            Text(names[i], color = color, fontSize = 18.sp, fontWeight = FontWeight.Bold)
-                            Text(signs[i], color = color, fontSize = 13.sp)
-                        }
+        BoxWithConstraints(Modifier.fillMaxWidth()) {
+            val s = maxWidth.value / 720f // dp на единицу чертежа
+            fun fs(units: Float) = with(density) { (units * s).dp.toSp() }
+            Box(Modifier.fillMaxWidth().height((480f * s).dp)) {
+                Canvas(Modifier.fillMaxSize()) {
+                    val k = size.width / 720f
+                    val cx = 360f * k
+                    val cy = 240f * k
+                    fun arrow(direction: Int, active: Boolean) {
+                        val path = arrowPath(cx, cy, k, direction)
+                        val color = if (active) on else off
+                        if (active) drawPath(path, color, style = Fill)
+                        drawPath(path, color, style = Stroke(width = 7f * k, join = StrokeJoin.Miter))
                     }
+                    fun sign(x: Float, y: Float, plus: Boolean, active: Boolean) {
+                        val path = signPath(x * k, y * k, k, plus)
+                        val color = if (active) on else off
+                        if (active) drawPath(path, color, style = Fill)
+                        drawPath(path, color, style = Stroke(width = 4f * k, join = StrokeJoin.Miter))
+                    }
+                    arrow(0, dir.reactivePlus)   // Q+
+                    arrow(1, dir.activePlus)     // P+
+                    arrow(3, dir.activeMinus)    // P−
+                    arrow(2, dir.reactiveMinus)  // Q−
+                    sign(275f, 108f, plus = true, active = dir.reactivePlus)
+                    sign(615f, 105f, plus = true, active = dir.activePlus)
+                    sign(235f, 428f, plus = false, active = dir.activeMinus)
+                    sign(620f, 430f, plus = false, active = dir.reactiveMinus)
                 }
+                QuadrantGlyph("Q", 135f, 112f, s, ::fs, if (dir.reactivePlus) on else off)
+                QuadrantGlyph("P", 500f, 105f, s, ::fs, if (dir.activePlus) on else off)
+                QuadrantGlyph("P", 125f, 410f, s, ::fs, if (dir.activeMinus) on else off)
+                QuadrantGlyph("Q", 510f, 410f, s, ::fs, if (dir.reactiveMinus) on else off)
             }
         }
         Text(
-            energyQuadrantCaption(dir, lit),
+            energyQuadrantCaption(dir),
             color = p.textPrimary,
-            fontSize = 15.sp,
+            fontSize = 20.sp,
             fontWeight = FontWeight.Bold,
-            modifier = Modifier.padding(top = 8.dp),
+            modifier = Modifier.padding(top = 10.dp),
         )
     }
 }
 
-private fun energyQuadrantCaption(dir: EnergyDirection, lit: List<Boolean>): String {
-    val quadrants = listOf("I", "II", "III", "IV").filterIndexed { i, _ -> lit[i] }
-    return when {
-        dir.none -> "Нет"
-        quadrants.size == 1 -> "Квадрант ${quadrants.first()}"
-        quadrants.isNotEmpty() -> "Квадранты ${quadrants.joinToString(", ")}"
-        else -> listOfNotNull(
-            "A+".takeIf { dir.activePlus }, "A−".takeIf { dir.activeMinus },
-            "R+".takeIf { dir.reactivePlus }, "R−".takeIf { dir.reactiveMinus },
-        ).joinToString(" ")
+/** Крупная буква P или Q (центр в точке чертежа cx, cy). */
+@Composable
+private fun QuadrantGlyph(text: String, cx: Float, cy: Float, s: Float, fs: (Float) -> TextUnit, color: Color) {
+    Box(
+        Modifier.offset(x = ((cx - 90f) * s).dp, y = ((cy - 90f) * s).dp).size((180f * s).dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(text, color = color, fontSize = fs(150f), fontWeight = FontWeight.Medium, fontFamily = RimFonts.Plex, softWrap = false)
     }
+}
+
+/**
+ * Контур стрелки: 0 — вверх, 1 — вправо, 2 — вниз, 3 — влево. Размеры в единицах чертежа
+ * относительно центра: остриё в 222, голова 100×50, стержень шириной 44, зазор у центра 33.
+ */
+private fun arrowPath(cx: Float, cy: Float, k: Float, direction: Int): Path {
+    val up = listOf(
+        0f to -222f, -50f to -172f, -22f to -172f, -22f to -33f,
+        22f to -33f, 22f to -172f, 50f to -172f,
+    )
+    val path = Path()
+    up.forEachIndexed { i, (x, y) ->
+        val (rx, ry) = when (direction) {
+            1 -> -y to x
+            2 -> -x to -y
+            3 -> y to -x
+            else -> x to y
+        }
+        val px = cx + rx * k
+        val py = cy + ry * k
+        if (i == 0) path.moveTo(px, py) else path.lineTo(px, py)
+    }
+    path.close()
+    return path
+}
+
+/** Контур знака «+» или «−» с центром в (cx, cy) пикселей. */
+private fun signPath(cx: Float, cy: Float, k: Float, plus: Boolean): Path {
+    val h = 40f * k   // половина длины
+    val a = 10f * k   // половина толщины
+    val pts = if (plus) {
+        listOf(-a to -h, a to -h, a to -a, h to -a, h to a, a to a, a to h, -a to h, -a to a, -h to a, -h to -a, -a to -a)
+    } else {
+        listOf(-h to -a, h to -a, h to a, -h to a)
+    }
+    val path = Path()
+    pts.forEachIndexed { i, (x, y) -> if (i == 0) path.moveTo(cx + x, cy + y) else path.lineTo(cx + x, cy + y) }
+    path.close()
+    return path
+}
+
+/** Подпись под символом: знаки включённых сегментов и, если однозначно, номер квадранта. */
+private fun energyQuadrantCaption(dir: EnergyDirection): String {
+    if (dir.none) return "Нет"
+    val signs = listOfNotNull(
+        "P+".takeIf { dir.activePlus }, "P−".takeIf { dir.activeMinus },
+        "Q+".takeIf { dir.reactivePlus }, "Q−".takeIf { dir.reactiveMinus },
+    ).joinToString(" ")
+    val quadrant = when {
+        dir.activePlus && dir.reactivePlus && !dir.activeMinus && !dir.reactiveMinus -> "I"
+        dir.activeMinus && dir.reactivePlus && !dir.activePlus && !dir.reactiveMinus -> "II"
+        dir.activeMinus && dir.reactiveMinus && !dir.activePlus && !dir.reactivePlus -> "III"
+        dir.activePlus && dir.reactiveMinus && !dir.activeMinus && !dir.reactivePlus -> "IV"
+        else -> null
+    }
+    return if (quadrant != null) "Квадрант $quadrant · $signs" else signs
 }
 
 @Composable
@@ -284,8 +373,8 @@ private fun RowDivider() {
 @Composable
 private fun RowScope.LabelWithObis(label: String, obis: String?, showObis: Boolean) {
     Column(Modifier.weight(1f)) {
-        Text(label, color = RimTheme.palette.textSecondary, fontSize = 15.sp)
-        if (showObis && obis != null) MonoText(obis, color = RimPrimaryLight, fontSize = 11.sp, weight = FontWeight.Normal, modifier = Modifier.padding(top = 1.dp))
+        Text(label, color = RimTheme.palette.textSecondary, fontSize = 16.sp)
+        if (showObis && obis != null) MonoText(obis, color = RimTheme.palette.textFaint, fontSize = 12.sp, weight = FontWeight.Normal, modifier = Modifier.padding(top = 1.dp))
     }
 }
 
@@ -295,9 +384,9 @@ private fun InfoRow(label: String, value: String, obis: String?, showObis: Boole
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.Bottom) {
         LabelWithObis(label, obis, showObis)
         if (mono) {
-            MonoText(value, color = p.textPrimary, fontSize = 16.sp)
+            MonoText(value, color = p.textPrimary, fontSize = 19.sp, weight = FontWeight.SemiBold)
         } else {
-            Text(value, color = p.textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+            Text(value, color = p.textPrimary, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
         }
     }
 }
@@ -314,9 +403,9 @@ private fun SensorRow(label: String, condition: TamperCondition, unknown: Boolea
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(14.dp))
-            .background(color.copy(alpha = 0.08f))
-            .border(1.5.dp, color.copy(alpha = 0.22f), RoundedCornerShape(14.dp))
+            .clip(RimShapes.card)
+            .background(p.cardSurface)
+            .border(1.dp, p.border, RimShapes.card)
             .padding(horizontal = 16.dp, vertical = 14.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween,
@@ -327,6 +416,6 @@ private fun SensorRow(label: String, condition: TamperCondition, unknown: Boolea
             }
             Text(label, color = p.textPrimary, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
         }
-        Text(text, color = color, fontSize = 14.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Default)
+        StatusChip(text, color)
     }
 }

@@ -17,11 +17,11 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -29,13 +29,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import ru.rim.dd.ui.theme.RimPrimary
-import ru.rim.dd.ui.theme.RimPrimaryLight
+import ru.rim.dd.ui.theme.RimFonts
 import ru.rim.dd.ui.theme.RimTheme
 
 @Composable
@@ -44,10 +43,10 @@ fun GlassCard(modifier: Modifier = Modifier, content: @Composable () -> Unit) {
     Column(
         modifier = modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(18.dp))
+            .clip(RimShapes.card)
             .background(p.glassSurface)
-            .border(1.dp, p.border, RoundedCornerShape(18.dp))
-            .padding(18.dp),
+            .border(1.dp, p.border, RimShapes.card)
+            .padding(16.dp),
     ) { content() }
 }
 
@@ -57,9 +56,9 @@ fun DataCard(modifier: Modifier = Modifier, noPad: Boolean = false, content: @Co
     Column(
         modifier = modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(16.dp))
+            .clip(RimShapes.card)
             .background(p.cardSurface)
-            .border(1.dp, p.border, RoundedCornerShape(16.dp))
+            .border(1.dp, p.border, RimShapes.card)
             .padding(if (noPad) 0.dp else 16.dp),
     ) { content() }
 }
@@ -68,10 +67,11 @@ fun DataCard(modifier: Modifier = Modifier, noPad: Boolean = false, content: @Co
 fun SectionLabel(text: String, modifier: Modifier = Modifier) {
     Text(
         text = text.uppercase(),
-        color = RimPrimaryLight,
+        color = RimTheme.palette.accentText,
         fontSize = 13.sp,
         fontWeight = FontWeight.Bold,
-        letterSpacing = 1.sp,
+        fontFamily = RimFonts.Raleway,
+        letterSpacing = 1.2.sp,
         modifier = modifier.padding(start = 2.dp, bottom = 8.dp, top = 4.dp),
     )
 }
@@ -119,7 +119,7 @@ fun Switchy(value: Boolean, onChange: (Boolean) -> Unit) {
     Box(
         modifier = Modifier
             .size(width = 50.dp, height = 28.dp)
-            .clip(RoundedCornerShape(14.dp))
+            .clip(RimShapes.control)
             .background(track)
             .clickable { onChange(!value) },
         contentAlignment = if (value) Alignment.CenterEnd else Alignment.CenterStart,
@@ -128,7 +128,7 @@ fun Switchy(value: Boolean, onChange: (Boolean) -> Unit) {
             modifier = Modifier
                 .padding(3.dp)
                 .size(22.dp)
-                .clip(CircleShape)
+                .clip(RimShapes.chip)
                 .background(Color.White),
         )
     }
@@ -151,13 +151,13 @@ fun ScreenHeader(title: String, onRefresh: () -> Unit, refreshing: Boolean) {
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween,
     ) {
-        Text(title, color = p.textPrimary, fontSize = 28.sp, fontWeight = FontWeight.ExtraBold)
+        Text(title, color = p.textPrimary, fontSize = 28.sp, fontWeight = FontWeight.ExtraBold, fontFamily = RimFonts.Raleway)
         Box(
             modifier = Modifier
-                .size(40.dp)
-                .clip(RoundedCornerShape(12.dp))
+                .size(44.dp)
+                .clip(RimShapes.control)
                 .background(p.cardSurface)
-                .border(1.dp, p.border, RoundedCornerShape(12.dp))
+                .border(1.dp, p.border, RimShapes.control)
                 .clickable { onRefresh() },
             contentAlignment = Alignment.Center,
         ) {
@@ -171,7 +171,7 @@ fun ScreenHeader(title: String, onRefresh: () -> Unit, refreshing: Boolean) {
     }
 }
 
-/** Число или код моноширинным шрифтом (напряжение, OBIS, время). */
+/** Число или код: IBM Plex Sans с цифрами одинаковой ширины (напряжение, OBIS, время). */
 @Composable
 fun MonoText(
     text: String,
@@ -180,21 +180,32 @@ fun MonoText(
     modifier: Modifier = Modifier,
     weight: FontWeight = FontWeight.Bold,
 ) {
-    Text(text = text, color = color, fontSize = fontSize, fontWeight = weight, fontFamily = FontFamily.Monospace, modifier = modifier)
+    Text(
+        text = text, color = color, fontSize = fontSize, fontWeight = weight,
+        fontFamily = RimFonts.Plex, style = LocalTextStyle.current.copy(fontFeatureSettings = RimFonts.DIGITS),
+        modifier = modifier,
+    )
 }
 
-/** Чип-плашка статуса (реле, соединение, пломбы): цветная точка + текст. */
+/** Плашка статуса (реле, соединение, пломбы): сплошная заливка цветом статуса, белый текст. */
 @Composable
 fun StatusChip(text: String, color: Color, modifier: Modifier = Modifier) {
-    Row(
+    Box(
         modifier = modifier
-            .clip(RoundedCornerShape(8.dp))
-            .background(color.copy(alpha = 0.12f))
-            .padding(horizontal = 10.dp, vertical = 5.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
+            .clip(RimShapes.chip)
+            .background(color)
+            .padding(horizontal = 10.dp, vertical = 4.dp),
     ) {
-        Box(Modifier.size(6.dp).clip(CircleShape).background(color))
-        Text(text, color = color, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+        Text(text, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
     }
+}
+
+/**
+ * Формы по брендбуку: строгий стиль, минимум скруглений. card — карточки и кнопки,
+ * control — небольшие элементы управления, chip — плашки статусов и чипы.
+ */
+object RimShapes {
+    val card = RoundedCornerShape(4.dp)
+    val control = RoundedCornerShape(4.dp)
+    val chip = RoundedCornerShape(2.dp)
 }

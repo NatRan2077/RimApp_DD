@@ -1,6 +1,7 @@
 package ru.rim.dd.feature.settings
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -9,9 +10,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -20,19 +19,18 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
-import ru.rim.dd.core.model.ConnectionState
 import ru.rim.dd.ui.components.DataCard
 import ru.rim.dd.ui.components.Divider
 import ru.rim.dd.ui.components.MonoText
+import ru.rim.dd.ui.components.RimShapes
 import ru.rim.dd.ui.components.SectionLabel
 import ru.rim.dd.ui.components.ToggleRow
 import ru.rim.dd.ui.theme.RimError
-import ru.rim.dd.ui.theme.RimIconGradient
+import ru.rim.dd.ui.theme.RimFonts
 import ru.rim.dd.ui.theme.RimTheme
 
 @Composable
@@ -43,11 +41,9 @@ fun SettingsScreen(
     onDarkChange: (Boolean) -> Unit,
     viewModel: SettingsViewModel = hiltViewModel(),
 ) {
-    val connection by viewModel.connectionState.collectAsState()
     val signal by viewModel.signalStrengthDbm.collectAsState()
     val info by viewModel.meterInfo.collectAsState()
     val p = RimTheme.palette
-    val connected = connection is ConnectionState.Connected || connection is ConnectionState.Reconnecting
 
     Column(
         modifier = Modifier
@@ -57,7 +53,7 @@ fun SettingsScreen(
             .padding(start = 16.dp, end = 16.dp, top = 20.dp, bottom = 24.dp),
     ) {
         Column(Modifier.padding(bottom = 20.dp)) {
-            Text("Настройки", color = p.textPrimary, fontSize = 28.sp, fontWeight = FontWeight.ExtraBold)
+            Text("Настройки", color = p.textPrimary, fontSize = 28.sp, fontWeight = FontWeight.ExtraBold, fontFamily = RimFonts.Raleway)
             Text("Управление подключением и видом", color = p.textSecondary, fontSize = 15.sp, modifier = Modifier.padding(top = 3.dp))
         }
 
@@ -68,30 +64,26 @@ fun SettingsScreen(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(14.dp),
             ) {
-                Box(
-                    Modifier.size(42.dp).clip(RoundedCornerShape(12.dp)).background(Brush.linearGradient(RimIconGradient)),
-                    contentAlignment = Alignment.Center,
-                ) { Text("⚡", fontSize = 18.sp) }
                 Column(Modifier.weight(1f)) {
-                    Text(info?.model ?: "Не подключено", color = p.textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Bold)
-                    val sig = signal?.let { " · $it дБм" } ?: ""
-                    MonoText("№${info?.serialNumber ?: "—"}$sig", color = p.textSecondary, fontSize = 13.sp, weight = FontWeight.Normal)
+                    Text(info?.model ?: "Не подключено", color = p.textSecondary, fontSize = 17.sp, fontWeight = FontWeight.Bold, fontFamily = RimFonts.Raleway)
+                    MonoText("№ ${info?.serialNumber ?: "—"}", color = p.textPrimary, fontSize = 24.sp, weight = FontWeight.SemiBold)
+                    signal?.let { MonoText("Сигнал $it дБм", color = p.textSecondary, fontSize = 15.sp, weight = FontWeight.Normal) }
                 }
             }
-            if (connected) {
-                Divider()
-                Box(Modifier.padding(16.dp)) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(10.dp))
-                            .background(RimError.copy(alpha = 0.12f))
-                            .clickable { viewModel.disconnect() }
-                            .padding(vertical = 11.dp),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Text("Отключиться", color = RimError, fontSize = 16.sp, fontWeight = FontWeight.Bold)
-                    }
+            // Кнопка есть всегда: при потере связи (переподключение, ошибка) выйти из сеанса нужно так же,
+            // как и при нормальной работе. Экран «Настройки» доступен только внутри сеанса.
+            Divider()
+            Box(Modifier.padding(16.dp)) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RimShapes.control)
+                        .border(1.5.dp, RimError, RimShapes.control)
+                        .clickable { viewModel.disconnect() }
+                        .padding(vertical = 13.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text("Отключиться", color = RimError, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
                 }
             }
         }

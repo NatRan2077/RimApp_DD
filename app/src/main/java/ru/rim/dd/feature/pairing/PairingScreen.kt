@@ -6,17 +6,15 @@ import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
 import android.content.Context
 import android.content.Intent
+import android.location.LocationManager
 import android.os.Build
+import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -26,14 +24,13 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
@@ -46,11 +43,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.scale
-import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -61,15 +57,11 @@ import ru.rim.dd.core.ble.BleDevice
 import ru.rim.dd.core.model.MeterDeviceName
 import ru.rim.dd.ui.components.GlassCard
 import ru.rim.dd.ui.components.MonoText
-import ru.rim.dd.ui.theme.RimButtonGradient
+import ru.rim.dd.ui.components.RimShapes
+import ru.rim.dd.ui.components.SectionLabel
 import ru.rim.dd.ui.theme.RimError
-import ru.rim.dd.ui.theme.RimLilac
-import ru.rim.dd.ui.theme.RimPrimary
-import ru.rim.dd.ui.theme.RimPrimaryDeep
-import ru.rim.dd.ui.theme.RimPrimaryLight
-import ru.rim.dd.ui.theme.RimSuccess
+import ru.rim.dd.ui.theme.RimFonts
 import ru.rim.dd.ui.theme.RimTheme
-import ru.rim.dd.ui.theme.RimWarn
 
 private val blePermissions: Array<String> =
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -78,14 +70,18 @@ private val blePermissions: Array<String> =
         arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
     }
 
+/**
+ * На Android 9–11 поиск Bluetooth-устройств не работает при выключенной геолокации телефона: система
+ * молча возвращает пустой список. С Android 12 доступ к поиску выдаётся отдельным разрешением.
+ */
+private fun isLocationReady(context: Context): Boolean {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) return true
+    val manager = context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager ?: return true
+    return manager.isLocationEnabled
+}
+
 private fun isBluetoothEnabled(context: Context): Boolean =
     (context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter?.isEnabled == true
-
-private fun rssiColor(r: Int) = when {
-    r > -50 -> RimSuccess
-    r > -70 -> RimWarn
-    else -> RimError
-}
 
 @Composable
 fun PairingScreen(
@@ -113,37 +109,84 @@ fun PairingScreen(
 
     LaunchedEffect(state.isConnected) { if (state.isConnected) onConnected() }
 
-    // Проверка Bluetooth перед поиском и подключением: если выключен — системный запрос на
-    // включение, и действие продолжается только после согласия пользователя.
+    // Проверка Bluetooth и геолокации перед поиском и подключением: если Bluetooth выключен — системный
+    // запрос на включение, если выключена геолокация (Android 9–11) — подсказка с переходом в настройки.
+    // Действие продолжается только когда всё готово.
+    var showLocationDialog by remember { mutableStateOf(false) }
+    val runChecked: (() -> Unit) -> Unit = { action ->
+        if (isLocationReady(context)) action() else showLocationDialog = true
+    }
     var pendingAfterBluetooth by remember { mutableStateOf<(() -> Unit)?>(null) }
     val enableBluetoothLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         val action = pendingAfterBluetooth
         pendingAfterBluetooth = null
-        if (result.resultCode == Activity.RESULT_OK) action?.invoke()
+        if (result.resultCode == Activity.RESULT_OK) action?.let { runChecked(it) }
         else viewModel.reportError("Bluetooth выключен — включите его, чтобы искать и подключаться к приборам")
     }
     val withBluetooth: (() -> Unit) -> Unit = { action ->
         if (isBluetoothEnabled(context)) {
-            action()
+            runChecked(action)
         } else {
             pendingAfterBluetooth = action
             enableBluetoothLauncher.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
         }
     }
+    val focusManager = LocalFocusManager.current
+    val lossNotice by viewModel.lossNotice.collectAsState()
 
     val canConnect = (selected != null || serial.length >= 8) && !state.isConnecting
 
+    if (showLocationDialog) {
+        AlertDialog(
+            onDismissRequest = { showLocationDialog = false },
+            containerColor = p.cardSurface,
+            shape = RimShapes.card,
+            title = { Text("Включите геолокацию", color = p.textPrimary, fontFamily = RimFonts.Raleway, fontWeight = FontWeight.Bold) },
+            text = {
+                Text(
+                    "На этой версии Android поиск Bluetooth-приборов работает только при включённой геолокации. " +
+                            "Приложение не определяет и не сохраняет ваше местоположение.",
+                    color = p.textSecondary, fontSize = 16.sp,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showLocationDialog = false
+                    context.startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS))
+                }) { Text("Открыть настройки", color = p.accentText, fontWeight = FontWeight.SemiBold) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showLocationDialog = false }) { Text("Отмена", color = p.textSecondary) }
+            },
+        )
+    }
+
+    lossNotice?.let { message ->
+        AlertDialog(
+            onDismissRequest = { viewModel.dismissLossNotice() },
+            containerColor = p.cardSurface,
+            shape = RimShapes.card,
+            title = { Text("Обрыв связи", color = RimError, fontFamily = RimFonts.Raleway, fontWeight = FontWeight.Bold) },
+            text = { Text(message, color = p.textSecondary, fontSize = 16.sp) },
+            confirmButton = {
+                TextButton(onClick = { viewModel.dismissLossNotice() }) {
+                    Text("Понятно", color = p.accentText, fontWeight = FontWeight.SemiBold)
+                }
+            },
+        )
+    }
+
     Box(Modifier.fillMaxSize().background(p.background)) {
         Column(Modifier.fillMaxSize()) {
-            Column(Modifier.padding(start = 24.dp, end = 24.dp, top = 20.dp, bottom = 20.dp)) {
+            Column(Modifier.padding(start = 20.dp, end = 20.dp, top = 20.dp, bottom = 18.dp)) {
                 Text(
                     "Подключение", color = p.textPrimary, fontSize = 30.sp,
-                    fontWeight = FontWeight.ExtraBold,
+                    fontWeight = FontWeight.ExtraBold, fontFamily = RimFonts.Raleway,
                 )
-                Text("к счётчику", color = RimPrimary, fontSize = 30.sp, fontWeight = FontWeight.ExtraBold)
-                Text("Выберите способ подключения", color = p.textSecondary, fontSize = 15.sp, modifier = Modifier.padding(top = 8.dp))
+                Text("к счётчику", color = p.accentText, fontSize = 30.sp, fontWeight = FontWeight.ExtraBold, fontFamily = RimFonts.Raleway)
+                Text("Выберите прибор или введите номер", color = p.textSecondary, fontSize = 16.sp, modifier = Modifier.padding(top = 8.dp))
             }
 
             Column(
@@ -164,31 +207,31 @@ fun PairingScreen(
                 } else {
                     GlassCard {
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
-                            SonarIcon(scanning = state.isScanning)
                             Column(Modifier.weight(1f)) {
-                                Text("Сканировать эфир", color = p.textPrimary, fontSize = 21.sp, fontWeight = FontWeight.Bold)
+                                Text("Поиск приборов", color = p.textPrimary, fontSize = 20.sp, fontWeight = FontWeight.Bold, fontFamily = RimFonts.Raleway)
                                 Text(
-                                    if (state.isScanning) "Идёт поиск…" else "Поиск BLE устройств поблизости",
-                                    color = p.textSecondary, fontSize = 17.sp,
+                                    if (state.isScanning) "Идёт поиск…" else "Приборы учёта поблизости",
+                                    color = p.textSecondary, fontSize = 16.sp,
                                 )
                             }
+                            // «Искать» — сплошная фирменная кнопка, «Стоп» — красная рамка.
                             Box(
                                 modifier = Modifier
-                                    .clip(RoundedCornerShape(100.dp))
+                                    .clip(RimShapes.control)
                                     .then(
-                                        if (state.isScanning) Modifier.background(RimError.copy(alpha = 0.15f))
-                                        else Modifier.background(Brush.linearGradient(RimButtonGradient))
+                                        if (state.isScanning) Modifier.border(1.5.dp, RimError, RimShapes.control)
+                                        else Modifier.background(p.accent)
                                     )
                                     .clickable(enabled = !state.isConnecting) {
                                         if (state.isScanning) viewModel.stopScan()
                                         else withBluetooth { viewModel.scan() }
                                     }
-                                    .padding(horizontal = 18.dp, vertical = 9.dp),
+                                    .padding(horizontal = 20.dp, vertical = 10.dp),
                             ) {
                                 Text(
                                     if (state.isScanning) "Стоп" else "Искать",
                                     color = if (state.isScanning) RimError else Color.White,
-                                    fontSize = 21.sp, fontWeight = FontWeight.Bold,
+                                    fontSize = 18.sp, fontWeight = FontWeight.SemiBold,
                                 )
                             }
                         }
@@ -196,12 +239,22 @@ fun PairingScreen(
 
                     // Ручной ввод: только серийный номер, PIN не нужен
                     GlassCard {
-                        Text("Ввести номер ПУ", color = p.textPrimary, fontSize = 21.sp, fontWeight = FontWeight.Bold)
-                        Text("Серийный номер прибора", color = p.textSecondary, fontSize = 17.sp, modifier = Modifier.padding(bottom = 12.dp))
-                        FieldInput(serial, { serial = it }, "Серийный номер", KeyboardType.Number)
+                        Text(
+                            "Номер прибора учёта", color = p.textPrimary, fontSize = 20.sp, fontWeight = FontWeight.Bold,
+                            fontFamily = RimFonts.Raleway, modifier = Modifier.padding(bottom = 10.dp),
+                        )
+                        FieldInput(
+                            value = serial,
+                            onChange = { serial = it; selected = null },
+                            placeholder = "Серийный номер",
+                            keyboard = KeyboardType.Number,
+                            // Ввод номера и выбор найденного прибора взаимоисключают друг друга:
+                            // как только пользователь берётся за поле, выбор снимается.
+                            onFocus = { selected = null },
+                        )
                         // Три последних введённых номера — нажатие подставляет номер в поле.
                         if (recentSerials.isNotEmpty()) {
-                            Text("Недавние", color = p.textFaint, fontSize = 13.sp, modifier = Modifier.padding(top = 10.dp, bottom = 6.dp))
+                            Text("НЕДАВНИЕ", color = p.textSecondary, fontSize = 13.sp, letterSpacing = 1.sp, modifier = Modifier.padding(top = 12.dp, bottom = 6.dp))
                             Row(
                                 modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -214,15 +267,14 @@ fun PairingScreen(
                     }
 
                     if (state.foundDevices.isNotEmpty()) {
-                        Text(
-                            "НАЙДЕНО · ${state.foundDevices.size}",
-                            color = RimPrimaryLight, fontSize = 13.sp, fontWeight = FontWeight.Bold,
-                            letterSpacing = 1.sp, modifier = Modifier.padding(start = 4.dp),
-                        )
+                        SectionLabel("Найдено · ${state.foundDevices.size}")
                         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             state.foundDevices.forEach { dev ->
                                 DeviceRow(dev, dev.address == selected) {
                                     selected = if (dev.address == selected) null else dev.address
+                                    // Убираем фокус с поля номера: иначе повторное нажатие на него
+                                    // не вызвало бы событие фокуса и выбор прибора не снялся бы.
+                                    focusManager.clearFocus()
                                 }
                             }
                         }
@@ -264,30 +316,13 @@ private fun RecentSerialChip(serial: String, active: Boolean, onClick: () -> Uni
     val p = RimTheme.palette
     Box(
         modifier = Modifier
-            .clip(RoundedCornerShape(100.dp))
-            .background(if (active) RimPrimaryDeep.copy(alpha = if (p.dark) 0.30f else 0.15f) else RimPrimaryDeep.copy(alpha = 0.10f))
-            .border(1.dp, if (active) RimPrimary else p.border, RoundedCornerShape(100.dp))
+            .clip(RimShapes.chip)
+            .background(if (active) p.accent.copy(alpha = 0.10f) else p.cardSurface)
+            .border(if (active) 1.5.dp else 1.dp, if (active) p.accent else p.border, RimShapes.chip)
             .clickable { onClick() }
-            .padding(horizontal = 14.dp, vertical = 7.dp),
+            .padding(horizontal = 12.dp, vertical = 7.dp),
     ) {
-        MonoText(serial, color = if (active) RimLilac else p.textPrimary, fontSize = 15.sp, weight = FontWeight.Normal)
-    }
-}
-
-@Composable
-private fun SonarIcon(scanning: Boolean) {
-    val scale = if (scanning) {
-        val t = rememberInfiniteTransition(label = "sonar")
-        t.animateFloat(1f, 2f, infiniteRepeatable(tween(1500), RepeatMode.Restart), label = "s").value
-    } else 1f
-    Box(
-        Modifier.size(52.dp).clip(CircleShape).background(RimPrimaryDeep.copy(alpha = 0.15f)),
-        contentAlignment = Alignment.Center,
-    ) {
-        if (scanning) {
-            Box(Modifier.size(52.dp).scale(scale).clip(CircleShape).border(1.5.dp, RimPrimaryDeep.copy(alpha = (2f - scale).coerceIn(0f, 0.4f)), CircleShape))
-        }
-        Text("⚡", fontSize = 20.sp)
+        MonoText(serial, color = if (active) p.accentText else p.textPrimary, fontSize = 17.sp, weight = FontWeight.Medium)
     }
 }
 
@@ -297,29 +332,26 @@ private fun DeviceRow(dev: BleDevice, selected: Boolean, onClick: () -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(14.dp))
-            .background(if (selected) RimPrimaryDeep.copy(alpha = if (p.dark) 0.25f else 0.10f) else p.cardSurface)
-            .border(1.5.dp, if (selected) RimPrimary else p.border, RoundedCornerShape(14.dp))
+            .clip(RimShapes.card)
+            .background(if (selected) p.accent.copy(alpha = if (p.dark) 0.18f else 0.06f) else p.cardSurface)
+            .border(if (selected) 2.dp else 1.dp, if (selected) p.accent else p.border, RimShapes.card)
             .clickable { onClick() }
-            .padding(horizontal = 16.dp, vertical = 13.dp),
+            .padding(horizontal = 14.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(14.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Box(
-            Modifier.size(40.dp).clip(RoundedCornerShape(10.dp)).background(RimPrimaryDeep.copy(alpha = 0.15f)),
-            contentAlignment = Alignment.Center,
-        ) { Text("▯", color = if (selected) RimLilac else p.textSecondary, fontSize = 16.sp) }
         Column(Modifier.weight(1f)) {
-            // Тип прибора (AKROS / РиМ 189.40 / РиМ 384.02), под ним — серийный номер и MAC.
+            // Тип прибора (AKROS / РиМ 189.40 / РиМ 384.02), под ним — серийный номер крупно.
             val parsed = MeterDeviceName.parse(dev.name)
             Text(
                 MeterDeviceName.typeLabel(dev.name) ?: dev.name ?: "Неизвестное устройство",
-                color = if (selected) RimLilac else p.textPrimary, fontSize = 21.sp, fontWeight = FontWeight.Bold,
+                color = if (selected) p.accentText else p.textSecondary, fontSize = 17.sp,
+                fontWeight = FontWeight.Bold, fontFamily = RimFonts.Raleway,
             )
             if (parsed != null) {
-                MonoText("№ ${parsed.serialNumber}", color = if (selected) RimLilac else p.textPrimary, fontSize = 24.sp, weight = FontWeight.ExtraBold)
+                MonoText("№ ${parsed.serialNumber}", color = p.textPrimary, fontSize = 27.sp, weight = FontWeight.SemiBold)
             } else {
-                MonoText(dev.address, color = p.textSecondary, fontSize = 15.sp, weight = FontWeight.Normal)
+                MonoText(dev.address, color = p.textSecondary, fontSize = 16.sp, weight = FontWeight.Normal)
             }
         }
         Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -328,42 +360,46 @@ private fun DeviceRow(dev: BleDevice, selected: Boolean, onClick: () -> Unit) {
                 (1..4).forEach { i ->
                     Box(
                         Modifier
-                            .size(width = 4.dp, height = (4 + i * 3).dp)
-                            .clip(RoundedCornerShape(2.dp))
-                            .background(if (i <= bars) rssiColor(dev.rssi) else p.border),
+                            .size(width = 5.dp, height = (5 + i * 3).dp)
+                            .background(if (i <= bars) p.accent else p.border),
                     )
                 }
             }
-            MonoText("${dev.rssi} дБм", color = rssiColor(dev.rssi), fontSize = 13.sp)
-        }
-        if (selected) {
-            Box(Modifier.size(20.dp).clip(CircleShape).background(RimPrimary), contentAlignment = Alignment.Center) {
-                Text("✓", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-            }
+            MonoText("${dev.rssi} дБм", color = p.textSecondary, fontSize = 14.sp, weight = FontWeight.Medium)
         }
     }
 }
 
 @Composable
-private fun FieldInput(value: String, onChange: (String) -> Unit, placeholder: String, keyboard: KeyboardType) {
+private fun FieldInput(
+    value: String,
+    onChange: (String) -> Unit,
+    placeholder: String,
+    keyboard: KeyboardType,
+    onFocus: () -> Unit = {},
+) {
     val p = RimTheme.palette
-    val container = if (p.dark) Color.White.copy(alpha = 0.05f) else RimPrimaryDeep.copy(alpha = 0.04f)
+    val container = p.fieldSurface
     TextField(
         value = value,
         onValueChange = onChange,
-        placeholder = { Text(placeholder, color = p.textFaint, fontFamily = FontFamily.Monospace) },
+        placeholder = { Text(placeholder, color = p.textFaint, fontSize = 20.sp) },
         singleLine = true,
-        textStyle = LocalTextStyle.current.copy(fontFamily = FontFamily.Monospace, fontSize = 16.sp),
+        textStyle = LocalTextStyle.current.copy(
+            fontFamily = RimFonts.Plex, fontSize = 22.sp, fontWeight = FontWeight.Medium,
+            fontFeatureSettings = RimFonts.DIGITS, letterSpacing = 1.sp,
+        ),
         keyboardOptions = KeyboardOptions(keyboardType = keyboard),
-        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)),
+        shape = RimShapes.control,
+        modifier = Modifier.fillMaxWidth().onFocusChanged { if (it.isFocused) onFocus() },
         colors = TextFieldDefaults.colors(
             focusedContainerColor = container,
             unfocusedContainerColor = container,
             focusedTextColor = p.textPrimary,
             unfocusedTextColor = p.textPrimary,
-            focusedIndicatorColor = RimPrimary,
-            unfocusedIndicatorColor = Color.Transparent,
-            cursorColor = RimPrimary,
+            focusedIndicatorColor = p.accent,
+            unfocusedIndicatorColor = p.border,
+            cursorColor = p.accent,
         ),
     )
 }
@@ -373,11 +409,8 @@ private fun GradientButton(text: String, modifier: Modifier = Modifier, enabled:
     val p = RimTheme.palette
     Box(
         modifier = modifier
-            .clip(RoundedCornerShape(16.dp))
-            .then(
-                if (enabled) Modifier.background(Brush.linearGradient(RimButtonGradient))
-                else Modifier.background(if (p.dark) Color.White.copy(alpha = 0.06f) else Color.Black.copy(alpha = 0.07f))
-            )
+            .clip(RimShapes.card)
+            .background(if (enabled) p.accent else if (p.dark) Color.White.copy(alpha = 0.08f) else Color.Black.copy(alpha = 0.07f))
             .clickable(enabled = enabled) { onClick() }
             .padding(vertical = 16.dp),
         contentAlignment = Alignment.Center,
@@ -385,7 +418,7 @@ private fun GradientButton(text: String, modifier: Modifier = Modifier, enabled:
         Text(
             text,
             color = if (enabled) Color.White else p.textFaint,
-            fontSize = 18.sp, fontWeight = FontWeight.Bold,
+            fontSize = 18.sp, fontWeight = FontWeight.SemiBold,
         )
     }
 }

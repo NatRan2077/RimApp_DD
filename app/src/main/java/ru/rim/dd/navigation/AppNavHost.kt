@@ -2,14 +2,15 @@ package ru.rim.dd.navigation
 
 import android.app.Activity
 import android.graphics.drawable.ColorDrawable
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.List
@@ -25,7 +26,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -48,9 +49,8 @@ import ru.rim.dd.feature.pairing.PairingScreen
 import ru.rim.dd.feature.readings.ReadingsScreen
 import ru.rim.dd.feature.settings.AppSettingsViewModel
 import ru.rim.dd.feature.settings.SettingsScreen
-import ru.rim.dd.ui.theme.RimPrimaryDeep
+import ru.rim.dd.ui.theme.RimError
 import ru.rim.dd.ui.theme.RimTheme
-import ru.rim.dd.ui.theme.RimViolet
 
 private object Routes {
     const val PAIRING = "pairing"
@@ -100,6 +100,17 @@ fun AppNavHost() {
             }
         }
 
+        // «Назад» при подключённом приборе означает «выйти»: разрываем связь и уходим на экран подключения.
+        val leaveSession: () -> Unit = {
+            connectionWatcher.disconnect()
+            navController.navigate(Routes.PAIRING) {
+                popUpTo(navController.graph.findStartDestination().id) { inclusive = true }
+            }
+        }
+        // Связь пропала, но сеанс ещё не закрыт (идёт переподключение) — показываем плашку.
+        val linkLost = currentRoute != null && currentRoute != Routes.PAIRING &&
+                connectionState !is ConnectionState.Connected && connectionState !is ConnectionState.Idle
+
         Scaffold(
             containerColor = palette.background,
             bottomBar = {
@@ -117,24 +128,48 @@ fun AppNavHost() {
                 }
             },
         ) { padding ->
-            NavHost(
-                navController = navController,
-                startDestination = Routes.PAIRING,
-                modifier = Modifier.padding(padding),
-            ) {
-                composable(Routes.PAIRING) {
-                    PairingScreen(onConnected = { navController.navigate(Routes.READINGS) })
-                }
-                composable(Routes.READINGS) { ReadingsScreen(showObis = showObis) }
-                composable(Routes.NETWORK) { NetworkScreen(showObis = showObis) }
-                composable(Routes.INFO) { InfoScreen(showObis = showObis) }
-                composable(Routes.SETTINGS) {
-                    SettingsScreen(
-                        showObis = showObis,
-                        onShowObisChange = appSettings::setShowObis,
-                        dark = dark,
-                        onDarkChange = appSettings::setDarkTheme,
+            Column(Modifier.padding(padding).fillMaxSize()) {
+                if (linkLost) {
+                    Text(
+                        "Нет связи с прибором — идёт переподключение…",
+                        color = Color.White,
+                        fontSize = 15.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(RimError)
+                            .padding(horizontal = 16.dp, vertical = 8.dp),
                     )
+                }
+                NavHost(
+                    navController = navController,
+                    startDestination = Routes.PAIRING,
+                    modifier = Modifier.weight(1f),
+                ) {
+                    composable(Routes.PAIRING) {
+                        PairingScreen(onConnected = { navController.navigate(Routes.READINGS) })
+                    }
+                    composable(Routes.READINGS) {
+                        BackHandler(onBack = leaveSession)
+                        ReadingsScreen(showObis = showObis)
+                    }
+                    composable(Routes.NETWORK) {
+                        BackHandler(onBack = leaveSession)
+                        NetworkScreen(showObis = showObis)
+                    }
+                    composable(Routes.INFO) {
+                        BackHandler(onBack = leaveSession)
+                        InfoScreen(showObis = showObis)
+                    }
+                    composable(Routes.SETTINGS) {
+                        BackHandler(onBack = leaveSession)
+                        SettingsScreen(
+                            showObis = showObis,
+                            onShowObisChange = appSettings::setShowObis,
+                            dark = dark,
+                            onDarkChange = appSettings::setDarkTheme,
+                        )
+                    }
                 }
             }
         }
@@ -151,31 +186,32 @@ private fun RimBottomBar(
         modifier = Modifier
             .fillMaxWidth()
             .background(palette.navBackground)
-            .padding(start = 8.dp, end = 8.dp, top = 6.dp, bottom = 10.dp),
-        horizontalArrangement = Arrangement.spacedBy(4.dp),
+            .drawBehind { drawRect(palette.border, size = androidx.compose.ui.geometry.Size(size.width, 1.dp.toPx())) },
     ) {
         bottomTabs.forEach { tab ->
             val active = currentRoute?.any { it.route == tab.route } == true
             Column(
                 modifier = Modifier
                     .weight(1f)
-                    .clip(RoundedCornerShape(12.dp))
-                    .background(if (active) RimPrimaryDeep.copy(alpha = if (palette.dark) 0.20f else 0.10f) else Color.Transparent)
+                    // Активная вкладка — фирменная полоса 3 dp сверху, без подложки и скруглений.
+                    .drawBehind {
+                        if (active) drawRect(palette.accent, size = androidx.compose.ui.geometry.Size(size.width, 3.dp.toPx()))
+                    }
                     .clickable { onSelect(tab.route) }
-                    .padding(vertical = 8.dp),
+                    .padding(top = 10.dp, bottom = 10.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(4.dp),
             ) {
                 Icon(
                     tab.icon,
                     contentDescription = tab.label,
-                    tint = if (active) RimViolet else palette.textFaint,
+                    tint = if (active) palette.accentText else palette.textSecondary,
                 )
                 Text(
                     tab.label,
-                    color = if (active) RimViolet else palette.textFaint,
-                    fontSize = 12.sp,
-                    fontWeight = if (active) FontWeight.Bold else FontWeight.Normal,
+                    color = if (active) palette.accentText else palette.textSecondary,
+                    fontSize = 13.sp,
+                    fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
                 )
             }
         }

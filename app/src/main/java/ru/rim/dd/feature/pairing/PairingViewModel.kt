@@ -3,6 +3,7 @@ package ru.rim.dd.feature.pairing
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -16,6 +17,7 @@ import ru.rim.dd.core.ble.BleDevice
 import ru.rim.dd.core.model.MeterDeviceName
 import ru.rim.dd.data.local.DeviceStore
 import ru.rim.dd.data.repository.MeterRepository
+import ru.rim.dd.navigation.ConnectionNotice
 import javax.inject.Inject
 
 data class PairingUiState(
@@ -31,6 +33,7 @@ data class PairingUiState(
 class PairingViewModel @Inject constructor(
     private val repository: MeterRepository,
     private val deviceStore: DeviceStore,
+    private val connectionNotice: ConnectionNotice,
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(PairingUiState())
@@ -39,6 +42,11 @@ class PairingViewModel @Inject constructor(
     /** Три последних вручную введённых номера ПУ — для быстрого набора. */
     val recentSerials: StateFlow<List<String>> = deviceStore.recentEnteredSerials
         .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    /** Предупреждение об обрыве связи: приложение само закрыло сеанс (см. ConnectionWatcherViewModel). */
+    val lossNotice: StateFlow<String?> = connectionNotice.message
+
+    fun dismissLossNotice() = connectionNotice.clear()
 
     private var scanJob: Job? = null
 
@@ -50,18 +58,31 @@ class PairingViewModel @Inject constructor(
         scanJob?.cancel()
         _uiState.value = _uiState.value.copy(isScanning = true, foundDevices = emptyList(), errorMessage = null)
         scanJob = viewModelScope.launch {
-            repository.scanDevices()
-                .filter { MeterDeviceName.looksLikeMeter(it.name) }
-                .collect { device ->
-                    val current = _uiState.value.foundDevices
-                    if (current.none { it.address == device.address }) {
-                        _uiState.value = _uiState.value.copy(foundDevices = current + device)
+            try {
+                repository.scanDevices()
+                    // Не фиксированный префикс, а looksLikeMeter: он пропускает и приборы вида AKROS-…
+                    .filter { MeterDeviceName.looksLikeMeter(it.name) }
+                    .collect { device ->
+                        val current = _uiState.value.foundDevices
+                        if (current.none { it.address == device.address }) {
+                            _uiState.value = _uiState.value.copy(foundDevices = current + device)
+                        }
                     }
-                }
-            _uiState.value = _uiState.value.copy(
-                isScanning = false,
-                errorMessage = "Не удалось начать поиск — проверьте, что Bluetooth включён",
-            )
+                // Сюда попадаем только если поток сам завершился (отмена бросает исключение мимо этой
+                // строки): радио-сканер недоступен, например выключен Bluetooth.
+                _uiState.value = _uiState.value.copy(
+                    isScanning = false,
+                    errorMessage = "Не удалось начать поиск — проверьте, что Bluetooth включён",
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // Причину отказа даёт сам сканер (см. MeterBleClient.scan): без неё поиск «молча не шёл».
+                _uiState.value = _uiState.value.copy(
+                    isScanning = false,
+                    errorMessage = e.message ?: "Не удалось начать поиск",
+                )
+            }
         }
     }
 

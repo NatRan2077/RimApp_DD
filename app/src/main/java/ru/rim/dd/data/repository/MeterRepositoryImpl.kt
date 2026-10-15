@@ -4,6 +4,7 @@ import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
@@ -57,8 +58,12 @@ import ru.rim.dd.core.model.Reading
 import ru.rim.dd.core.model.RelaySource
 import ru.rim.dd.core.model.RelayState
 import ru.rim.dd.core.model.TamperState
+import ru.rim.dd.core.model.EnergyCategory
 import ru.rim.dd.data.local.DeviceStore
+import ru.rim.dd.data.local.JournalLine
+import ru.rim.dd.data.local.JournalStore
 import ru.rim.dd.data.local.ReadingDao
+import ru.rim.dd.ui.components.formatNumber
 import java.io.ByteArrayOutputStream
 import java.time.Instant
 import java.time.LocalDate
@@ -78,6 +83,7 @@ class MeterRepositoryImpl @Inject constructor(
     private val spodes: SpodesClientBridge,
     private val readingDao: ReadingDao,
     private val deviceStore: DeviceStore,
+    private val journal: JournalStore,
 ) : MeterRepository {
 
     private val _relayState = MutableStateFlow(
@@ -159,6 +165,24 @@ class MeterRepositoryImpl @Inject constructor(
      */
     private var consecutiveForceReconnectsWithoutData = 0
 
+    /**
+     * Данные принадлежат конкретному прибору, поэтому при новом подключении и при отключении
+     * всё, что осталось от прошлого, обнуляется. Иначе поля, которых новый прибор не присылает
+     * (например HDLC P1 у AKROS), показывались бы со значениями прежнего ПУ: разбор буфера
+     * сохраняет прежнее значение для не пришедших полей.
+     */
+    private fun resetSessionData() {
+        _relayState.value = RelayState(isOn = false, powerLimitKw = 0.0, source = RelaySource.UNKNOWN)
+        _tamperState.value = TamperState.UNKNOWN
+        _networkParams.value = null
+        _meterInfo.value = null
+        _readings.value = emptyList()
+        akrosCaptureObis = emptyList()
+        akrosScalerUnits = emptyMap()
+        activeSerialNumber = null
+        meterReportedSerial = null
+    }
+
     init {
         // GATT переподключает MeterBleClient (свой цикл); здесь только протокольная часть:
         // при обрыве останавливаем обмен, при восстановлении пересобираем DLMS-сеанс.
@@ -185,8 +209,8 @@ class MeterRepositoryImpl @Inject constructor(
     override fun scanDevices(): Flow<BleDevice> = ble.scan()
 
     override suspend fun connectByAddress(address: String, pin: String, remember: Boolean, deviceName: String?) {
-        // Номер от прибора относится к конкретному сеансу — не тащим его с прошлого подключения.
-        meterReportedSerial = null
+        // Всё, что осталось от прошлого прибора (номер, показания, инфо), к новому не относится.
+        resetSessionData()
         withContext(Dispatchers.IO) { ble.connectByAddress(address, deviceName) }
         openProtocolSession(deviceName)
 
@@ -202,6 +226,7 @@ class MeterRepositoryImpl @Inject constructor(
                 ),
             )
         }
+        updateJournal()
         startAutoRefresh()
     }
 
@@ -213,7 +238,7 @@ class MeterRepositoryImpl @Inject constructor(
      * фильтр поиска; это пишется в лог.
      */
     override suspend fun connectBySerialNumber(serialNumber: String, pin: String, remember: Boolean) {
-        meterReportedSerial = null
+        resetSessionData()
         val found = withContext(Dispatchers.IO) { ble.connectBySerialNumber(serialNumber) }
         openProtocolSession(found.name)
 
@@ -249,6 +274,7 @@ class MeterRepositoryImpl @Inject constructor(
                 ),
             )
         }
+        updateJournal()
         startAutoRefresh()
     }
 
@@ -261,12 +287,19 @@ class MeterRepositoryImpl @Inject constructor(
         isAkros = MeterProtocolProfile.forDeviceName(deviceName) == MeterProtocolProfile.AKROS_STANDARD
         akrosAssociation = false
         Log.i(TAG, "Обмен с \"$deviceName\": ${if (isAkros) "AKROS" else "РиМ"}")
-        spodes.createClient()
-        startTransportPump()
-        if (!establishSessionAndReadFirst()) {
-            stopTransportPump()
-            ble.disconnect()
-            throw IllegalStateException(lastProtocolError ?: "неизвестная ошибка")
+        // Карточка журнала и лог байтов заводятся до первого обмена; при неудаче удаляются.
+        withContext(Dispatchers.IO) { journal.begin() }
+        try {
+            spodes.createClient()
+            startTransportPump()
+            if (!establishSessionAndReadFirst()) {
+                stopTransportPump()
+                ble.disconnect()
+                throw IllegalStateException(lastProtocolError ?: "неизвестная ошибка")
+            }
+        } catch (ex: Exception) {
+            withContext(NonCancellable + Dispatchers.IO) { journal.discard() }
+            throw ex
         }
     }
 
@@ -310,6 +343,7 @@ class MeterRepositoryImpl @Inject constructor(
     private fun abortSession(message: String): Nothing {
         stopTransportPump()
         ble.disconnect()
+        journal.discard()
         throw IllegalStateException(message)
     }
 
@@ -506,7 +540,50 @@ class MeterRepositoryImpl @Inject constructor(
         applyEnergyReadings(all)
         applyNetworkParams(all)
         applyMeterInfo(all)
+        updateJournal()
     }
+
+    /**
+     * Переносит последние разобранные данные в карточку журнала: тип и номер ПУ, энергию по
+     * тарифам, напряжение и ток. Вызывается после каждого разобранного буфера.
+     */
+    private fun updateJournal() {
+        val info = _meterInfo.value
+        val net = _networkParams.value
+        journal.update(
+            meterType = info?.model?.replace(Regex("^(РиМ|RIM|Rim)\\s*", RegexOption.IGNORE_CASE), "")?.trim(),
+            serialNumber = meterReportedSerial ?: info?.serialNumber,
+            energy = journalEnergyLines(_readings.value),
+            voltage = net?.let { journalPhases(it.voltage, 1, "В") },
+            current = net?.let { journalPhases(it.current, 3, "А") },
+        )
+    }
+
+    private fun journalEnergyLines(readings: List<Reading>): List<JournalLine> {
+        fun head(c: EnergyCategory) = when (c) {
+            EnergyCategory.ACTIVE_IMPORT -> "A+"
+            EnergyCategory.ACTIVE_EXPORT -> "A−"
+            EnergyCategory.REACTIVE_Q1 -> "R+"
+            EnergyCategory.REACTIVE_Q4 -> "R−"
+            EnergyCategory.OTHER -> "Прочее"
+        }
+        return readings
+            .filter { !it.isRdch && it.category != EnergyCategory.OTHER }
+            .sortedWith(compareBy({ it.category.ordinal }, { it.tariff ?: 0 }))
+            .map {
+                val tariff = if (it.tariff == null) "сумма" else "Т${it.tariff}"
+                val unit = it.unitLabel?.let { u -> " $u" } ?: ""
+                JournalLine("${head(it.category)} · $tariff", formatNumber(it.valueKwh, 3) + unit)
+            }
+    }
+
+    private fun journalPhases(v: PhaseValues, decimals: Int, unit: String): String =
+        if (v.isThreePhase) {
+            "L1 ${formatNumber(v.l1 ?: 0.0, decimals)} · L2 ${formatNumber(v.l2 ?: 0.0, decimals)} · " +
+                    "L3 ${formatNumber(v.l3 ?: 0.0, decimals)} $unit"
+        } else {
+            "${formatNumber(v.total, decimals)} $unit"
+        }
 
     /** Поле буфера по OBIS-коду; при дубликатах берётся первое. */
     private fun List<ObisReading>.byObis(obis: String) = firstOrNull { it.obisCode == obis }
@@ -988,7 +1065,10 @@ class MeterRepositoryImpl @Inject constructor(
         stopTransportPump()
         pumpJob = repositoryScope.launch {
             launch {
-                ble.incomingBytes().collect { chunk -> spodes.pushIncomingBytes(chunk) }
+                ble.incomingBytes().collect { chunk ->
+                    journal.appendBytes(chunk)
+                    spodes.pushIncomingBytes(chunk)
+                }
             }
             launch {
                 while (true) {
@@ -1087,6 +1167,8 @@ class MeterRepositoryImpl @Inject constructor(
             }
         }
     }
+
+    override suspend fun addToJournal(): Boolean = withContext(Dispatchers.IO) { journal.commit() }
 
     override fun readings(): Flow<List<Reading>> = _readings.asStateFlow()
 
@@ -1210,8 +1292,9 @@ class MeterRepositoryImpl @Inject constructor(
         stopTransportPump()
         protocolMutex.withLock { withContext(Dispatchers.IO) { spodes.destroyClient() } }
         ble.disconnect()
-        activeSerialNumber = null
-        meterReportedSerial = null
+        withContext(NonCancellable + Dispatchers.IO) { journal.end() }
+        // Данные отключённого прибора не должны достаться следующему.
+        resetSessionData()
         protocolSessionEstablished = false
         consecutiveEmptyOrFailedReads = 0
         isAkros = false
@@ -1226,7 +1309,7 @@ class MeterRepositoryImpl @Inject constructor(
         private const val FLAT_SRC_ADDRESS = 0x43
 
         private const val PUMP_POLL_INTERVAL_MS = 20L
-        private const val AUTO_REFRESH_INTERVAL_MS = 1_000L
+        private const val AUTO_REFRESH_INTERVAL_MS = 5_000L
 
         /** Три цикла × 5 с = 15 с: не реагируем на единичный сбой, но и не держим мёртвое «Подключено». */
         private const val MAX_CONSECUTIVE_PROTOCOL_FAILURES = 3

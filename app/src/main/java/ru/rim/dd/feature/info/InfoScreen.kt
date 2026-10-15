@@ -56,7 +56,6 @@ import ru.rim.dd.ui.components.ScreenHeader
 import ru.rim.dd.ui.components.SectionLabel
 import ru.rim.dd.ui.components.StatusChip
 import ru.rim.dd.ui.components.formatDate
-import ru.rim.dd.ui.components.formatDateTime
 import ru.rim.dd.ui.components.formatNumber
 import ru.rim.dd.ui.components.formatTime
 import ru.rim.dd.ui.components.tariffLabel
@@ -107,7 +106,6 @@ fun InfoScreen(showObis: Boolean, viewModel: InfoViewModel = hiltViewModel()) {
             inf.backupVoltageV?.let { add { InfoRow("Напряжение батарейки", "${formatNumber(it, 3)} В", "0.0.96.6.3.255", showObis) } }
             inf.deviceDate?.let { add { InfoRow("Дата прибора", formatDate(it), inf.deviceDateObis, showObis, mono = true) } }
             inf.deviceTime?.let { add { InfoRow("Время прибора", formatTime(it), inf.deviceTimeObis, showObis, mono = true) } }
-            inf.rdchDateTime?.let { add { InfoRow("Расчётный день (РДЧ)", formatDateTime(it), "0.0.0.9.2.101", showObis, mono = true) } }
             inf.firmwareVersion.takeIf { it.isNotBlank() && it != "—" }?.let { add { InfoRow("Версия ПО", it, inf.firmwareVersionObis, showObis) } }
             inf.currentTariff?.let { add { InfoRow("Текущий тариф", tariffLabel(it), "0.0.96.14.0.255", showObis) } }
             inf.operatingTime?.let { t ->
@@ -382,7 +380,7 @@ private fun RowScope.LabelWithObis(label: String, obis: String?, showObis: Boole
 private fun InfoRow(label: String, value: String, obis: String?, showObis: Boolean, mono: Boolean = false) {
     val p = RimTheme.palette
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.Bottom) {
-        LabelWithObis(label, obis, showObis)
+        LabelWithObis(label, obis, showObis) // уже weight(1f): название занимает остаток ширины
         if (mono) {
             MonoText(value, color = p.textPrimary, fontSize = 19.sp, weight = FontWeight.SemiBold)
         } else {

@@ -44,6 +44,7 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import ru.rim.dd.core.model.ConnectionState
 import ru.rim.dd.feature.info.InfoScreen
+import ru.rim.dd.feature.journal.JournalScreen
 import ru.rim.dd.feature.network.NetworkScreen
 import ru.rim.dd.feature.pairing.PairingScreen
 import ru.rim.dd.feature.readings.ReadingsScreen
@@ -58,6 +59,7 @@ private object Routes {
     const val NETWORK = "network"
     const val INFO = "info"
     const val SETTINGS = "settings"
+    const val JOURNAL = "journal"
 }
 
 private data class BottomTab(val route: String, val label: String, val icon: ImageVector)
@@ -117,6 +119,7 @@ fun AppNavHost() {
                 if (showBottomBar) {
                     RimBottomBar(
                         currentRoute = backStackEntry?.destination?.hierarchy,
+                        forceRoute = if (currentRoute == Routes.JOURNAL) Routes.SETTINGS else null,
                         onSelect = { route ->
                             navController.navigate(route) {
                                 popUpTo(navController.graph.findStartDestination().id) { saveState = true }
@@ -168,7 +171,13 @@ fun AppNavHost() {
                             onShowObisChange = appSettings::setShowObis,
                             dark = dark,
                             onDarkChange = appSettings::setDarkTheme,
+                            onOpenJournal = { navController.navigate(Routes.JOURNAL) },
                         )
+                    }
+                    composable(Routes.JOURNAL) {
+                        // «Назад» из журнала возвращает в настройки, а не завершает сеанс.
+                        BackHandler { navController.popBackStack() }
+                        JournalScreen(onBack = { navController.popBackStack() })
                     }
                 }
             }
@@ -179,6 +188,7 @@ fun AppNavHost() {
 @Composable
 private fun RimBottomBar(
     currentRoute: Sequence<NavDestination>?,
+    forceRoute: String?,
     onSelect: (String) -> Unit,
 ) {
     val palette = RimTheme.palette
@@ -189,7 +199,7 @@ private fun RimBottomBar(
             .drawBehind { drawRect(palette.border, size = androidx.compose.ui.geometry.Size(size.width, 1.dp.toPx())) },
     ) {
         bottomTabs.forEach { tab ->
-            val active = currentRoute?.any { it.route == tab.route } == true
+            val active = forceRoute == tab.route || currentRoute?.any { it.route == tab.route } == true
             Column(
                 modifier = Modifier
                     .weight(1f)

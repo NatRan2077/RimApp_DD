@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Временные файлы экспорта журнала: cacheDir/journal_export/ -->
+    <cache-path name="journal_export" path="journal_export/" />
+</paths>

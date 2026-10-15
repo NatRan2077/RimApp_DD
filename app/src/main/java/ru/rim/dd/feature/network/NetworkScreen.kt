@@ -28,6 +28,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
+import ru.rim.dd.core.model.LineVoltages
 import ru.rim.dd.core.model.PhaseValues
 import ru.rim.dd.core.model.RelaySource
 import ru.rim.dd.ui.components.DataCard
@@ -106,18 +107,8 @@ fun NetworkScreen(showObis: Boolean, viewModel: NetworkViewModel = hiltViewModel
                 }
             }
             params.lineVoltages?.let { lv ->
-                val codes = if (lv.legacyCodes) listOf("1.0.12.7.1.255", "1.0.12.7.2.255", "1.0.12.7.3.255")
-                else listOf("1.0.124.7.0.255", "1.0.125.7.0.255", "1.0.126.7.0.255")
-                lv.l12?.let {
-                    ExtraRow("Напряжение L1–L2", "${formatNumber(it, 1)} В", codes[0], showObis)
-                    RowDivider()
-                }
-                lv.l23?.let {
-                    ExtraRow("Напряжение L2–L3", "${formatNumber(it, 1)} В", codes[1], showObis)
-                    RowDivider()
-                }
-                lv.l13?.let {
-                    ExtraRow("Напряжение L1–L3", "${formatNumber(it, 1)} В", codes[2], showObis)
+                if (lv.l12 != null || lv.l23 != null || lv.l13 != null) {
+                    LineVoltagesBlock(lv, if (lv.legacyCodes) "1.0.12.7.1/2/3.255" else "1.0.124/125/126.7.0.255", showObis)
                     RowDivider()
                 }
             }
@@ -205,11 +196,32 @@ private fun PowerRow(label: String, value: String, unit: String, obis: String, s
     }
 }
 
+/**
+ * Строка «название — значение». Название занимает остаток ширины (weight), поэтому слово не
+ * «ломается» по буквам, когда значение длинное; длинное значение (cos φ по трём фазам) мельче.
+ */
 @Composable
 private fun ExtraRow(label: String, value: String, obis: String, showObis: Boolean) {
     val p = RimTheme.palette
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-        LabelWithObis(label, obis, showObis)
-        MonoText(value, color = p.textPrimary, fontSize = 22.sp, weight = FontWeight.SemiBold)
+        Box(Modifier.weight(1f).padding(end = 8.dp)) { LabelWithObis(label, obis, showObis) }
+        MonoText(value, color = p.textPrimary, fontSize = if (value.length > 12) 17.sp else 22.sp, weight = FontWeight.SemiBold)
+    }
+}
+
+/** Линейные напряжения трёхфазного ПУ: три колонки L1–L2 / L2–L3 / L1–L3 вместо трёх длинных строк. */
+@Composable
+private fun LineVoltagesBlock(lv: LineVoltages, obis: String, showObis: Boolean) {
+    val p = RimTheme.palette
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        LabelWithObis("Линейные напряжения, В", obis, showObis)
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            listOf("L1–L2" to lv.l12, "L2–L3" to lv.l23, "L1–L3" to lv.l13).forEach { (name, value) ->
+                Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(name, color = p.textSecondary, fontSize = 14.sp)
+                    MonoText(value?.let { formatNumber(it, 1) } ?: "—", color = p.textPrimary, fontSize = 22.sp, weight = FontWeight.SemiBold)
+                }
+            }
+        }
     }
 }

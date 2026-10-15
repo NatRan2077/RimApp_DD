@@ -33,6 +33,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import ru.rim.dd.feature.journal.AddToJournalButton
 import ru.rim.dd.ui.theme.RimPrimary
 import ru.rim.dd.ui.theme.RimFonts
 import ru.rim.dd.ui.theme.RimTheme
@@ -151,22 +152,29 @@ fun ScreenHeader(title: String, onRefresh: () -> Unit, refreshing: Boolean) {
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween,
     ) {
-        Text(title, color = p.textPrimary, fontSize = 28.sp, fontWeight = FontWeight.ExtraBold, fontFamily = RimFonts.Raleway)
-        Box(
-            modifier = Modifier
-                .size(44.dp)
-                .clip(RimShapes.control)
-                .background(p.cardSurface)
-                .border(1.dp, p.border, RimShapes.control)
-                .clickable { onRefresh() },
-            contentAlignment = Alignment.Center,
-        ) {
-            Icon(
-                imageVector = Icons.Filled.Refresh,
-                contentDescription = "Обновить",
-                tint = p.textSecondary,
-                modifier = Modifier.size(20.dp).rotate(angle),
-            )
+        Text(
+            title, color = p.textPrimary, fontSize = 28.sp, fontWeight = FontWeight.ExtraBold, fontFamily = RimFonts.Raleway,
+            maxLines = 1, modifier = Modifier.weight(1f).padding(end = 8.dp),
+        )
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            // «+»: добавить текущие данные в журнал (иначе они сохранятся сами при выходе).
+            AddToJournalButton()
+            Box(
+                modifier = Modifier
+                    .size(44.dp)
+                    .clip(RimShapes.control)
+                    .background(p.cardSurface)
+                    .border(1.dp, p.border, RimShapes.control)
+                    .clickable { onRefresh() },
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.Refresh,
+                    contentDescription = "Обновить",
+                    tint = p.textSecondary,
+                    modifier = Modifier.size(20.dp).rotate(angle),
+                )
+            }
         }
     }
 }

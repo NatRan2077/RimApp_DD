@@ -55,6 +55,12 @@ interface MeterRepository {
     /** Пломбы, датчики, батарея и лимит мощности — из буфера индикации, см. [TamperState]. */
     fun tamperState(): Flow<TamperState>
 
+    /**
+     * Кнопка «+» на экранах прибора: записывает в журнал последние целиком принятые данные.
+     * false — данных ещё нет. Если не нажимать, они сохранятся сами при выходе.
+     */
+    suspend fun addToJournal(): Boolean
+
     // ---- UC-10 ----
     fun history(serialNumber: String): Flow<List<Reading>>
 

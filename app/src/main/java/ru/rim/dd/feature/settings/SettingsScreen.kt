@@ -39,6 +39,7 @@ fun SettingsScreen(
     onShowObisChange: (Boolean) -> Unit,
     dark: Boolean,
     onDarkChange: (Boolean) -> Unit,
+    onOpenJournal: () -> Unit,
     viewModel: SettingsViewModel = hiltViewModel(),
 ) {
     val signal by viewModel.signalStrengthDbm.collectAsState()
@@ -89,6 +90,22 @@ fun SettingsScreen(
         }
 
         Box(Modifier.padding(top = 4.dp))
+        SectionLabel("Данные")
+        DataCard(noPad = true) {
+            Row(
+                Modifier.fillMaxWidth().clickable { onOpenJournal() }.padding(horizontal = 16.dp, vertical = 14.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("Журнал", color = p.textPrimary, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+                    Text("Приборы, к которым вы подключались", color = p.textSecondary, fontSize = 14.sp)
+                }
+                Text("›", color = p.textSecondary, fontSize = 26.sp)
+            }
+        }
+
+        Box(Modifier.padding(top = 16.dp))
         SectionLabel("Отображение")
         DataCard(noPad = true) {
             ToggleRow("OBIS коды", "Показывать коды параметров", showObis, onShowObisChange)

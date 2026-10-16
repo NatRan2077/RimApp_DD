@@ -164,8 +164,6 @@ fun JournalScreen(
             DataCard {
                 Text("Журнал пуст", color = p.textPrimary, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
                 Text(
-                    "Нажмите «+» рядом с кнопкой обновления на экране прибора. Если не нажимать, " +
-                            "данные сохранятся сами при выходе (кнопка «Назад», «Отключиться» или обрыв связи).",
                     color = p.textSecondary, fontSize = 15.sp, modifier = Modifier.padding(top = 4.dp),
                 )
             }
@@ -268,7 +266,6 @@ private fun JournalCard(
             Column(Modifier.weight(1f)) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(entry.meterType, color = p.textPrimary, fontSize = 20.sp, fontWeight = FontWeight.Bold, fontFamily = RimFonts.Raleway)
-                    if (active) StatusChip("Сейчас подключён", RimSuccess)
                 }
                 MonoText("№ ${entry.serialNumber}", color = p.textPrimary, fontSize = 20.sp, weight = FontWeight.SemiBold)
                 Text(
@@ -288,19 +285,9 @@ private fun JournalCard(
             Divider()
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 InfoLine("Подключено", stamp(entry.connectedAt))
-                entry.savedAt?.let { InfoLine("Сохранено", stamp(it)) }
                 InfoLine(
                     "Отключено",
                     entry.disconnectedAt?.let { stamp(it) } ?: if (active) "ещё подключён" else "—",
-                )
-                InfoLine("Данные получены", stamp(entry.lastUpdateAt))
-                InfoLine(
-                    "Запись",
-                    when {
-                        entry.isPending -> "будет сохранена при выходе"
-                        entry.savedManually -> "добавлена вручную"
-                        else -> "сохранена при выходе"
-                    },
                 )
 
                 SectionLabel("Электроэнергия", Modifier.padding(top = 10.dp))
@@ -325,19 +312,6 @@ private fun JournalCard(
 @Composable
 private fun InfoLine(label: String, value: String, mono: Boolean = false) {
     val p = RimTheme.palette
-    // Длинное значение (напряжение/ток трёх фаз) ставим под названием — иначе оно сжимает название
-    // до «Напряже-ние» в два-три ряда.
-    if (value.length > 16) {
-        Column(Modifier.fillMaxWidth()) {
-            Text(label, color = p.textSecondary, fontSize = 15.sp)
-            if (mono) {
-                MonoText(value, color = p.textPrimary, fontSize = 16.sp, weight = FontWeight.Medium)
-            } else {
-                Text(value, color = p.textPrimary, fontSize = 15.sp, fontWeight = FontWeight.Medium)
-            }
-        }
-        return
-    }
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
         Text(label, color = p.textSecondary, fontSize = 15.sp, modifier = Modifier.weight(1f))
         if (mono) {

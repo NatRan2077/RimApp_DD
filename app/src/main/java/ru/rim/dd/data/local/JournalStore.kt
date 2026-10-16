@@ -17,11 +17,25 @@ import java.util.Locale
 import javax.inject.Inject
 import javax.inject.Singleton
 
+/**
+ * Лог «сырых» байтов (все пришедшие от прибора байты одним HEX-потоком через пробел).
+ * Выключен: в журнале его нет и в файлы он не пишется. Чтобы включить — поставить true:
+ * для каждого подключения начнёт писаться файл `<id>.hex`, а в раскрытой карточке журнала
+ * появится кнопка «Лог байтов» (отправка .txt).
+ */
+const val JOURNAL_RAW_LOG_ENABLED = false
+
 /** Одна строка показаний в карточке журнала: «A+ · Т1» → «1 234,567 кВт·ч». */
 data class JournalLine(val label: String, val value: String)
 
 /**
  * Карточка журнала — одно подключение к прибору. Время берётся с телефона.
+ * [lastUpdateAt] — время последнего полностью принятого и разобранного чтения (из него взяты
+ * показания карточки). [disconnectedAt] == null — подключение ещё идёт (или приложение
+ * закрыли, не отключившись: тогда при следующем запуске конец сеанса = [lastUpdateAt]).
+ * [savedManually] — карточка добавлена кнопкой «+», иначе сохранена автоматически при выходе;
+ * [savedAt] — время нажатия «+» (у карточки, сохранённой при выходе, null: это [disconnectedAt]).
+ * Для добавленных вручную карточек видны три времени: подключение, сохранение, отключение.
  */
 data class JournalEntry(
     val id: Long,
@@ -34,14 +48,27 @@ data class JournalEntry(
     val voltage: String?,
     val current: String?,
     val rawBytes: Long,
+    val savedManually: Boolean = false,
+    val savedAt: Long? = null,
     /** true — это подключение идёт прямо сейчас (проставляется при публикации списка, на диск не пишется). */
     val isActive: Boolean = false,
+    /** true — подключение идёт, а в файл ещё не записано (запишется по «+» или при выходе). */
+    val isPending: Boolean = false,
 ) {
     /** Сколько байт в HEX-логе (rawBytes — размер текста: по 3 символа на байт, кроме последнего). */
     val byteCount: Long get() = if (rawBytes > 0) (rawBytes + 1) / 3 else 0
 }
 
 /**
+ * Журнал подключений. Пока идёт подключение, данные копятся только в памяти ([Session]) —
+ * после каждого ПОЛНОСТЬЮ принятого и разобранного буфера обновляется «снимок». В файл
+ * `filesDir/journal/<id>.json` карточка попадает двумя способами:
+ *  1. кнопка «+» на экране прибора — [commit]: сохраняется снимок на этот момент;
+ *  2. выход без нажатия «+» — [end]: сохраняется последний целый снимок.
+ * Если «+» нажимали, при выходе в карточку дописывается только время отключения.
+ * Подключение, по которому не было ни одного целого чтения, в журнал не попадает.
+ *
+ * Лог байтов (`<id>.hex`) пишется только при [JOURNAL_RAW_LOG_ENABLED].
  *
  * Все методы потокобезопасны (общий lock) и блокируют вызывающий поток на файловой работе,
  * поэтому вызывать их нужно не с главного потока.
@@ -59,7 +86,26 @@ class JournalStore @Inject constructor(
     /** Все карточки, новые сверху. */
     val entries: StateFlow<List<JournalEntry>> = _entries.asStateFlow()
 
+    /** Подключение, идущее сейчас; данные в памяти до [commit]/[end]. */
+    private class Session(val id: Long) {
+        var meterType = "—"
+        var serialNumber = "—"
+        var energy: List<JournalLine> = emptyList()
+        var voltage: String? = null
+        var current: String? = null
+
+        /** Время последнего целого чтения; 0 — ни одного ещё не было. */
+        var snapshotAt = 0L
+
+        /** Карточка уже записана в файл кнопкой «+». */
+        var committed = false
+
+        val hasData: Boolean
+            get() = snapshotAt > 0 && (energy.isNotEmpty() || voltage != null || current != null)
+    }
+
     private var loaded = false
+    private var session: Session? = null
     private var rawOut: FileOutputStream? = null
     private var rawSize = 0L
 
@@ -69,26 +115,53 @@ class JournalStore @Inject constructor(
         publishLocked()
     }
 
+    /** Начало подключения. Прошлый незакрытый сеанс закрывается ([end]). */
     fun begin() = synchronized(lock) {
         loadLocked()
         endLocked()
+        val sess = Session(System.currentTimeMillis())
+        session = sess
         rawSize = 0
+        if (JOURNAL_RAW_LOG_ENABLED) {
+            rawOut = runCatching { FileOutputStream(rawFile(sess.id), false) }.getOrNull()
+        }
         publishLocked()
     }
 
+    /** Подключение не удалось — всё, что успело записаться, удаляется. */
     fun discard() = synchronized(lock) {
+        val sess = session ?: return@synchronized
         closeRawLocked()
+        session = null
+        jsonFile(sess.id).delete()
+        rawFile(sess.id).delete()
         publishLocked()
     }
 
+    /** Выход: если «+» не нажимали — сохраняет последний целый снимок; иначе дописывает время отключения. */
     fun end() = synchronized(lock) {
         loadLocked()
         endLocked()
         publishLocked()
     }
 
+    /**
+     * Кнопка «+»: записывает в журнал снимок последнего целого чтения. Повторное нажатие
+     * обновляет ту же карточку. false — целых данных ещё нет (или нет подключения).
+     */
+    fun commit(): Boolean = synchronized(lock) {
+        loadLocked()
+        val sess = session ?: return@synchronized false
+        if (!sess.hasData) return@synchronized false
+        saveLocked(entryOf(sess, disconnectedAt = null, manual = true, savedAt = System.currentTimeMillis()))
+        sess.committed = true
+        publishLocked()
+        true
+    }
+
     /** Добавляет пришедшие байты в лог: HEX, через пробел, чанки подряд одним потоком. */
     fun appendBytes(chunk: ByteArray) {
+        if (!JOURNAL_RAW_LOG_ENABLED || chunk.isEmpty()) return
         synchronized(lock) {
             val out = rawOut ?: return
             val sb = StringBuilder(chunk.size * 3 + 1)
@@ -110,6 +183,10 @@ class JournalStore @Inject constructor(
         }
     }
 
+    /**
+     * Обновляет снимок подключения после ПОЛНОСТЬЮ разобранного буфера. Недостающие в этом
+     * цикле поля сохраняют прежнее значение. На диск не пишет — см. [commit] и [end].
+     */
     fun update(
         meterType: String?,
         serialNumber: String?,
@@ -117,11 +194,21 @@ class JournalStore @Inject constructor(
         voltage: String?,
         current: String?,
     ) = synchronized(lock) {
+        val sess = session ?: return@synchronized
+        meterType?.takeIf { it.isNotBlank() && it != "—" }?.let { sess.meterType = it }
+        serialNumber?.takeIf { it.isNotBlank() && it != "—" }?.let { sess.serialNumber = it }
+        if (energy.isNotEmpty()) sess.energy = energy
+        if (voltage != null) sess.voltage = voltage
+        if (current != null) sess.current = current
+        sess.snapshotAt = System.currentTimeMillis()
+        // Карточка «сейчас подключён» в журнале живая, пока её не сохранили; файлы не перечитываем.
+        if (!sess.committed) publishLocked(reload = false)
     }
 
     /** Удаляет выбранные карточки (вместе с логами байтов); активное подключение не трогает. */
     fun delete(ids: Set<Long>) = synchronized(lock) {
         loadLocked()
+        ids.filter { it != session?.id }.forEach {
             jsonFile(it).delete()
             rawFile(it).delete()
         }
@@ -133,6 +220,7 @@ class JournalStore @Inject constructor(
         loadLocked()
         dir.listFiles()?.forEach { f ->
             val id = f.nameWithoutExtension.toLongOrNull()
+            if (id != null && id != session?.id) f.delete()
         }
         publishLocked()
     }
@@ -151,6 +239,7 @@ class JournalStore @Inject constructor(
             sb.appendLine("==============================================")
             sb.appendLine("Прибор: ${e.meterType}    № ${e.serialNumber}")
             sb.appendLine("Подключено: ${formatTime(e.connectedAt)}")
+            e.savedAt?.let { sb.appendLine("Сохранено:  ${formatTime(it)} (кнопка «+»)") }
             val end = e.disconnectedAt
             sb.appendLine(
                 "Отключено:  " + when {
@@ -159,6 +248,15 @@ class JournalStore @Inject constructor(
                     else -> "${formatTime(e.lastUpdateAt)} (связь прервана, приложение закрыто)"
                 }
             )
+            sb.appendLine("Данные получены: ${formatTime(e.lastUpdateAt)}")
+            sb.appendLine(
+                "Запись: " + when {
+                    e.isPending -> "будет сохранена при выходе"
+                    e.savedManually -> "добавлена вручную"
+                    else -> "сохранена автоматически при выходе"
+                }
+            )
+            if (JOURNAL_RAW_LOG_ENABLED) sb.appendLine("Принято байт (HEX-лог): ${e.byteCount}")
             sb.appendLine()
             sb.appendLine("Электроэнергия:")
             if (e.energy.isEmpty()) sb.appendLine("  нет данных")
@@ -179,6 +277,7 @@ class JournalStore @Inject constructor(
         val e = _entries.value.firstOrNull { it.id == id }
         val name = "RimApp_bytes_${e?.serialNumber?.takeIf { it != "—" } ?: id}_${stamp()}.txt"
         val file = File(exportDir, name)
+        runCatching { if (id == session?.id) rawOut?.flush() }
         src.copyTo(file, overwrite = true)
         file
     }
@@ -194,11 +293,35 @@ class JournalStore @Inject constructor(
     }
 
     private fun endLocked() {
+        val sess = session ?: return
         closeRawLocked()
+        val now = System.currentTimeMillis()
+        when {
+            sess.committed -> parse(jsonFile(sess.id))?.let { saveLocked(it.copy(disconnectedAt = now)) }
+            sess.hasData -> saveLocked(entryOf(sess, disconnectedAt = now, manual = false, savedAt = null))
+            else -> rawFile(sess.id).delete()
         }
+        session = null
+    }
+
+    private fun entryOf(sess: Session, disconnectedAt: Long?, manual: Boolean, savedAt: Long?) = JournalEntry(
+        id = sess.id,
+        meterType = sess.meterType,
+        serialNumber = sess.serialNumber,
+        connectedAt = sess.id,
+        disconnectedAt = disconnectedAt,
+        lastUpdateAt = sess.snapshotAt,
+        energy = sess.energy,
+        voltage = sess.voltage,
+        current = sess.current,
+        rawBytes = rawSize,
+        savedManually = manual,
+        savedAt = savedAt,
+    )
 
     /** Лог не растёт бесконечно: при превышении предела остаётся «хвост» — последние байты. */
     private fun trimRawLocked() {
+        val cur = session ?: return
         try {
             closeRawLocked()
             val f = rawFile(cur.id)
@@ -226,12 +349,34 @@ class JournalStore @Inject constructor(
         // Незакрытые карточки прошлых запусков закрываем временем последнего чтения.
         dir.listFiles { f -> f.extension == "json" }?.forEach { f ->
             val e = parse(f) ?: return@forEach
+            if (e.disconnectedAt == null && e.id != session?.id) {
                 saveLocked(e.copy(disconnectedAt = e.lastUpdateAt))
             }
         }
+        // Файлы лога байтов без карточки (подключение без данных, аварийное закрытие) не нужны.
+        dir.listFiles { f -> f.extension == "hex" }?.forEach { f ->
+            val id = f.nameWithoutExtension.toLongOrNull()
+            if (id != null && id != session?.id && !jsonFile(id).exists()) f.delete()
+        }
     }
 
+    /** Карточки из файлов; пересчитываются при [reload], иначе берутся прежние (частое обновление живой карточки). */
+    private var diskEntries: List<JournalEntry> = emptyList()
+
+    private fun publishLocked(reload: Boolean = true) {
+        if (reload) {
+            diskEntries = dir.listFiles { f -> f.extension == "json" }
+                ?.mapNotNull { f -> parse(f)?.let { if (it.id == session?.id) it.copy(isActive = true) else it } }
                 ?: emptyList()
+        }
+        // Идущее подключение, которое ещё не записано, показываем «живой» карточкой — как только есть данные.
+        val sess = session
+        val live = if (sess != null && !sess.committed && sess.hasData) {
+            listOf(entryOf(sess, disconnectedAt = null, manual = false, savedAt = null).copy(isActive = true, isPending = true))
+        } else {
+            emptyList()
+        }
+        _entries.value = (diskEntries + live).sortedByDescending { it.connectedAt }
     }
 
     private fun saveLocked(e: JournalEntry) {
@@ -246,6 +391,8 @@ class JournalStore @Inject constructor(
                 .put("voltage", e.voltage ?: JSONObject.NULL)
                 .put("current", e.current ?: JSONObject.NULL)
                 .put("rawBytes", e.rawBytes)
+                .put("manual", e.savedManually)
+                .put("savedAt", e.savedAt ?: JSONObject.NULL)
                 .put(
                     "energy",
                     JSONArray().apply {
@@ -279,6 +426,8 @@ class JournalStore @Inject constructor(
             voltage = if (o.isNull("voltage")) null else o.getString("voltage"),
             current = if (o.isNull("current")) null else o.getString("current"),
             rawBytes = o.optLong("rawBytes", 0),
+            savedManually = o.optBoolean("manual", false),
+            savedAt = if (o.isNull("savedAt")) null else o.getLong("savedAt"),
         )
     }.getOrNull()
 

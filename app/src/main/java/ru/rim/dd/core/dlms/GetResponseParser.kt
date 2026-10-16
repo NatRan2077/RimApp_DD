@@ -4,39 +4,35 @@ import java.time.LocalDate
 import java.time.LocalTime
 
 /**
- * Один разобранный элемент ответа: OBIS-код + значение с учётом scaler/unit (если был),
- * либо (для служебных полей вроде часов/даты устройства) — «сырые» байты OctetString.
- *
- * Реальный буфер (см. историю диагностики — сравнение с логом пульта РиМ 040.40)
- * содержит вперемешку: накопленную энергию (D=8, unit=Wh/varh), мгновенные величины
- * (D=7: мощность/напряжение/ток/частота) и статусные OBIS 0.0.96.x (температура,
- * резервное питание) — единая структура ObisReading используется для всех них,
- * а MeterRepositoryImpl уже раскладывает их по нужным экранам.
+ * Один элемент буфера: OBIS-код + значение (rawValue × 10^scaler, unit) либо, вместо числа,
+ * сырые байты ([octetValue]), текст ([textValue]) или готовый float ([floatValue]).
  */
 data class ObisReading(
     val obisCode: String,
     val rawValue: Long,
     val scaler: Int,
-    /** Код единицы измерения по IEC 62056-6-2 (30 = Wh, 35 = V, 44 = Hz, ...), null — не найден. */
+    /** Код единицы по IEC 62056-6-2 (30 = Wh, 35 = V, 44 = Hz, ...), null — не найден. */
     val unit: Int?,
-    /** Заполнено вместо rawValue/scaler/unit для OctetString-значений (напр. дата/время прибора). */
+    /** Вместо rawValue/scaler/unit для OctetString (напр. дата/время прибора). */
     val octetValue: ByteArray? = null,
     /**
-     * [Android-патч] Заполнено вместо rawValue/scaler/unit, если значение атрибута — DLMS
-     * VisibleString (тег 0x0A), напр. версия ПО или другое текстовое служебное поле. Нужно
-     * для работы с РАЗНЫМИ счётчиками серии: пользователь обнаружил, что на другом приборе
-     * (не РиМ 040.40, на который были рассчитаны все предыдущие фиксы) первый сегмент буфера
-     * 0.0.21.0.2.255 БОЛЬШЕ и, судя по всему, содержит доп. поля вроде версии ПО прямо внутри
-     * "публичного" буфера индикации — то есть без отдельного GET и без ассоциации. Раньше
-     * collectReadings() ниже умел распознавать в паре {OBIS, значение} только число или
-     * OctetString — VisibleString (текст) просто терялся молча. Теперь ловится и он, поэтому
-     * ЛЮБОЙ счётчик с текстовым полем прямо в этом буфере подхватится сам, без хардкода под
-     * конкретную модель.
+     * Вместо rawValue/scaler/unit для текстовых полей буфера (версия ПО и т.п.):
+     * VisibleString (тег 0x0A) либо OctetString с печатным ASCII.
      */
     val textValue: String? = null,
+    /**
+     * Вместо rawValue/scaler для значения, пришедшего float (теги 0x17/0x18) — так отдаёт AKROS.
+     * Множитель scaler_unit уже применён, [value] отдаёт этому полю предпочтение.
+     */
+    val floatValue: Double? = null,
+    /**
+     * Атрибуты объекта HDLC-настройки (0.x.22.0.0.255) после OBIS: скорость (Enum), окна, размеры
+     * кадров, таймауты, адрес устройства (последний элемент).
+     */
+    val structItems: List<DlmsValue>? = null,
 ) {
     /** rawValue * 10^scaler — значение в базовой единице (Вт, В, А, Гц, °C, Вт·ч, вар·ч...). */
-    val value: Double get() = rawValue * Math.pow(10.0, scaler.toDouble())
+    val value: Double get() = floatValue ?: (rawValue * Math.pow(10.0, scaler.toDouble()))
 
     /** value / 1000 — удобно для энергии (Вт·ч → кВт·ч, вар·ч → квар·ч) и мощности (Вт → кВт). */
     val valueKwh: Double get() = value / 1000.0
@@ -51,81 +47,121 @@ data class ObisReading(
 private const val UNIT_WH = 30
 
 /**
- * [Android-патч] см. collectReadings() — control_state размыкателя (0.0.96.3.10.255, класс 70
- * Disconnect Control, атрибут 3) НЕ читается отдельным GET (счётчик отвечает 0x0D — см. историю
- * диагностики readDisconnectControlAttribute() в MeterRepositoryImpl), а приходит ВНУТРИ обычного
- * буфера индикации (0.0.21.0.2.255), который мы и так опрашиваем каждый цикл. Подтверждено двумя
- * независимыми способами: (1) диагностика capture_objects этого буфера (лог "2_8") явно показала
- * элемент [1] = Struct(класс=70, OBIS=0.0.96.3.10.255, атрибут=3) — сразу после элемента [0] =
- * Struct(класс=8 Clock, атрибут=4 "status"); (2) байт-перечисление (Enum) на этой позиции реально
- * меняет значение в момент подтверждённой команды включения реле (лог Text_Document_13: 0x02
- * стабильно во всех циклах ДО команды → 0x01 сразу ПОСЛЕ подтверждённого ACTION-Result=0). Позиция
- * подтверждена на ДВУХ разных моделях счётчика (РиМ 040.40 и 189.40) — совпадает, поэтому не
- * хардкод под одну модель.
+ * control_state размыкателя (класс 70 Disconnect Control, атрибут 3) — Enum, позиционное поле [1]
+ * буфера индикации 0.0.21.0.2.255 сразу после статуса часов. Отдельным GET не читается (ответ 0x0D).
+ * Позиция совпадает у РиМ 040.40 и 189.40.
  */
 const val RELAY_CONTROL_STATE_OBIS = "0.0.96.3.10.255"
 
 /**
- * [Android-патч] см. TamperState.kt и collectReadings() — состояние пломб (корпуса, клеммника),
- * магнитного поля, СВЧ, батареи и превышения лимита мощности НЕ читается отдельными GET на
- * объекты СТО 34.01-5.1-006 (0.0.96.51.0/1/3/4/5.255 — на этом приборе без DLMS-ассоциации это
- * почти наверняка отказ доступа, как и всё остальное, кроме буфера индикации), а приходит
- * ВНУТРИ ТОГО ЖЕ буфера 0.0.21.0.2.255, третьим по счёту позиционным (без обёртки в OBIS) полем
- * ПОСЛЕ control_state размыкателя. OBIS 0.0.96.50.170.255 в этой константе — не код для GET (сам
- * элемент не читается отдельно), а просто "паспортный" адрес этого же значения для справки: имя
- * "Значки ДД" и OBIS подтверждены паспортом объектов прибора (файл-выгрузка объектов, лист
- * Sheet1: строка "Data | 0.0.96.50.170.255 | 0 | Значки ДД"). Битовая раскладка ПОЛНОСТЬЮ
- * расшифрована из исходников прошивки самого пульта РиМ 040.40 — thread_dataRequest.c,
- * функция read_status() (проект RiM_040_40_v1.1.41, ветка "версия ЖКИ 1", реально
- * наблюдаемая в логах: byte1 бит6 = 1 → (byte1&0xC0)>>6 = версия 1). Комментарий прошивки
- * дословно: "байт 1: сборка бит - статус пломб + версия ЖКИ: бит 0 Tamper_Cover.State (замок 2),
- * бит 1 Tamper_Meter.State (замок 1), бит 2 Tamper_Magnet.State, бит 3 Tamper_Battery.State
- * (замок 3), бит 4 СВЧ, бит 5 статус диагностики, биты 6-7 версия ЖКИ; байт 2: те же биты —
- * но "было, сейчас не активно" (FLAG), бит 7 — превышение лимита мощности". Подробный разбор —
- * см. TamperState.decode(). Подтверждено на реальном логе (Text_Document_13, тот же сеанс, что
- * и для control_state реле): сырое значение поля было 0x00410100 → байт1=0x41 → бит0=1
- * (Tamper_Cover=ACTIVE) и биты6-7=01 (версия ЖКИ=1) — правдоподобно для стендового испытания
- * с не до конца закрытым/опломбированным корпусом.
+ * Статус пломб, магнитного поля, СВЧ, батареи и лимита мощности («Значки ДД») — UInt32,
+ * позиционное поле [4] буфера, после текущего тарифа. OBIS паспортный, для GET не используется.
+ *
+ * Раскладка (прошивка пульта РиМ 040.40, read_status(); байт 1 — второй от старшего,
+ * напр. 0x00410100 → 0x41): бит 0 Tamper_Cover (замок 2), бит 1 Tamper_Meter (замок 1),
+ * бит 2 Tamper_Magnet, бит 3 Tamper_Battery (замок 3), бит 4 СВЧ, бит 5 статус диагностики,
+ * биты 6-7 версия ЖКИ. Байт 2 — те же биты в смысле «было, сейчас не активно»; бит 7 —
+ * превышение лимита мощности. Подробнее — TamperState.decode().
  */
 const val TAMPER_STATUS_OBIS = "0.0.96.50.170.255"
 
-/**
- * [Android-патч] Текущий тариф (1..N) — тоже позиционное (без обёртки в OBIS) поле буфера,
- * третье по счёту после control_state реле (см. collectReadings()), ИДЁТ ПЕРЕД
- * TAMPER_STATUS_OBIS. Название и OBIS подтверждены паспортом объектов прибора ("Data |
- * 0.0.96.14.0.255 | 0 | Текущий тариф"). До этого патча значение молча отбрасывалось (общий
- * цикл лишь использовал его форму — OctetString не 6 байт — чтобы не спутать с OBIS-кодом, и
- * пропускал дальше).
- */
+/** Текущий тариф (1..N) — OctetString(1), позиционное поле [3] буфера, перед [TAMPER_STATUS_OBIS]. */
 const val CURRENT_TARIFF_OBIS = "0.0.96.14.0.255"
 
 /**
- * [Android-патч] Второе позиционное поле буфера (сразу после control_state реле, ПЕРЕД
- * текущим тарифом) — по паспорту объектов прибора: "Data | 1.0.96.50.0.255 | 0 | Отображение
- * фаз ДД". Смысл в точности не расшифрован (не встретился в исходниках прошивки, в отличие от
- * TAMPER_STATUS_OBIS) — предположительно битовая маска "какие фазы пульт умеет/должен
- * отображать" у многофазных приборов; сохраняем как есть, чтобы не терять и разобраться позже
- * по мере накопления логов с других (многофазных) счётчиков.
+ * «Отображение фаз ДД» — Int8, позиционное поле [2] буфера, после control_state. Смысл не
+ * расшифрован (предположительно маска отображаемых фаз у многофазных приборов), хранится как есть.
  */
 const val DD_PHASE_DISPLAY_OBIS = "1.0.96.50.0.255"
 
 /**
- * [Android-патч] Статус часов реального времени прибора (Clock, class=8, attribute=4) — самое
- * первое позиционное поле буфера (см. collectReadings()), OBIS подтверждён capture_objects
- * буфера ("Struct(class=8, OBIS=0.0.1.0.0.255, attr=4)"). До этого патча значение читалось
- * ТОЛЬКО чтобы отличить "это правда начало буфера" (форма Int8/U8 + Enum), а само число никуда
- * не попадало. Смысл битов — из комментария прошивки ДД (thread_dataRequest.c) и совпадает со
- * стандартным Clock.status по DLMS: биты 0 (invalid value), 1 (doubtful value) и 3 (invalid
- * clock status) — часы недостоверны, если ЛЮБОЙ из них установлен (маска 0x0B, см.
- * isClockStatusValid() ниже). Бит 2 (другая база времени) в прошивке ДД сознательно НЕ
- * считается ошибкой.
+ * Статус часов (Clock, класс 8, атрибут 4) — позиционное поле [0] буфера. Биты как в Clock.status:
+ * часы недостоверны, если установлен любой из битов 0 (invalid value), 1 (doubtful value) или
+ * 3 (invalid clock status); бит 2 (другая база времени) прошивка ДД ошибкой не считает.
  */
 const val CLOCK_STATUS_OBIS = "0.0.1.0.0.255"
 
-/** См. CLOCK_STATUS_OBIS — true, если часы прибора достоверны (как считает прошивка ДД). */
+/** true — часы прибора достоверны (ни один из битов маски 0x0B не установлен). */
 fun isClockStatusValid(rawStatus: Long): Boolean = (rawStatus and 0x0B) == 0L
 
-/** Подмножество таблицы единиц измерения IEC 62056-6-2, реально встречающееся у этого счётчика. */
+/**
+ * Один блок ответа, разбитого прибором на части (get-response-with-datablock: «C4 02», флаг
+ * последнего блока, номер блока, данные). Нужен, когда ответ не влезает в HDLC-кадр: AKROS
+ * ограничивает информационное поле 128 байтами, а capture_objects (14 записей по 18 байт) больше.
+ */
+data class GetResponseBlock(
+    /** true — последний блок. */
+    val lastBlock: Boolean,
+    /** Номер блока; указывается в запросе следующего. */
+    val blockNumber: Int,
+    /** Кусок данных; куски всех блоков склеиваются и разбираются целиком. */
+    val data: ByteArray,
+)
+
+/**
+ * Разбирает get-response-with-datablock. null — ответ не блочный (разбирать через
+ * [parseGetResponseValue]) или некорректный.
+ */
+fun parseGetResponseBlock(rawFrame: ByteArray): GetResponseBlock? {
+    val llcOffset = findLlcHeader(rawFrame) ?: return null
+    var pos = llcOffset + 3
+    // service-id (0xC4) + choice: нас интересует только choice = 2 (with-datablock)
+    if (rawFrame.getOrNull(pos)?.toInt()?.and(0xFF) != 0xC4) return null
+    if (rawFrame.getOrNull(pos + 1)?.toInt()?.and(0xFF) != 0x02) return null
+    pos += 3 // service-id, choice, invoke-id-and-priority
+
+    val lastBlock = (rawFrame.getOrNull(pos)?.toInt()?.and(0xFF) ?: return null) != 0
+    pos += 1
+    if (pos + 4 > rawFrame.size) return null
+    var blockNumber = 0
+    for (i in 0 until 4) blockNumber = (blockNumber shl 8) or (rawFrame[pos + i].toInt() and 0xFF)
+    pos += 4
+
+    // result-choice: 0 — дальше «сырые» данные, иначе код ошибки
+    if ((rawFrame.getOrNull(pos)?.toInt()?.and(0xFF) ?: return null) != 0) return null
+    pos += 1
+
+    // Длина данных в A-XDR: до 0x80 — само число, иначе младшие биты — число байт длины
+    val lengthByte = rawFrame.getOrNull(pos)?.toInt()?.and(0xFF) ?: return null
+    pos += 1
+    var length = lengthByte
+    if (lengthByte > 0x80) {
+        val lengthBytes = lengthByte and 0x7F
+        if (pos + lengthBytes > rawFrame.size) return null
+        length = 0
+        for (i in 0 until lengthBytes) length = (length shl 8) or (rawFrame[pos + i].toInt() and 0xFF)
+        pos += lengthBytes
+    }
+
+    // Последние 3 байта кадра (CRC + флаг) в данные не входят; при завышенной длине берём что есть.
+    val available = (rawFrame.size - 3 - pos).coerceAtLeast(0)
+    val take = minOf(length, available)
+    return GetResponseBlock(
+        lastBlock = lastBlock,
+        blockNumber = blockNumber,
+        data = rawFrame.copyOfRange(pos, pos + take),
+    )
+}
+
+/** Разбирает DLMS-значение из «голых» байт (без HDLC и APDU) — для склеенных данных блоков. */
+fun decodeDlmsValue(data: ByteArray): DlmsValue = DlmsDecoder(data).decodeAt(0).first
+
+/**
+ * Как [unitLabelOf], но для величин, показываемых делёнными на 1000 ([ObisReading.valueKwh]):
+ * «Вт·ч» → «кВт·ч». Неизвестный код показывается как «ед.N», а не подменяется догадкой.
+ */
+fun kiloUnitLabelOf(unit: Int?): String? = when (unit) {
+    null -> null
+    27 -> "кВт"
+    28 -> "кВА"
+    29 -> "квар"
+    30 -> "кВт·ч"
+    31 -> "кВА·ч"
+    32 -> "квар·ч"
+    else -> unitLabelOf(unit) ?: "ед.$unit"
+}
+
+/** Подмножество таблицы единиц IEC 62056-6-2, реально встречающееся у счётчиков. */
 fun unitLabelOf(unit: Int?): String? = when (unit) {
     4 -> "сут"
     5 -> "ч"
@@ -173,57 +209,42 @@ fun decodeCosemTime(bytes: ByteArray): LocalTime? {
 }
 
 /**
- * Разбирает "сырой" HDLC-кадр GET-response (см. SpodesClientBridge.getResponseRawBytes())
- * в список показаний. Формат этого конкретного ответа счётчика (подтверждён логом
- * реального обмена): APDU = C4(get-response-normal) 01(choice: normal) <invoke-id-and-priority>
- * 00(choice: data, не data-access-result) <DLMS-значение>, а само DLMS-значение — массив/
- * структура из повторяющихся троек {OctetString(6, OBIS-код), DoubleLongUnsigned(значение),
- * Structure(2){Integer(scaler), Enum(unit)}} — по одной на тариф.
- *
- * Не полагается на фиксированные смещения байт (в отличие от библиотечного
- * GetResponseGeneral()) — сначала ищет LLC-заголовок "E6 E7 00" (сервер→клиент), затем
- * пропускает 3 служебных байта APDU (service-id, choice, invoke-id-and-priority) и один
- * байт выбора "data"/"data-access-result", и уже оттуда запускает общий DLMS-декодер
- * (DlmsDecoder). Поэтому не критичен к однобайтовой vs двухбайтовой HDLC-адресации.
- *
- * @throws DlmsDecodeException если LLC-заголовок не найден или разбор данных не удался.
+ * Раскладывает значение буфера индикации (одно или склеенное из блоков) в список показаний.
+ * Механизм пульта РиМ 040.40, одинаковый для всех приборов: сначала пять позиционных полей
+ * (статус часов, control_state реле, статус фаз, тариф, «Значки ДД»), затем структуры
+ * {OctetString(6) OBIS, значение, Structure(2){Integer scaler, Enum unit}}. Значение — целое,
+ * вещественное (AKROS), текст или дата-время.
  */
-fun parseGetResponseTariffs(rawFrame: ByteArray): List<ObisReading> {
-    val root = parseGetResponseValue(rawFrame)
+fun readingsOf(root: DlmsValue): List<ObisReading> {
     val readings = mutableListOf<ObisReading>()
     collectReadings(root, readings)
     return readings
 }
 
 /**
- * Пропускает служебные байты APDU (LLC-заголовок, service-id, choice, invoke-id-and-priority,
- * result-choice) и разбирает уже само DLMS-значение — общий код для parseGetResponseTariffs()
- * (когда известно, что внутри массив/структура из троек OBIS+значение+scaler-unit) и для
- * диагностики произвольных OBIS-кодов, где заранее не известно, скаляр там или структура
- * (см. MeterRepositoryImpl.probeStandardObisCandidates()).
+ * Пропускает LLC и заголовок APDU GET-response и разбирает DLMS-значение. LLC-заголовок
+ * "E6 E7 00" ищется по содержимому, а не по фиксированному смещению, поэтому длина
+ * HDLC-адреса не важна.
  *
- * @throws DlmsDecodeException если LLC-заголовок не найден, ответ короче ожидаемого,
- *         сервис не GET-response или сервер вернул data-access-result вместо данных.
+ * @throws DlmsDecodeException если LLC-заголовок не найден, ответ короткий, сервис не
+ *         GET-response или сервер вернул data-access-result вместо данных.
  */
 fun parseGetResponseValue(rawFrame: ByteArray): DlmsValue {
     val llcOffset = findLlcHeader(rawFrame)
         ?: throw DlmsDecodeException("В ответе не найден LLC-заголовок сервера (E6 E7 00)")
 
-    // llcOffset указывает на первый байт "E6" — далее 3 байта LLC, затем APDU.
+    // llcOffset указывает на "E6" — далее 3 байта LLC, затем APDU
     var pos = llcOffset + 3
     if (pos + 3 > rawFrame.size) throw DlmsDecodeException("Ответ слишком короткий для GET-response APDU")
 
     val serviceId = rawFrame[pos].toInt() and 0xFF
     if (serviceId != 0xC4) throw DlmsDecodeException("Ожидался GET-response (0xC4), получено 0x%02X".format(serviceId))
-    pos += 1 // сместились с service-id (C4) на choice (get-response-normal = 0x01)
-    pos += 1 // сместились с choice на invoke-id-and-priority (0x81 у этого счётчика)
-    pos += 1 // сместились с invoke-id-and-priority на result-choice (data / data-access-result)
+    pos += 3 // service-id, choice (get-response-normal = 0x01), invoke-id-and-priority
     val resultChoice = rawFrame[pos].toInt() and 0xFF
     pos += 1
     if (resultChoice != 0x00) {
-        // resultChoice=1 значит "дальше идёт код ошибки (Data-Access-Result), а не данные" —
-        // сам код лежит СЛЕДУЮЩИМ байтом (см. IEC 62056-6-2: 0=success, 1=hardware-fault,
-        // 4=object-undefined, 11=no-long-get-in-progress, 13=data-block-number-invalid...).
+        // resultChoice=1: следом код Data-Access-Result (IEC 62056-6-2: 0=success, 1=hardware-fault,
+        // 4=object-undefined, 11=no-long-get-in-progress, 13=data-block-number-invalid...)
         val errorCode = rawFrame.getOrNull(pos)?.toInt()?.and(0xFF)
         throw DlmsDecodeException(
             if (errorCode != null) "Сервер вернул data-access-result, код ошибки 0x%02X (%d)".format(errorCode, errorCode)
@@ -236,18 +257,11 @@ fun parseGetResponseValue(rawFrame: ByteArray): DlmsValue {
 }
 
 /**
- * [Android-патч] Разбирает ACTION-response (см. turnRelayOn()/turnRelayOff() в
- * MeterRepositoryImpl.kt) — тот же принцип, что и у parseGetResponseValue(): ищем LLC-
- * заголовок сервера "E6 E7 00", затем идёт service-id=0xC7 (action-response-normal),
- * choice=0x01 (normal), invoke-id-and-priority, и СРАЗУ (без выбора data/data-access-result,
- * как у GET-response) — однобайтовый Action-Result (0=success, остальные коды — по тому же
- * перечислению Data-Access-Result: 1=hardware-fault, 3=read-write-denied и т.д.), а следом
- * ещё один байт-выбор "есть ли возвращаемые данные" (в подтверждённом логе — 0, данных нет,
- * этого достаточно для методов Disconnect Control). Подтверждено реальным логом пульта
- * РиМ 040.40: ответ на ACTION method 2 (remote_reconnect, 0.0.96.3.10.255) — ровно
- * "E6 E7 00 C7 01 <invoke> 00 00" (00=success, 00=без данных).
+ * Разбирает ACTION-response: «E6 E7 00 C7 01 <invoke-id-and-priority> <Action-Result> <есть ли данные>».
+ * Action-Result: 0 = успех, остальное — коды Data-Access-Result. Для РиМ 040.40 ответ на method 2
+ * (remote_reconnect) — «E6 E7 00 C7 01 <invoke> 00 00».
  *
- * @return код Action-Result (0 = успех) или null, если ответ короче ожидаемого/не ACTION-response.
+ * @return Action-Result или null, если ответ короткий или это не ACTION-response.
  */
 fun parseActionResponseResult(rawFrame: ByteArray): Int? {
     val llcOffset = findLlcHeader(rawFrame) ?: return null
@@ -269,11 +283,9 @@ private fun findLlcHeader(frame: ByteArray): Int? {
 }
 
 /**
- * Рекурсивно обходит дерево в поисках троек {OBIS(6 байт), число, [scaler,unit]}, а также
- * пар {OBIS(6 байт), OctetString} — так закодированы часы/дата устройства (0.0.0.9.1.255 /
- * 0.0.0.9.2.255 в этом буфере): вместо числа там 4/5-байтовый OctetString, а следующей
- * структуры {scaler,unit} для них либо нет, либо она бессмысленна — в этом случае она просто
- * пропускается, если похожа по форме на Structure(2).
+ * Рекурсивно собирает тройки {OBIS(6 байт), число или float, [scaler, unit]} и пары {OBIS, OctetString |
+ * VisibleString} (дата/время устройства, текстовые поля). Следующая за значением Structure(2),
+ * если есть, пропускается как scaler-unit.
  */
 private fun collectReadings(value: DlmsValue, out: MutableList<ObisReading>) {
     val items = when (value) {
@@ -283,32 +295,19 @@ private fun collectReadings(value: DlmsValue, out: MutableList<ObisReading>) {
     }
 
     var i = 0
-    // [Android-патч] см. RELAY_CONTROL_STATE_OBIS выше — специальный случай ДО общего цикла по
-    // тройкам {OBIS, значение, scaler-unit}: главная строка буфера (это Struct размером под 90
-    // элементов — на порядок больше, чем у ЛЮБОЙ scaler-unit-структуры вида {Integer, Enum},
-    // которая встречается ниже per-элементно и всегда размером ровно 2 — условие items.size > 2
-    // отсекает именно её и не даёт спутать со строкой буфера) начинается с пары [Int8 (статус
-    // часов, class=8 Clock attr=4), Enum (control_state размыкателя)] БЕЗ обёртки в OBIS-код —
-    // именно поэтому раньше это значение молча терялось (общий цикл ищет только тройки/пары,
-    // начинающиеся с OctetString(6)=OBIS, и просто перешагивал через оба элемента по одному).
+    // Главная строка буфера индикации (Struct ~90 элементов; items.size > 2 отличает её от
+    // scaler-unit-структур размером 2) начинается позиционными полями БЕЗ обёртки OBIS:
+    // [0] Int8/U8 — статус часов, [1] Enum — control_state размыкателя.
     if (items.size > 2 && (items[0] is DlmsValue.I8 || items[0] is DlmsValue.U8) && items.getOrNull(1) is DlmsValue.EnumVal) {
-        // [Android-патч] см. CLOCK_STATUS_OBIS выше — раньше items[0] проверялся только на
-        // форму (Int8/U8), а само значение никуда не сохранялось.
         val clockStatus = numericValueOf(items[0])
         if (clockStatus != null) out.add(ObisReading(CLOCK_STATUS_OBIS, clockStatus, 0, null))
         val controlState = (items[1] as DlmsValue.EnumVal).value
         out.add(ObisReading(RELAY_CONTROL_STATE_OBIS, controlState.toLong(), 0, null))
         i = 2
-        // [Android-патч] см. TAMPER_STATUS_OBIS выше — сразу следом идут ЕЩЁ ТРИ позиционных
-        // (без OBIS-обёртки) поля: [2]=Int8 статус фаз ДД, [3]=OctetString(1 байт) текущий
-        // тариф (0.0.96.14.0.255), [4]=UInt32 "Значки ДД"/статус пломб (0.0.96.50.170.255).
-        // Раньше общий цикл ниже эти три значения молча "проглатывал" по одному (перешагивал,
-        // не найдя в них OBIS-код), НЕ ломаясь и НЕ теряя синхронизацию с остальным буфером
-        // (см. resync ниже: неопознанный элемент просто пропускается по одному) — но и не
-        // извлекая ничего. Проверяем всю тройку СТРОГО по форме (Int8/U8, затем OctetString
-        // длиной НЕ 6 — то есть заведомо не OBIS-код, затем ровно U32) и продвигаемся дальше
-        // ТОЛЬКО если форма совпала целиком — иначе (другая модель счётчика/прошивки) просто
-        // остаёмся на i=2, и общий цикл ниже сам безопасно доберёт синхронизацию как раньше.
+        // Далее ещё три позиционных поля: [2] Int8 — статус фаз ДД, [3] OctetString не из 6 байт
+        // (чтобы не спутать с OBIS) — текущий тариф, [4] UInt32 — статус пломб. Переходим к i=5
+        // только если форма совпала целиком; иначе (другая модель/прошивка) остаёмся на i=2, и
+        // общий цикл сам досинхронизируется, пропуская неопознанные элементы по одному.
         val phaseItem = items.getOrNull(2)
         val tariffItem = items.getOrNull(3)
         val statusItem = items.getOrNull(4)
@@ -330,6 +329,21 @@ private fun collectReadings(value: DlmsValue, out: MutableList<ObisReading>) {
         val obisItem = items[i]
         if (obisItem is DlmsValue.OctetStr && obisItem.bytes.size == 6) {
             val valueItem = items.getOrNull(i + 1)
+            // Объект HDLC-настройки (класс 23, 0.x.22.0.0.255) в буфере — плоская структура:
+            // {OBIS, comm_speed(Enum), window_tx(U8), window_rx(U8), max_info_tx(U16), max_info_rx(U16),
+            //  inter_octet_timeout(U16), inactivity_timeout(U16), device_address(U16)}. Всё после OBIS —
+            // атрибуты объекта, а не одно значение, поэтому забираем остаток структуры целиком.
+            if (obisItem.bytes[2].toInt() == HDLC_OBIS_GROUP_C && valueItem is DlmsValue.EnumVal) {
+                out.add(ObisReading(obisCodeOf(obisItem.bytes), 0L, 0, null, structItems = items.subList(i + 1, items.size).toList()))
+                i = items.size
+                continue
+            }
+            val floatReading = floatReadingOf(obisItem.bytes, valueItem, items.getOrNull(i + 2))
+            if (floatReading != null) {
+                out.add(floatReading)
+                i += 3
+                continue
+            }
             val rawValue = numericValueOf(valueItem)
             if (rawValue != null) {
                 val scalerUnit = items.getOrNull(i + 2)
@@ -339,17 +353,8 @@ private fun collectReadings(value: DlmsValue, out: MutableList<ObisReading>) {
                 continue
             }
             if (valueItem is DlmsValue.OctetStr) {
-                // [Android-патч] НАЙДЕНО по логу подключения к ДРУГОМУ счётчику (модель 189.40):
-                // версия ПО там лежит прямо в этом же буфере под OBIS 0.0.96.1.2.255 — ровно тем,
-                // что мы уже занесли в FIRMWARE_VERSION_OBIS_CANDIDATES (MeterRepositoryImpl) — но
-                // закодирована НЕ как VisibleString (тег 0x0A, ловится веткой ниже), а как OctetString
-                // (тег 0x09) с ASCII-текстом внутри ("31 2E 35 38" = "1.58"). Раньше это попадало
-                // только в octetValue (сырые байты) — textValue оставался null, и версия ПО не
-                // подхватывалась. Печатаемый ASCII из OctetString — частый способ хранить текст в
-                // DLMS (тот же приём уже применялся в textValueOf() для одиночных атрибутов) —
-                // используем его и здесь, не трогая octetValue (он всё ещё нужен для НЕ-текстовых
-                // OctetString, напр. даты/времени прибора — там байты непечатаемые, textValue
-                // останется null, поведение для них не меняется).
+                // Печатный ASCII в OctetString — тоже текст (напр. версия ПО 0.0.96.1.2.255 у 189.40:
+                // «31 2E 35 38» = «1.58»). octetValue остаётся для нетекстовых (дата/время).
                 val text = valueItem.bytes.takeIf { it.isNotEmpty() && it.all { b -> (b.toInt() and 0xFF) in 0x20..0x7E } }
                     ?.let { String(it, Charsets.US_ASCII) }
                 out.add(ObisReading(obisCodeOf(obisItem.bytes), 0L, 0, null, octetValue = valueItem.bytes, textValue = text))
@@ -357,10 +362,7 @@ private fun collectReadings(value: DlmsValue, out: MutableList<ObisReading>) {
                 i += if (maybeScalerUnit is DlmsValue.Struct && maybeScalerUnit.items.size == 2) 3 else 2
                 continue
             }
-            // [Android-патч] см. textValue в ObisReading — пара {OBIS, VisibleString} встречается,
-            // когда буфер конкретного счётчика включает текстовые служебные поля (напр. версию ПО)
-            // прямо внутри "публичного" профиля — на разных моделях счётчиков состав буфера разный,
-            // это ловит такие поля независимо от того, какой именно OBIS у них оказался.
+            // Текстовое служебное поле (напр. версия ПО) прямо в буфере
             if (valueItem is DlmsValue.VisibleStr) {
                 out.add(ObisReading(obisCodeOf(obisItem.bytes), 0L, 0, null, textValue = valueItem.text))
                 val maybeScalerUnit = items.getOrNull(i + 2)
@@ -368,15 +370,18 @@ private fun collectReadings(value: DlmsValue, out: MutableList<ObisReading>) {
                 continue
             }
         }
-        // Не подошло под тройку/пару целиком — всё равно спускаемся внутрь на случай вложенности.
+        // Не тройка/пара — спускаемся внутрь на случай вложенности
         collectReadings(obisItem, out)
         i += 1
     }
 }
 
-private fun obisCodeOf(bytes: ByteArray): String = bytes.joinToString(".") { (it.toInt() and 0xFF).toString() }
+/** Группа C в OBIS объектов HDLC-настройки: 0.0.22.0.0.255, 0.1.22.0.0.255, ... */
+private const val HDLC_OBIS_GROUP_C = 22
 
-/** Компактное текстовое представление для логов — OctetStr(6) печатается как OBIS-код. */
+internal fun obisCodeOf(bytes: ByteArray): String = bytes.joinToString(".") { (it.toInt() and 0xFF).toString() }
+
+/** Компактное представление для логов; OctetStr(6) печатается как OBIS-код. */
 fun describeDlmsValue(value: DlmsValue): String = when (value) {
     is DlmsValue.Struct -> "Struct(${value.items.joinToString(", ") { describeDlmsValue(it) }})"
     is DlmsValue.Arr -> "Arr(${value.items.joinToString(", ") { describeDlmsValue(it) }})"
@@ -399,11 +404,9 @@ fun describeDlmsValue(value: DlmsValue): String = when (value) {
 }
 
 /**
- * Человекочитаемое текстовое представление одиночного значения — для служебных OBIS вроде
- * версии ПО (0.0.96.1.2.255), где заранее не известно, придёт ли VisibleString, OctetString
- * (ASCII-текст или бинарные данные) или просто число. VisibleString — как есть; OctetString —
- * как ASCII, если все байты печатаемые, иначе HEX; числа — через toString(); Struct/Arr/Null —
- * через describeDlmsValue() (для диагностики, если формат окажется сложнее одиночного значения).
+ * Текстовое представление одиночного значения (напр. версия ПО 0.0.96.1.2.255): VisibleString —
+ * как есть; OctetString — ASCII, если все байты печатаемые, иначе HEX; числа — toString();
+ * остальное — [describeDlmsValue].
  */
 fun textValueOf(value: DlmsValue): String = when (value) {
     is DlmsValue.VisibleStr -> value.text
@@ -431,11 +434,8 @@ fun textValueOf(value: DlmsValue): String = when (value) {
 }
 
 /**
- * [Android-патч] Универсальное числовое/булево значение одиночного атрибута — для служебных
- * объектов вроде состояния размыкателя (0.0.96.3.10.255, класс Disconnect Control), где заранее
- * не известно, придёт ли Boolean (output_state) или Enum (control_state). В отличие от
- * numericValueOf() ниже (используется только для показаний энергии — там Bool/Enum не нужны),
- * эта функция публичная и покрывает ещё EnumVal и BoolVal.
+ * Числовое значение одиночного атрибута, включая Enum и Bool (напр. размыкатель
+ * 0.0.96.3.10.255: Boolean output_state или Enum control_state). null — не число.
  */
 fun longOrBoolValueOf(value: DlmsValue): Long? = when (value) {
     is DlmsValue.U8 -> value.value.toLong()
@@ -463,7 +463,31 @@ private fun numericValueOf(value: DlmsValue?): Long? = when (value) {
     else -> null
 }
 
-/** Structure(2){Integer scaler, Enum unit} — если формат другой, считаем scaler=0/unit=Wh по умолчанию. */
+/**
+ * Вещественное значение (теги 0x17/0x18) с множителем из следующей Structure(2){scaler, unit}:
+ * AKROS отдаёт так напряжение, ток, мощность и энергию. Множитель по стандарту применяется и к
+ * вещественным значениям (прошивка пульта делает так же). null — значение не вещественное.
+ * Без пары {scaler, unit} значение берётся как есть, единица неизвестна.
+ */
+private fun floatReadingOf(obisBytes: ByteArray, value: DlmsValue?, scalerUnitItem: DlmsValue?): ObisReading? {
+    val raw = when (value) {
+        is DlmsValue.Float32Val -> value.value.toDouble()
+        is DlmsValue.Float64Val -> value.value
+        else -> return null
+    }
+    var scaler = 0
+    var unit: Int? = null
+    if (scalerUnitItem is DlmsValue.Struct && scalerUnitItem.items.size == 2) {
+        val scalerValue = (scalerUnitItem.items[0] as? DlmsValue.I8)?.value
+        if (scalerValue != null) {
+            scaler = scalerValue
+            unit = (scalerUnitItem.items[1] as? DlmsValue.EnumVal)?.value
+        }
+    }
+    return ObisReading(obisCodeOf(obisBytes), 0L, 0, unit, floatValue = raw * Math.pow(10.0, scaler.toDouble()))
+}
+
+/** Structure(2){Integer scaler, Enum unit}; при другом формате — scaler=0, unit=Wh. */
 private fun scalerUnitOf(value: DlmsValue?): Pair<Int, Int?> {
     if (value is DlmsValue.Struct && value.items.size == 2) {
         val scaler = (value.items[0] as? DlmsValue.I8)?.value

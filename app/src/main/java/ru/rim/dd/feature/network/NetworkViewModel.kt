@@ -11,6 +11,7 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import ru.rim.dd.core.model.NetworkParams
 import ru.rim.dd.core.model.PhaseValues
+import ru.rim.dd.core.model.RelaySource
 import ru.rim.dd.core.model.RelayState
 import ru.rim.dd.data.repository.MeterRepository
 import javax.inject.Inject
@@ -30,7 +31,7 @@ class NetworkViewModel @Inject constructor(
     val relayState: StateFlow<RelayState> = repository.relayState()
         .stateIn(
             viewModelScope, SharingStarted.WhileSubscribed(5_000),
-            RelayState(isOn = false, powerLimitKw = 0.0, source = ru.rim.dd.core.model.RelaySource.UNKNOWN),
+            RelayState(isOn = false, powerLimitKw = 0.0, source = RelaySource.UNKNOWN),
         )
 
     /** Секунды, оставшиеся до включения реле (UC-08: обратный отсчёт 60 c, как в прошивке ДД). */

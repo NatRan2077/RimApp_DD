@@ -1,72 +1,123 @@
 package ru.rim.dd.feature.settings
 
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.Button
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
-import ru.rim.dd.core.model.ConnectionState
+import ru.rim.dd.ui.components.DataCard
+import ru.rim.dd.ui.components.Divider
+import ru.rim.dd.ui.components.MonoText
+import ru.rim.dd.ui.components.RimShapes
+import ru.rim.dd.ui.components.SectionLabel
+import ru.rim.dd.ui.components.ToggleRow
+import ru.rim.dd.ui.theme.RimError
+import ru.rim.dd.ui.theme.RimFonts
+import ru.rim.dd.ui.theme.RimTheme
 
-/** Экран «Настройки» — соответствует макету wf5_settings.png из ТЗ. */
 @Composable
-fun SettingsScreen(viewModel: SettingsViewModel = hiltViewModel()) {
-    val connectionState by viewModel.connectionState.collectAsState()
-    val signalStrengthDbm by viewModel.signalStrengthDbm.collectAsState()
-    // [Android-патч] Уровень сигнала показываем только при реально активном соединении (см.
-    // disconnect()/signalStrengthDbm() в SettingsViewModel).
-    val isConnected = connectionState is ConnectionState.Connected
-    // [Android-патч] см. ConnectionState.Reconnecting — механизм переподключения (MeterBleClient/
-    // MeterRepositoryImpl): после неожиданного разрыва связь автоматически восстанавливается сама,
-    // без участия пользователя, поэтому показываем это отдельным статусом, а не просто "Не подключено".
-    val isReconnecting = connectionState is ConnectionState.Reconnecting
-    // [Android-патч] Кнопку «Отключиться» держим доступной и во время Reconnecting — пользователь
-    // должен иметь возможность прервать ожидание автопереподключения и вручную уйти на экран
-    // «Подключение» выбрать другой прибор, а не ждать неопределённое время.
-    val canDisconnect = connectionState !is ConnectionState.Idle
+fun SettingsScreen(
+    showObis: Boolean,
+    onShowObisChange: (Boolean) -> Unit,
+    dark: Boolean,
+    onDarkChange: (Boolean) -> Unit,
+    onOpenJournal: () -> Unit,
+    viewModel: SettingsViewModel = hiltViewModel(),
+) {
+    val signal by viewModel.signalStrengthDbm.collectAsState()
+    val info by viewModel.meterInfo.collectAsState()
+    val p = RimTheme.palette
 
-    // [Android-патч] verticalScroll — по той же причине, что и на экране «Инфо» (см.
-    // комментарий там): Column без скролла не прокручивается, а молча обрезает всё, что не
-    // влезло по высоте. Здесь содержимое пока короткое и на обычном экране помещается, но при
-    // крупном системном шрифте или на маленьком устройстве нижние строки (статус соединения,
-    // уровень сигнала, кнопка «Отключиться») точно так же оказались бы недоступны.
     Column(
-        modifier = Modifier.fillMaxSize().padding(16.dp).verticalScroll(rememberScrollState()),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
+        modifier = Modifier
+            .fillMaxSize()
+            .background(p.background)
+            .verticalScroll(rememberScrollState())
+            .padding(start = 16.dp, end = 16.dp, top = 20.dp, bottom = 24.dp),
     ) {
-        Text("Настройки", style = MaterialTheme.typography.headlineSmall)
-        Text("Управление сопряжением")
-        Text("История показаний")
-        Text("Синхронизация с ЛК энергосбыта")
-        Text("О приложении")
-        // TODO: реальные списки/переключатели — после того как заработают
-        //  реальные данные из MeterRepository (UC-10, UC-12).
-
-        Text("Соединение", style = MaterialTheme.typography.titleMedium)
-        Text(
-            when {
-                isConnected -> "Подключено"
-                isReconnecting -> "Переподключение..."
-                else -> "Не подключено"
-            }
-        )
-        // [Android-патч] см. MeterRepository.signalStrengthDbm() — null, пока нет соединения
-        // или ни одного успешного чтения RSSI ещё не было (сразу после подключения).
-        if (isConnected) {
-            Text(signalStrengthDbm?.let { "Уровень сигнала: $it дБм" } ?: "Уровень сигнала: —")
+        Column(Modifier.padding(bottom = 20.dp)) {
+            Text("Настройки", color = p.textPrimary, fontSize = 28.sp, fontWeight = FontWeight.ExtraBold, fontFamily = RimFonts.Raleway)
+            Text("Управление подключением и видом", color = p.textSecondary, fontSize = 15.sp, modifier = Modifier.padding(top = 3.dp))
         }
-        // [Android-патч] см. canDisconnect выше — доступна и во время Reconnecting (прервать
-        // ожидание автопереподключения). После нажатия приложение само уведёт на экран
-        // «Подключение» (см. AppNavHost/ConnectionWatcherViewModel — реагируют на ConnectionState.Idle).
-        Button(onClick = viewModel::disconnect, enabled = canDisconnect) { Text("Отключиться") }
+
+        SectionLabel("Соединение")
+        DataCard(noPad = true) {
+            Row(
+                Modifier.fillMaxWidth().padding(16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(14.dp),
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text(info?.model ?: "Не подключено", color = p.textSecondary, fontSize = 17.sp, fontWeight = FontWeight.Bold, fontFamily = RimFonts.Raleway)
+                    MonoText("№ ${info?.serialNumber ?: "—"}", color = p.textPrimary, fontSize = 24.sp, weight = FontWeight.SemiBold)
+                    signal?.let { MonoText("Сигнал $it дБм", color = p.textSecondary, fontSize = 15.sp, weight = FontWeight.Normal) }
+                }
+            }
+            // Кнопка есть всегда: при потере связи (переподключение, ошибка) выйти из сеанса нужно так же,
+            // как и при нормальной работе. Экран «Настройки» доступен только внутри сеанса.
+            Divider()
+            Box(Modifier.padding(16.dp)) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RimShapes.control)
+                        .border(1.5.dp, RimError, RimShapes.control)
+                        .clickable { viewModel.disconnect() }
+                        .padding(vertical = 13.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text("Отключиться", color = RimError, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
+                }
+            }
+        }
+
+        Box(Modifier.padding(top = 4.dp))
+        SectionLabel("Данные")
+        DataCard(noPad = true) {
+            Row(
+                Modifier.fillMaxWidth().clickable { onOpenJournal() }.padding(horizontal = 16.dp, vertical = 14.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("Журнал", color = p.textPrimary, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+                    Text("Приборы, к которым вы подключались", color = p.textSecondary, fontSize = 14.sp)
+                }
+                Text("›", color = p.textSecondary, fontSize = 26.sp)
+            }
+        }
+
+        Box(Modifier.padding(top = 16.dp))
+        SectionLabel("Отображение")
+        DataCard(noPad = true) {
+            ToggleRow("OBIS коды", "Показывать коды параметров", showObis, onShowObisChange)
+            Divider()
+            ToggleRow("Тёмная тема", "Переключить цветовую схему", dark, onDarkChange)
+        }
+
+        Text(
+            "Дистанционный дисплей РиМ · v0.0.1 · 2026",
+            color = p.textFaint, fontSize = 14.sp,
+            modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
+            textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+        )
     }
 }

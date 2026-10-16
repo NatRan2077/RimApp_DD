@@ -3,15 +3,21 @@ package ru.rim.dd.feature.pairing
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import ru.rim.dd.core.ble.BleDevice
+import ru.rim.dd.core.model.MeterDeviceName
+import ru.rim.dd.data.local.DeviceStore
 import ru.rim.dd.data.repository.MeterRepository
+import ru.rim.dd.navigation.ConnectionNotice
 import javax.inject.Inject
 
 data class PairingUiState(
@@ -26,39 +32,57 @@ data class PairingUiState(
 @HiltViewModel
 class PairingViewModel @Inject constructor(
     private val repository: MeterRepository,
+    private val deviceStore: DeviceStore,
+    private val connectionNotice: ConnectionNotice,
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(PairingUiState())
     val uiState: StateFlow<PairingUiState> = _uiState.asStateFlow()
 
+    /** Три последних вручную введённых номера ПУ — для быстрого набора. */
+    val recentSerials: StateFlow<List<String>> = deviceStore.recentEnteredSerials
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    /** Предупреждение об обрыве связи: приложение само закрыло сеанс (см. ConnectionWatcherViewModel). */
+    val lossNotice: StateFlow<String?> = connectionNotice.message
+
+    fun dismissLossNotice() = connectionNotice.clear()
+
     private var scanJob: Job? = null
+
+    fun reportError(message: String) {
+        _uiState.value = _uiState.value.copy(errorMessage = message)
+    }
 
     fun scan() {
         scanJob?.cancel()
-        _uiState.value = _uiState.value.copy(
-            isScanning = true,
-            foundDevices = emptyList(),
-            errorMessage = null
-        )
-
+        _uiState.value = _uiState.value.copy(isScanning = true, foundDevices = emptyList(), errorMessage = null)
         scanJob = viewModelScope.launch {
-            repository.scanDevices()
-                // Пульты РиМ 040.40 рекламируются в эфире как "RIM ..." или "AKROS ..."
-                .filter { device ->
-                    device.name?.let { name ->
-                        NAME_PREFIXES.any { prefix ->
-                            name.startsWith(prefix, ignoreCase = true)
+            try {
+                repository.scanDevices()
+                    // Не фиксированный префикс, а looksLikeMeter: он пропускает и приборы вида AKROS-…
+                    .filter { MeterDeviceName.looksLikeMeter(it.name) }
+                    .collect { device ->
+                        val current = _uiState.value.foundDevices
+                        if (current.none { it.address == device.address }) {
+                            _uiState.value = _uiState.value.copy(foundDevices = current + device)
                         }
-                    } == true
-                }
-                .collect { device ->
-                    val current = _uiState.value.foundDevices
-                    if (current.none { it.address == device.address }) {
-                        _uiState.value = _uiState.value.copy(
-                            foundDevices = current + device
-                        )
                     }
-                }
+                // Сюда попадаем только если поток сам завершился (отмена бросает исключение мимо этой
+                // строки): радио-сканер недоступен, например выключен Bluetooth.
+                _uiState.value = _uiState.value.copy(
+                    isScanning = false,
+                    errorMessage = "Не удалось начать поиск — проверьте, что Bluetooth включён",
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // Причину отказа даёт сам сканер (см. MeterBleClient.scan): без неё поиск «молча не шёл».
+                _uiState.value = _uiState.value.copy(
+                    isScanning = false,
+                    errorMessage = e.message ?: "Не удалось начать поиск",
+                )
+            }
         }
     }
 
@@ -69,25 +93,8 @@ class PairingViewModel @Inject constructor(
     }
 
     /**
-     * [Android-патч] НАЙДЕНА причина странного бага "обновление работает при подключении по
-     * номеру, но не при подключении из списка сканирования": stopScan() выше делает
-     * scanJob?.cancel() — это АСИНХРОННАЯ отмена, Job.cancel() не ждёт, пока корутина реально
-     * остановится. А фактическая остановка радио-скана (scanner.stopScan()) происходит в блоке
-     * awaitClose ВНУТРИ MeterBleClient.scan() — он выполняется только когда отмена долетит до
-     * этой корутины, а это не мгновенно. Раньше selectDevice()/connectByNumber() вызывали
-     * stopScan() и СРАЗУ ЖЕ (без ожидания) стартовали GATT-подключение — то есть физический BLE-
-     * скан мог ещё идти в эфире ПАРАЛЛЕЛЬНО с началом GATT-соединения и первым обменом SNRM/GET.
-     * Одновременные скан+GATT — известная проблема стека BLE на Android (нестабильные/потерянные
-     * notify, обрезанные кадры), и именно это, похоже, портило ПЕРВЫЙ буфер после подключения
-     * ЧЕРЕЗ СПИСОК (а дальше "не удалось разобрать DLMS-данные" тянулось на каждое "Обновить",
-     * потому что нативный rx-буфер, скорее всего, остался с "хвостом" от повреждённого кадра).
-     * Подключение по номеру (connectBySerialNumber → ble.connectBySerialNumber()) НЕ страдало этим,
-     * потому что там скан честно suspend-запущенный: scan().first{} не возвращает управление,
-     * пока сам скан не остановлен ПОЛНОСТЬЮ (включая awaitClose) — гонки просто не возникает.
-     *
-     * Исправлено: вместо cancel() используем cancelAndJoin() — он РЕАЛЬНО ждёт, пока предыдущий
-     * scanJob (со всем его awaitClose) завершится, и только потом продолжаем к GATT-подключению.
-     * Вызывается перед ОБОИМИ способами подключения — не только через список.
+     * cancelAndJoin вместо cancel: радио-скан должен реально остановиться до GATT-подключения,
+     * иначе параллельные скан и GATT на Android дают потерянные notify и обрезанные кадры.
      */
     private suspend fun stopScanAndAwait() {
         scanJob?.cancelAndJoin()
@@ -110,6 +117,7 @@ class PairingViewModel @Inject constructor(
     fun connectByNumber(serialNumber: String, pin: String, remember: Boolean) {
         _uiState.value = _uiState.value.copy(isConnecting = true, errorMessage = null)
         viewModelScope.launch {
+            deviceStore.addRecentEnteredSerial(serialNumber)
             stopScanAndAwait()
             runCatching { repository.connectBySerialNumber(serialNumber, pin, remember) }
                 .onSuccess { _uiState.value = _uiState.value.copy(isConnecting = false, isConnected = true) }
@@ -117,10 +125,5 @@ class PairingViewModel @Inject constructor(
                     _uiState.value = _uiState.value.copy(isConnecting = false, errorMessage = e.message ?: "Ошибка подключения")
                 }
         }
-    }
-
-    private companion object {
-        /** Пульты РиМ 040.40 рекламируются в эфире как "RIM ..." */
-        val NAME_PREFIXES = setOf("RIM", "AKROS")
     }
 }

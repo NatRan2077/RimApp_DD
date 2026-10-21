@@ -24,8 +24,6 @@ import javax.inject.Singleton
  * появится кнопка «Лог байтов» (отправка .txt).
  */
 const val JOURNAL_RAW_LOG_ENABLED = false
-
-/** Одна строка показаний в карточке журнала: «A+ · Т1» → «1 234,567 кВт·ч». */
 data class JournalLine(val label: String, val value: String)
 
 /**

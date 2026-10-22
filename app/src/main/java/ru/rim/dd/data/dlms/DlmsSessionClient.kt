@@ -1,6 +1,7 @@
 package ru.rim.dd.data.dlms
 
-import android.util.Log
+import ru.rim.dd.core.log.APP_LOGGING_ENABLED
+import ru.rim.dd.core.log.AppLog
 import ru.rim.dd.core.bridge.SpodesClientBridge
 import ru.rim.dd.core.dlms.CaptureColumn
 import ru.rim.dd.core.dlms.DlmsValue
@@ -95,10 +96,10 @@ class DlmsSessionClient @Inject constructor(
      */
     fun readMainBuffer(): MainBufferResult {
         val sent = if (akrosAssociation) {
-            Log.d(TAG, "GET буфера AKROS (стандартная адресация, после ассоциации)")
+            AppLog.d(TAG, "GET буфера AKROS (стандартная адресация, после ассоциации)")
             spodes.getRequest(MAIN_BUFFER_CLASS_ID, MAIN_BUFFER_OBIS, attributeId = 2)
         } else {
-            Log.d(TAG, "GET буфера индикации (плоская адресация, как у пульта)")
+            AppLog.d(TAG, "GET буфера индикации (плоская адресация, как у пульта)")
             spodes.getRequestFlatAddress(
                 classId = MAIN_BUFFER_CLASS_ID,
                 obisCode = MAIN_BUFFER_OBIS,
@@ -123,14 +124,14 @@ class DlmsSessionClient @Inject constructor(
                     if (akrosCaptureObis.isEmpty()) {
                         // Без описания колонок значения не с чем сопоставить; этот цикл потерян,
                         // следующее автообновление разберёт буфер полностью.
-                        Log.w(TAG, "AKROS: описания буфера ещё нет — запрашиваем capture_objects повторно")
+                        AppLog.w(TAG, "AKROS: описания буфера ещё нет — запрашиваем capture_objects повторно")
                         readCaptureObjects()
                     }
                     compactReadingsOf(buffer, akrosCaptureObis, akrosScalerUnits)
                 } else {
                     readingsOf(buffer)
                 }
-                Log.d(TAG, "GET-response: разобрано ${all.size} элементов буфера: $all")
+                if (APP_LOGGING_ENABLED) AppLog.d(TAG, "GET-response: разобрано ${all.size} элементов буфера: $all")
                 MainBufferResult.Decoded(all)
             }
         } catch (ex: Exception) {
@@ -147,7 +148,7 @@ class DlmsSessionClient @Inject constructor(
      * @return null при успехе, иначе текст ошибки (вызывающий код рвёт соединение).
      */
     fun establishAkrosSession(): String? {
-        Log.d(
+        AppLog.d(
             TAG,
             "AKROS: SNRM (клиент=$AKROS_CLIENT_ADDRESS, сервер логич.=$AKROS_LOGICAL_ADDRESS, " +
                     "физич.=$AKROS_PHYSICAL_ADDRESS)",
@@ -162,20 +163,20 @@ class DlmsSessionClient @Inject constructor(
         if (!snrmOk) return "AKROS: не удалось сформировать SNRM-кадр: ${spodes.lastErrorMessage()}"
 
         val ua = spodes.receiveUnnumberedAcknowledge()
-        Log.d(TAG, "AKROS: ответ на SNRM = $ua (1=UA, 2=DM, 0=ошибка/таймаут)")
+        AppLog.d(TAG, "AKROS: ответ на SNRM = $ua (1=UA, 2=DM, 0=ошибка/таймаут)")
         if (ua != 1) {
             return if (ua == 2) "AKROS: прибор ответил DM — сеанс не открыт"
             else "AKROS: не дождались UA на SNRM (${spodes.lastErrorMessage()})"
         }
 
         // Низкого уровня достаточно: всё нужное лежит в публичном буфере индикации.
-        Log.d(TAG, "AKROS: AARQ (низкоуровневая ассоциация, LLS, пароль \"$AKROS_ASSOCIATION_PASSWORD\")")
+        AppLog.d(TAG, "AKROS: AARQ (низкоуровневая ассоциация, LLS, пароль \"$AKROS_ASSOCIATION_PASSWORD\")")
         val aarqOk = spodes.establishConnection(
             securityLevel = AKROS_SECURITY_LEVEL_LOW,
             password = AKROS_ASSOCIATION_PASSWORD,
         )
         if (!aarqOk) return "AKROS: ассоциация не установлена: ${spodes.lastErrorMessage()}"
-        Log.i(TAG, "AKROS: ассоциация установлена, можно читать данные")
+        AppLog.i(TAG, "AKROS: ассоциация установлена, можно читать данные")
         readCaptureObjects()
         return null
     }
@@ -186,7 +187,7 @@ class DlmsSessionClient @Inject constructor(
      * @return true — прибор вернул Action-Result = 0 (команда выполнена).
      */
     fun disconnectControlAction(methodId: Int, label: String): Boolean {
-        Log.d(TAG, "ACTION-запрос размыкателя ($DISCONNECT_CONTROL_OBIS, class=$DISCONNECT_CONTROL_CLASS_ID Disconnect Control, method=$methodId \"$label\")")
+        AppLog.d(TAG, "ACTION-запрос размыкателя ($DISCONNECT_CONTROL_OBIS, class=$DISCONNECT_CONTROL_CLASS_ID Disconnect Control, method=$methodId \"$label\")")
         val sent = spodes.actionRequestFlatAddress(
             classId = DISCONNECT_CONTROL_CLASS_ID,
             obisCode = DISCONNECT_CONTROL_OBIS,
@@ -198,22 +199,22 @@ class DlmsSessionClient @Inject constructor(
             srcAddress = FLAT_SRC_ADDRESS,
         )
         if (!sent) {
-            Log.w(TAG, "Размыкатель ($label): запрос не отправлен (${spodes.lastErrorMessage()})")
+            AppLog.w(TAG, "Размыкатель ($label): запрос не отправлен (${spodes.lastErrorMessage()})")
             return false
         }
         val raw = spodes.getResponseRawBytes()
         if (raw.isEmpty()) {
-            Log.w(TAG, "Размыкатель ($label): пустой ответ от транспорта (${spodes.lastErrorMessage()})")
+            AppLog.w(TAG, "Размыкатель ($label): пустой ответ от транспорта (${spodes.lastErrorMessage()})")
             return false
         }
         val result = parseActionResponseResult(raw)
         return when {
             result == null -> {
-                Log.w(TAG, "Размыкатель ($label): не удалось разобрать ACTION-response")
+                AppLog.w(TAG, "Размыкатель ($label): не удалось разобрать ACTION-response")
                 false
             }
             result != 0 -> {
-                Log.w(
+                AppLog.w(
                     TAG,
                     "Размыкатель ($label): сервер вернул Action-Result код 0x%02X (%d) — команда НЕ выполнена"
                         .format(result, result),
@@ -221,7 +222,7 @@ class DlmsSessionClient @Inject constructor(
                 false
             }
             else -> {
-                Log.d(TAG, "Размыкатель ($label): УСПЕХ (Action-Result=0)")
+                AppLog.d(TAG, "Размыкатель ($label): УСПЕХ (Action-Result=0)")
                 true
             }
         }
@@ -239,7 +240,7 @@ class DlmsSessionClient @Inject constructor(
     private fun readDlmsValueWithBlocks(label: String): DlmsValue? {
         val first = spodes.getResponseRawBytes()
         if (first.isEmpty()) {
-            Log.w(TAG, "AKROS: пустой ответ на $label (${spodes.lastErrorMessage()})")
+            AppLog.w(TAG, "AKROS: пустой ответ на $label (${spodes.lastErrorMessage()})")
             return null
         }
         return assembleDlmsValue(first, label, flat = false)
@@ -259,7 +260,7 @@ class DlmsSessionClient @Inject constructor(
     private fun assembleDlmsValue(first: ByteArray, label: String, flat: Boolean): DlmsValue? {
         var block = parseGetResponseBlock(first)
             ?: return runCatching { parseGetResponseValue(first) }
-                .onFailure { Log.w(TAG, "Ответ на $label не разобран: ${it.message}") }
+                .onFailure { AppLog.w(TAG, "Ответ на $label не разобран: ${it.message}") }
                 .getOrNull()
 
         val data = ByteArrayOutputStream()
@@ -272,17 +273,17 @@ class DlmsSessionClient @Inject constructor(
                 spodes.sendReadyToReceive(block.blockNumber)
             }
             if (!requested) {
-                Log.w(TAG, "Запрос блока ${block.blockNumber + 1} ($label) не ушёл: ${spodes.lastErrorMessage()}")
+                AppLog.w(TAG, "Запрос блока ${block.blockNumber + 1} ($label) не ушёл: ${spodes.lastErrorMessage()}")
                 break
             }
             val raw = spodes.getResponseRawBytes()
             if (raw.isEmpty()) {
-                Log.w(TAG, "Пустой ответ на блок ${block.blockNumber + 1} ($label) (${spodes.lastErrorMessage()})")
+                AppLog.w(TAG, "Пустой ответ на блок ${block.blockNumber + 1} ($label) (${spodes.lastErrorMessage()})")
                 break
             }
             val next = parseGetResponseBlock(raw)
             if (next == null) {
-                Log.w(TAG, "Блок ${block.blockNumber + 1} ($label) пришёл в неожиданном формате")
+                AppLog.w(TAG, "Блок ${block.blockNumber + 1} ($label) пришёл в неожиданном формате")
                 break
             }
             data.write(next.data)
@@ -291,13 +292,13 @@ class DlmsSessionClient @Inject constructor(
         }
 
         if (!block.lastBlock) {
-            Log.w(TAG, "$label получен не полностью — оборвались на блоке ${block.blockNumber} из $blocks")
+            AppLog.w(TAG, "$label получен не полностью — оборвались на блоке ${block.blockNumber} из $blocks")
             return null
         }
         val bytes = data.toByteArray()
-        Log.d(TAG, "$label собран из $blocks блок(ов), ${bytes.size} байт данных")
+        AppLog.d(TAG, "$label собран из $blocks блок(ов), ${bytes.size} байт данных")
         return runCatching { decodeDlmsValue(bytes) }
-            .onFailure { Log.w(TAG, "$label не разобран после склейки блоков: ${it.message}") }
+            .onFailure { AppLog.w(TAG, "$label не разобран после склейки блоков: ${it.message}") }
             .getOrNull()
     }
 
@@ -312,14 +313,14 @@ class DlmsSessionClient @Inject constructor(
         akrosScalerUnits = emptyMap()
         val sent = spodes.getRequest(MAIN_BUFFER_CLASS_ID, MAIN_BUFFER_OBIS, PROFILE_CAPTURE_OBJECTS_ATTRIBUTE)
         if (!sent) {
-            Log.w(TAG, "AKROS: не удалось отправить запрос capture_objects: ${spodes.lastErrorMessage()}")
+            AppLog.w(TAG, "AKROS: не удалось отправить запрос capture_objects: ${spodes.lastErrorMessage()}")
             return
         }
         val value = readDlmsValueWithBlocks("capture_objects") ?: return
         try {
             val columns = captureColumnsOf(value)
             akrosCaptureObis = columns
-            Log.i(
+            AppLog.i(
                 TAG,
                 "AKROS: описание буфера получено, ${columns.size} колонок: " +
                         columns.joinToString { c ->
@@ -328,7 +329,7 @@ class DlmsSessionClient @Inject constructor(
             )
             readScalerUnits(columns)
         } catch (ex: Exception) {
-            Log.e(TAG, "AKROS: не удалось разобрать capture_objects: ${ex.message}", ex)
+            AppLog.e(TAG, "AKROS: не удалось разобрать capture_objects: ${ex.message}", ex)
         }
     }
 
@@ -346,17 +347,17 @@ class DlmsSessionClient @Inject constructor(
             .forEach { column ->
                 val attribute = ScalerUnit.attributeFor(column.classId) ?: return@forEach
                 if (!spodes.getRequest(column.classId, column.obisCode, attribute)) {
-                    Log.w(TAG, "AKROS: запрос scaler_unit для ${column.obisCode} не ушёл: ${spodes.lastErrorMessage()}")
+                    AppLog.w(TAG, "AKROS: запрос scaler_unit для ${column.obisCode} не ушёл: ${spodes.lastErrorMessage()}")
                     return@forEach
                 }
                 val answer = readDlmsValueWithBlocks("scaler_unit ${column.obisCode}") ?: return@forEach
                 val parsed = runCatching { scalerUnitOf(answer) }
-                    .onFailure { Log.w(TAG, "AKROS: scaler_unit для ${column.obisCode} не разобран: ${it.message}") }
+                    .onFailure { AppLog.w(TAG, "AKROS: scaler_unit для ${column.obisCode} не разобран: ${it.message}") }
                     .getOrNull()
                 if (parsed != null) units[column.obisCode] = parsed
             }
         akrosScalerUnits = units
-        Log.i(
+        AppLog.i(
             TAG,
             "AKROS: единицы измерения получены для ${units.size} из ${columns.count { it != null }} колонок: " +
                     units.entries.joinToString { (obis, su) ->

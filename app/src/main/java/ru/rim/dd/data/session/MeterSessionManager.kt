@@ -1,6 +1,6 @@
 package ru.rim.dd.data.session
 
-import android.util.Log
+import ru.rim.dd.core.log.AppLog
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -111,14 +111,14 @@ class MeterSessionManager @Inject constructor(
         // при обрыве останавливаем обмен, при восстановлении пересобираем DLMS-сеанс.
         scope.launch {
             ble.unexpectedDisconnects.collect {
-                Log.w(TAG, "Обнаружен неожиданный разрыв связи — останавливаем протокольный обмен, ждём автопереподключения BLE")
+                AppLog.w(TAG, "Обнаружен неожиданный разрыв связи — останавливаем протокольный обмен, ждём автопереподключения BLE")
                 stopTransportPump()
             }
         }
         scope.launch {
             ble.connectionState.collect { connection ->
                 if (connection is ConnectionState.Connected && !pump.isActive && protocolSessionEstablished) {
-                    Log.d(TAG, "BLE-соединение восстановлено (автопереподключение) — пересобираем протокольный сеанс")
+                    AppLog.d(TAG, "BLE-соединение восстановлено (автопереподключение) — пересобираем протокольный сеанс")
                     reestablishProtocolSession()
                 }
             }
@@ -178,7 +178,7 @@ class MeterSessionManager @Inject constructor(
 
         val reported = meterReportedSerial
         if (reported != null && !MeterDeviceName.serialsEqual(reported, serialNumber)) {
-            Log.e(
+            AppLog.e(
                 TAG,
                 "ПОДКЛЮЧИЛИСЬ НЕ К ТОМУ ПРИБОРУ: запрошен № $serialNumber, а прибор " +
                         "(\"${found.name}\", ${found.address}) сообщил о себе № $reported — разрываем связь",
@@ -189,7 +189,7 @@ class MeterSessionManager @Inject constructor(
             )
         }
         if (reported == null) {
-            Log.w(
+            AppLog.w(
                 TAG,
                 "Прибор не сообщил свой серийный номер (${MeterBufferMapper.SERIAL_NUMBER_OBIS}) — сверить подключение " +
                         "по протоколу не с чем, полагаемся только на совпадение номера в имени устройства " +
@@ -218,10 +218,10 @@ class MeterSessionManager @Inject constructor(
      */
     suspend fun refresh() {
         if (!pump.isActive) {
-            Log.w(TAG, "refreshReadings(): нет активного BLE-соединения — обновлять нечего")
+            AppLog.w(TAG, "refreshReadings(): нет активного BLE-соединения — обновлять нечего")
             return
         }
-        if (!readMainBuffer()) Log.w(TAG, "refreshReadings(): GET-запрос не удался ($lastProtocolError)")
+        if (!readMainBuffer()) AppLog.w(TAG, "refreshReadings(): GET-запрос не удался ($lastProtocolError)")
     }
 
     /**
@@ -250,7 +250,7 @@ class MeterSessionManager @Inject constructor(
     private suspend fun openProtocolSession(deviceName: String?) {
         isAkros = MeterProtocolProfile.forDeviceName(deviceName) == MeterProtocolProfile.AKROS_STANDARD
         dlms.akrosAssociation = false
-        Log.i(TAG, "Обмен с \"$deviceName\": ${if (isAkros) "AKROS" else "РиМ"}")
+        AppLog.i(TAG, "Обмен с \"$deviceName\": ${if (isAkros) "AKROS" else "РиМ"}")
         // Карточка журнала и лог байтов заводятся до первого обмена; при неудаче удаляются.
         withContext(Dispatchers.IO) { journal.begin() }
         try {
@@ -283,7 +283,7 @@ class MeterSessionManager @Inject constructor(
         val ok = readMainBuffer()
         if (!isAkros || (ok && consecutiveEmptyOrFailedReads == 0)) return ok
 
-        Log.w(TAG, "AKROS не ответил на запрос без ассоциации ($lastProtocolError) — пробуем ассоциацию (SNRM + AARQ)")
+        AppLog.w(TAG, "AKROS не ответил на запрос без ассоциации ($lastProtocolError) — пробуем ассоциацию (SNRM + AARQ)")
         // Насос останавливаем до destroyClient(): иначе входящий пакет попал бы в уничтоженный клиент.
         // Пока он остановлен, запоздавшие ответы на прежние кадры отбрасываются.
         stopTransportPump()
@@ -324,10 +324,10 @@ class MeterSessionManager @Inject constructor(
     private fun applyDeviceNameInfo(name: String?) {
         val parsed = MeterDeviceName.parse(name)
         if (parsed == null) {
-            Log.w(TAG, "Модель/серийный номер: не удалось разобрать имя устройства \"$name\" (ожидалось 13 цифр после префикса \"RIM\")")
+            AppLog.w(TAG, "Модель/серийный номер: не удалось разобрать имя устройства \"$name\" (ожидалось 13 цифр после префикса \"RIM\")")
             return
         }
-        Log.d(TAG, "Модель/серийный номер разобраны из имени устройства \"$name\": модель=${parsed.model}, серийный=${parsed.serialNumber}")
+        AppLog.d(TAG, "Модель/серийный номер разобраны из имени устройства \"$name\": модель=${parsed.model}, серийный=${parsed.serialNumber}")
         activeSerialNumber = parsed.serialNumber
         state.updateInfo {
             (it ?: MeterBufferMapper.blankMeterInfo(activeSerialNumber))
@@ -352,18 +352,18 @@ class MeterSessionManager @Inject constructor(
             is MainBufferResult.Empty -> {
                 lastProtocolError = result.error
                 consecutiveEmptyOrFailedReads++
-                Log.w(TAG, "GET-response: пустой ответ от транспорта ($lastProtocolError, подряд неудач: $consecutiveEmptyOrFailedReads)")
+                AppLog.w(TAG, "GET-response: пустой ответ от транспорта ($lastProtocolError, подряд неудач: $consecutiveEmptyOrFailedReads)")
             }
             is MainBufferResult.Incomplete -> {
                 // Именно ответ транспорта — надёжный признак, что сеанс реально поднялся.
                 protocolSessionEstablished = true
                 consecutiveEmptyOrFailedReads++
-                Log.w(TAG, "GET-response: буфер не получен (подряд неудач: $consecutiveEmptyOrFailedReads)")
+                AppLog.w(TAG, "GET-response: буфер не получен (подряд неудач: $consecutiveEmptyOrFailedReads)")
             }
             is MainBufferResult.DecodeFailed -> {
                 protocolSessionEstablished = true
                 consecutiveEmptyOrFailedReads++
-                Log.e(TAG, "GET-response: не удалось разобрать DLMS-данные: ${result.error.message} (подряд неудач: $consecutiveEmptyOrFailedReads)", result.error)
+                AppLog.e(TAG, "GET-response: не удалось разобрать DLMS-данные: ${result.error.message} (подряд неудач: $consecutiveEmptyOrFailedReads)", result.error)
             }
             is MainBufferResult.Decoded -> {
                 protocolSessionEstablished = true
@@ -373,7 +373,7 @@ class MeterSessionManager @Inject constructor(
                     consecutiveForceReconnectsWithoutData = 0
                 } catch (ex: Exception) {
                     consecutiveEmptyOrFailedReads++
-                    Log.e(TAG, "GET-response: не удалось разобрать DLMS-данные: ${ex.message} (подряд неудач: $consecutiveEmptyOrFailedReads)", ex)
+                    AppLog.e(TAG, "GET-response: не удалось разобрать DLMS-данные: ${ex.message} (подряд неудач: $consecutiveEmptyOrFailedReads)", ex)
                 }
             }
         }
@@ -390,7 +390,7 @@ class MeterSessionManager @Inject constructor(
             all = all,
             activeSerialNumber = activeSerialNumber,
             knownReportedSerial = meterReportedSerial,
-            log = { Log.d(TAG, it) },
+            log = { AppLog.d(TAG, it) },
         )?.let { meterReportedSerial = it }
         recordJournal()
     }
@@ -431,13 +431,13 @@ class MeterSessionManager @Inject constructor(
             while (true) {
                 delay(AUTO_REFRESH_INTERVAL_MS)
                 val ok = readMainBuffer()
-                if (!ok) Log.w(TAG, "Автообновление: GET-запрос не удался ($lastProtocolError)")
+                if (!ok) AppLog.w(TAG, "Автообновление: GET-запрос не удался ($lastProtocolError)")
                 if (consecutiveEmptyOrFailedReads >= MAX_CONSECUTIVE_PROTOCOL_FAILURES) {
                     consecutiveEmptyOrFailedReads = 0
                     consecutiveForceReconnectsWithoutData++
                     val cold = consecutiveForceReconnectsWithoutData >= COLD_RECONNECT_THRESHOLD
                     if (cold) consecutiveForceReconnectsWithoutData = 0
-                    Log.w(
+                    AppLog.w(
                         TAG,
                         "Автообновление: $MAX_CONSECUTIVE_PROTOCOL_FAILURES неудачных циклов подряд — " +
                                 "считаем DLMS-сессию разорванной при формально рабочем GATT, принудительно " +
@@ -478,16 +478,16 @@ class MeterSessionManager @Inject constructor(
                 val connected = establishSessionAndReadFirst()
                 startAutoRefresh()
                 if (connected) {
-                    Log.d(TAG, "Протокольный сеанс восстановлен после автопереподключения")
+                    AppLog.d(TAG, "Протокольный сеанс восстановлен после автопереподключения")
                 } else {
-                    Log.w(
+                    AppLog.w(
                         TAG,
                         "Восстановление сеанса: первый GET-запрос не удался ($lastProtocolError) — " +
                                 "автообновление всё равно запущено и будет повторять попытки",
                     )
                 }
             } catch (ex: Exception) {
-                Log.e(TAG, "Восстановление сеанса после автопереподключения не удалось: ${ex.message}", ex)
+                AppLog.e(TAG, "Восстановление сеанса после автопереподключения не удалось: ${ex.message}", ex)
             }
         }
     }

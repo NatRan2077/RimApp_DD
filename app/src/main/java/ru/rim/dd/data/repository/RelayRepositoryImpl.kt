@@ -1,6 +1,6 @@
 package ru.rim.dd.data.repository
 
-import android.util.Log
+import ru.rim.dd.core.log.AppLog
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.withContext
@@ -46,7 +46,7 @@ class RelayRepositoryImpl @Inject constructor(
      */
     private suspend fun sendDisconnectControlAction(methodId: Int, label: String) {
         if (!session.isActive) {
-            Log.w(TAG, "Размыкатель ($label): нет активного BLE-соединения — команда не отправлена")
+            AppLog.w(TAG, "Размыкатель ($label): нет активного BLE-соединения — команда не отправлена")
             return
         }
         session.exclusive {

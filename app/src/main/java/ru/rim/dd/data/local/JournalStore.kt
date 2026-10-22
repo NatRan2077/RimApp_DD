@@ -1,7 +1,7 @@
 package ru.rim.dd.data.local
 
 import android.content.Context
-import android.util.Log
+import ru.rim.dd.core.log.AppLog
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -164,7 +164,7 @@ class JournalStore @Inject constructor(
                 out.write(bytes)
                 rawSize += bytes.size
             } catch (e: Exception) {
-                Log.w(TAG, "Не удалось записать лог байтов: ${e.message}")
+                AppLog.w(TAG, "Не удалось записать лог байтов: ${e.message}")
                 return
             }
             if (rawSize > MAX_RAW_FILE_BYTES) trimRawLocked()
@@ -326,7 +326,7 @@ class JournalStore @Inject constructor(
             rawOut = FileOutputStream(f, true)
             rawSize = kept.size.toLong()
         } catch (e: Exception) {
-            Log.w(TAG, "Не удалось обрезать лог байтов: ${e.message}")
+            AppLog.w(TAG, "Не удалось обрезать лог байтов: ${e.message}")
             rawOut = runCatching { FileOutputStream(rawFile(cur.id), true) }.getOrNull()
         }
     }
@@ -394,7 +394,7 @@ class JournalStore @Inject constructor(
                 target.writeText(o.toString(), Charsets.UTF_8)
                 tmp.delete()
             }
-        }.onFailure { Log.w(TAG, "Не удалось сохранить карточку журнала: ${it.message}") }
+        }.onFailure { AppLog.w(TAG, "Не удалось сохранить карточку журнала: ${it.message}") }
     }
 
     private fun parse(f: File): JournalEntry? = runCatching {

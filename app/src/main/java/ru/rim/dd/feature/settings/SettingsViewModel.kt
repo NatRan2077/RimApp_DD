@@ -9,12 +9,11 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import ru.rim.dd.core.model.ConnectionState
 import ru.rim.dd.core.model.MeterInfo
-import ru.rim.dd.core.model.Reading
 import ru.rim.dd.data.repository.ConnectionRepository
 import ru.rim.dd.data.repository.MeterDataRepository
 import javax.inject.Inject
 
-/** UC-10 (история) и UC-12 (управление сопряжёнными устройствами). Экран «Настройки». */
+/** UC-12 (управление сопряжёнными устройствами). Экран «Настройки». */
 @HiltViewModel
 class SettingsViewModel @Inject constructor(
     private val connection: ConnectionRepository,
@@ -29,10 +28,6 @@ class SettingsViewModel @Inject constructor(
 
     val meterInfo: StateFlow<MeterInfo?> = meterData.meterInfo()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
-
-    fun history(serialNumber: String): StateFlow<List<Reading>> =
-        meterData.history(serialNumber)
-            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     fun forgetDevice(serialNumber: String) {
         viewModelScope.launch { connection.forgetDevice(serialNumber) }

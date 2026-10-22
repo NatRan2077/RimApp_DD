@@ -14,7 +14,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.os.Build
-import android.util.Log
+import ru.rim.dd.core.log.AppLog
 import androidx.annotation.RequiresPermission
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CoroutineScope
@@ -145,7 +145,7 @@ class MeterBleClient @Inject constructor(
             }
 
             override fun onScanFailed(errorCode: Int) {
-                Log.e("MeterBleClient", "Сканирование не запустилось, код $errorCode (расширенный режим: $extended)")
+                AppLog.e("MeterBleClient", "Сканирование не запустилось, код $errorCode (расширенный режим: $extended)")
                 if (extended) {
                     // Расширенный режим не принят — пробуем обычный поиск тем же сканером.
                     extended = false
@@ -154,7 +154,7 @@ class MeterBleClient @Inject constructor(
                         scanner.startScan(null, settings(false), this)
                         return
                     } catch (ex: Exception) {
-                        Log.e("MeterBleClient", "Повторный запуск поиска не удался: ${ex.message}")
+                        AppLog.e("MeterBleClient", "Повторный запуск поиска не удался: ${ex.message}")
                     }
                 }
                 close(IllegalStateException(scanFailureText(errorCode)))
@@ -199,7 +199,7 @@ class MeterBleClient @Inject constructor(
         stalePairingHint = null
         reconnectJob?.cancel()
         _connectionState.value = ConnectionState.Connecting(device.address)
-        Log.d("MeterBleClient", "Подключение к ${device.address}, состояние сопряжения в системе: ${bondStateName(device.bondState)}")
+        AppLog.d("MeterBleClient", "Подключение к ${device.address}, состояние сопряжения в системе: ${bondStateName(device.bondState)}")
         val manager = MeterGattManager(
             context,
             onStateChanged = { state -> _connectionState.value = state },
@@ -234,7 +234,7 @@ class MeterBleClient @Inject constructor(
                 if (changed?.address != device.address) return
                 val state = intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.ERROR)
                 val previous = intent.getIntExtra(BluetoothDevice.EXTRA_PREVIOUS_BOND_STATE, BluetoothDevice.ERROR)
-                Log.d("MeterBleClient", "Сопряжение ${device.address}: $previous → $state")
+                AppLog.d("MeterBleClient", "Сопряжение ${device.address}: $previous → $state")
                 if (state == BluetoothDevice.BOND_NONE && previous == BluetoothDevice.BOND_BONDING) {
                     bondRejected.complete(Unit)
                 }
@@ -262,7 +262,7 @@ class MeterBleClient @Inject constructor(
             // Подключение могло завершиться раньше, чем дошла рассылка об отказе.
             if (bondRejected.isCompleted) throw BondRejectedException()
         } catch (ex: BondRejectedException) {
-            Log.w("MeterBleClient", "Сопряжение с ${device.address} отменено или не удалось — разрываем соединение")
+            AppLog.w("MeterBleClient", "Сопряжение с ${device.address} отменено или не удалось — разрываем соединение")
             // Флаг ставим до disconnect(): иначе разрыв сочтётся неожиданным и запустит переподключение.
             userInitiatedDisconnect = true
             reconnectJob?.cancel()
@@ -304,11 +304,11 @@ class MeterBleClient @Inject constructor(
     private fun handleStaleBond(device: BluetoothDevice) {
         if (staleBondHandled) return
         staleBondHandled = true
-        Log.w("MeterBleClient", "Прибор сопряжён, но шифрованный обмен не удался — удаляем старую связь и сопрягаем заново")
+        AppLog.w("MeterBleClient", "Прибор сопряжён, но шифрованный обмен не удался — удаляем старую связь и сопрягаем заново")
         val removed = try {
             device.javaClass.getMethod("removeBond").invoke(device) as? Boolean ?: false
         } catch (ex: Exception) {
-            Log.w("MeterBleClient", "removeBond недоступен: ${ex.message}")
+            AppLog.w("MeterBleClient", "removeBond недоступен: ${ex.message}")
             false
         }
         if (!removed) {
@@ -333,7 +333,7 @@ class MeterBleClient @Inject constructor(
         // REASON_NOT_SUPPORTED — не разрыв, а отказ нашего isRequiredServiceSupported():
         // повтор ничего не изменит (раньше цикл бесконечно переподключался к такому прибору).
         if (reason == ConnectionObserver.REASON_NOT_SUPPORTED) {
-            Log.e(
+            AppLog.e(
                 "MeterBleClient",
                 "Прибор $device не поддерживается: ни один известный профиль обмена не найден " +
                         "(см. isRequiredServiceSupported). Переподключение НЕ запускаем — оно ничего не изменит",
@@ -344,7 +344,7 @@ class MeterBleClient @Inject constructor(
             )
             return
         }
-        Log.w(
+        AppLog.w(
             "MeterBleClient",
             "Неожиданный разрыв связи (устройство вне радиуса действия/выключено?) — " +
                     "переходим в Reconnecting и переподключаемся к $device своим циклом",
@@ -357,7 +357,7 @@ class MeterBleClient @Inject constructor(
             val extraDelay = nextReconnectExtraDelayMs
             nextReconnectExtraDelayMs = 0
             if (extraDelay > 0) {
-                Log.w(
+                AppLog.w(
                     "MeterBleClient",
                     "«Холодное» переподключение — ждём ${extraDelay}мс перед повторным connect() к " +
                             "$device (даём пульту время заметить реальную потерю связи и пересобрать " +
@@ -370,7 +370,7 @@ class MeterBleClient @Inject constructor(
             while (isActive && !userInitiatedDisconnect) {
                 attempt++
                 try {
-                    Log.d("MeterBleClient", "Попытка переподключения #$attempt к $device")
+                    AppLog.d("MeterBleClient", "Попытка переподключения #$attempt к $device")
                     gattManager?.connect(device)
                         ?.useAutoConnect(false)
                         ?.timeout(RECONNECT_ATTEMPT_TIMEOUT_MS)
@@ -379,11 +379,11 @@ class MeterBleClient @Inject constructor(
                             // gattManager == null: клиент уже отключён, цикл не нужен
                             return@launch
                         }
-                    Log.i("MeterBleClient", "Переподключение к $device успешно (попытка #$attempt)")
+                    AppLog.i("MeterBleClient", "Переподключение к $device успешно (попытка #$attempt)")
                     return@launch
                 } catch (ex: Exception) {
                     if (userInitiatedDisconnect) return@launch
-                    Log.w(
+                    AppLog.w(
                         "MeterBleClient",
                         "Попытка переподключения #$attempt не удалась (${ex.message}) — повтор через ${delayMs}мс",
                     )
@@ -404,14 +404,14 @@ class MeterBleClient @Inject constructor(
     @SuppressLint("MissingPermission")
     fun forceReconnect(cold: Boolean = false) {
         if (cold) {
-            Log.w(
+            AppLog.w(
                 "MeterBleClient",
                 "Принудительное «холодное» переподключение — несколько подряд циклов без данных, " +
                         "даём пульту паузу ${COLD_RECONNECT_COOLDOWN_MS}мс перед следующей попыткой",
             )
             nextReconnectExtraDelayMs = COLD_RECONNECT_COOLDOWN_MS
         } else {
-            Log.w("MeterBleClient", "Принудительное переподключение — протокольный уровень счёл DLMS-сессию мёртвой при формально рабочем GATT")
+            AppLog.w("MeterBleClient", "Принудительное переподключение — протокольный уровень счёл DLMS-сессию мёртвой при формально рабочем GATT")
         }
         gattManager?.disconnect()?.enqueue()
     }
@@ -456,14 +456,14 @@ class MeterBleClient @Inject constructor(
                 "\"$serialNumber\" не похож на номер прибора учёта — ожидается до " +
                         "${MeterDeviceName.SERIAL_DIGITS} цифр (номер со счётчика) либо 13 цифр из имени устройства"
             )
-        Log.d("MeterBleClient", "Поиск прибора учёта № $wanted в эфире (таймаут ${timeoutMs}мс)")
+        AppLog.d("MeterBleClient", "Поиск прибора учёта № $wanted в эфире (таймаут ${timeoutMs}мс)")
         val found = withTimeoutOrNull(timeoutMs) {
             scan().first { MeterDeviceName.matches(it.name, wanted) }
         } ?: throw IllegalStateException(
             "Прибор учёта № $wanted не найден за ${timeoutMs / 1000} с. Проверьте номер и " +
                     "убедитесь, что прибор включён и находится рядом"
         )
-        Log.i("MeterBleClient", "Найден прибор учёта № $wanted: \"${found.name}\" (${found.address})")
+        AppLog.i("MeterBleClient", "Найден прибор учёта № $wanted: \"${found.name}\" (${found.address})")
         connect(remoteDevice(found.address), found.name)
         return found
     }
@@ -564,7 +564,7 @@ private class MeterGattManager(
             }
 
             override fun onDeviceFailedToConnect(device: BluetoothDevice, reason: Int) {
-                Log.w("MeterGattManager", "onDeviceFailedToConnect: reason=$reason")
+                AppLog.w("MeterGattManager", "onDeviceFailedToConnect: reason=$reason")
                 onStateChanged(ConnectionState.Error.Other("Не удалось подключиться (код $reason)"))
             }
 
@@ -577,7 +577,7 @@ private class MeterGattManager(
             }
 
             override fun onDeviceDisconnected(device: BluetoothDevice, reason: Int) {
-                Log.w("MeterGattManager", "onDeviceDisconnected: reason=$reason")
+                AppLog.w("MeterGattManager", "onDeviceDisconnected: reason=$reason")
                 onDisconnected(reason)
             }
         })
@@ -586,18 +586,18 @@ private class MeterGattManager(
     fun requestRssi() {
         readRssi()
             .with { _, rssi -> onRssiRead(rssi) }
-            .fail { _, status -> Log.w("MeterGattManager", "readRssi() не удался, status=$status") }
+            .fail { _, status -> AppLog.w("MeterGattManager", "readRssi() не удался, status=$status") }
             .enqueue()
     }
 
     override fun log(priority: Int, message: String) {
-        Log.println(priority, "MeterGattManager", message)
+        AppLog.println(priority, "MeterGattManager", message)
     }
     @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
     override fun isRequiredServiceSupported(gatt: BluetoothGatt): Boolean {
         // Полный список сервисов и характеристик — чтобы по логу можно было добавить новую ревизию платы.
         for (service in gatt.services) {
-            Log.d(
+            AppLog.d(
                 "MeterGattManager",
                 "Сервис ${service.uuid}: " + service.characteristics.joinToString { "${it.uuid} props=${it.properties}" },
             )
@@ -608,7 +608,7 @@ private class MeterGattManager(
             val rx = service.getCharacteristic(profile.rxWrite)
             val tx = service.getCharacteristic(profile.txNotify)
             if (rx == null || tx == null) {
-                Log.w(
+                AppLog.w(
                     "MeterGattManager",
                     "Набор ${profile.label}: сервис есть, но характеристики неполные " +
                             "(RX=${rx?.uuid}, TX=${tx?.uuid}) — пробуем следующий",
@@ -625,7 +625,7 @@ private class MeterGattManager(
             ?: found.firstOrNull()
             ?: findGenericUart(gatt)
         if (chosen == null) {
-            Log.e(
+            AppLog.e(
                 "MeterGattManager",
                 "Ни один из известных профилей обмена не найден на устройстве " +
                         "(искали: ${GattUuids.ALL.joinToString { it.label }}), и сервиса вида «UART» тоже нет. " +
@@ -642,8 +642,8 @@ private class MeterGattManager(
         } else {
             BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
         }
-        Log.i("MeterGattManager", "Профиль обмена: ${profile.label}")
-        Log.d(
+        AppLog.i("MeterGattManager", "Профиль обмена: ${profile.label}")
+        AppLog.d(
             "MeterGattManager",
             "RX(write)=${rx.uuid}, props=${rx.properties}; " +
                     "TX(notify)=${tx.uuid}, props=${tx.properties}, " +
@@ -669,7 +669,7 @@ private class MeterGattManager(
                 it !== tx && it.properties and
                         (BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE or BluetoothGattCharacteristic.PROPERTY_WRITE) != 0
             } ?: continue
-            Log.w(
+            AppLog.w(
                 "MeterGattManager",
                 "Известный профиль не найден — берём сервис ${service.uuid} как UART: " +
                         "RX=${rx.uuid}, TX=${tx.uuid} (автоопределение)",
@@ -682,8 +682,8 @@ private class MeterGattManager(
     @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
     override fun initialize() {
         requestMtu(247)
-            .done { mtu -> Log.d("MeterGattManager", "MTU согласован: $mtu") }
-            .fail { _, status -> Log.w("MeterGattManager", "requestMtu не удался, status=$status (не критично — .split() всё равно спасёт большие записи)") }
+            .done { mtu -> AppLog.d("MeterGattManager", "MTU согласован: $mtu") }
+            .fail { _, status -> AppLog.w("MeterGattManager", "requestMtu не удался, status=$status (не критично — .split() всё равно спасёт большие записи)") }
             .enqueue()
         // Как у пульта: AKROS принимает данные только после сопряжения (LE Secure Connections с
         // PIN, при legacy-сопряжении разрывает связь с кодом 0x13), а notify включается уже ПОСЛЕ
@@ -693,22 +693,22 @@ private class MeterGattManager(
         // зависала — запрос не завершался, хотя bond уже был создан.
         if (isAkrosPeer()) {
             val alreadyBonded = bluetoothDevice?.bondState == BluetoothDevice.BOND_BONDED
-            Log.d(
+            AppLog.d(
                 "MeterGattManager",
                 "AKROS: сопряжение, уже сопряжены=$alreadyBonded (состояние системы: ${bluetoothDevice?.bondState})",
             )
             if (!alreadyBonded) {
                 createBond()
-                    .done { Log.d("MeterGattManager", "AKROS: сопряжение выполнено") }
-                    .fail { _, status -> Log.e("MeterGattManager", "AKROS: сопряжение не удалось, status=$status") }
+                    .done { AppLog.d("MeterGattManager", "AKROS: сопряжение выполнено") }
+                    .fail { _, status -> AppLog.e("MeterGattManager", "AKROS: сопряжение не удалось, status=$status") }
                     .enqueue()
             }
         }
         setNotificationCallback(txCharacteristic).with { _, data ->
             data.value?.let {
-                Log.d("MeterGattManager", "<< notify (${it.size} байт): ${it.toHex()}")
+                AppLog.d("MeterGattManager", "<< notify (${it.size} байт): ${it.toHex()}")
                 if (!incomingBytes.tryEmit(it.copyOf())) {
-                    Log.e(
+                    AppLog.e(
                         "MeterGattManager",
                         "ПОТЕРЯН входящий кадр (${it.size} байт) — буфер incomingBytes переполнен, " +
                                 "транспортный «насос» не успевает читать",
@@ -717,10 +717,10 @@ private class MeterGattManager(
             }
         }
         enableNotifications(txCharacteristic)
-            .before { Log.d("MeterGattManager", "Включаем notify на TX") }
-            .done { Log.d("MeterGattManager", "Notifications на TX включены успешно") }
+            .before { AppLog.d("MeterGattManager", "Включаем notify на TX") }
+            .done { AppLog.d("MeterGattManager", "Notifications на TX включены успешно") }
             .fail { _, status ->
-                Log.e("MeterGattManager", "enableNotifications провалился, status=$status")
+                AppLog.e("MeterGattManager", "enableNotifications провалился, status=$status")
                 // У AKROS notify доступен только по шифрованной связи: отказ при «сопряжённом» приборе
                 // значит, что ключи не подходят — запрос PIN сам не появится, связь надо пересоздать.
                 if (isAkrosPeer() && bluetoothDevice?.bondState == BluetoothDevice.BOND_BONDED) {
@@ -731,7 +731,7 @@ private class MeterGattManager(
     }
 
     fun writeRxCharacteristic(bytes: ByteArray) {
-        Log.d("MeterGattManager", ">> write (${bytes.size} байт): ${bytes.toHex()}")
+        AppLog.d("MeterGattManager", ">> write (${bytes.size} байт): ${bytes.toHex()}")
         // split() обязателен для кадров длиннее MTU-3 (по умолчанию 20 байт): иначе Android молча
         // обрезает WRITE_NO_RESPONSE, прибор получает битый кадр (FCS) и не отвечает. Разбивка
         // безопасна: «прозрачный UART» копит записи в RX-буфер побайтово.
@@ -741,8 +741,8 @@ private class MeterGattManager(
             rxWriteType,
         )
             .split()
-            .done { Log.d("MeterGattManager", ">> write подтверждён (enqueue done)") }
-            .fail { _, status -> Log.e("MeterGattManager", ">> write ПРОВАЛИЛСЯ, status=$status") }
+            .done { AppLog.d("MeterGattManager", ">> write подтверждён (enqueue done)") }
+            .fail { _, status -> AppLog.e("MeterGattManager", ">> write ПРОВАЛИЛСЯ, status=$status") }
             .enqueue()
     }
 }

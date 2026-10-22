@@ -187,7 +187,7 @@ fun InfoScreen(showObis: Boolean, viewModel: InfoViewModel = hiltViewModel()) {
                 SensorGroup("Состояние прибора") {
                     SensorRow("Батарея", tamper.battery, false)
                     SensorRow("Самодиагностика", tamper.selfDiagnosticsFault, false)
-                    if (tamper.powerLimitExceeded) SensorRow("Превышен лимит мощности", TamperCondition.ACTIVE, false)
+                    if (tamper.powerLimitExceeded) SensorRow("ПЛМ", TamperCondition.ACTIVE, false)
                 }
             }
             SensorGroup("Качество сети") {

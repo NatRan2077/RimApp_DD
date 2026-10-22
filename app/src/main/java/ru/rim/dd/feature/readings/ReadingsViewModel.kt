@@ -9,13 +9,13 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import ru.rim.dd.core.model.MeterInfo
 import ru.rim.dd.core.model.Reading
-import ru.rim.dd.data.repository.MeterRepository
+import ru.rim.dd.data.repository.MeterDataRepository
 import javax.inject.Inject
 
 /** UC-03 (просмотр показаний) и UC-04 (обновление). Экран «Показания». */
 @HiltViewModel
 class ReadingsViewModel @Inject constructor(
-    private val repository: MeterRepository,
+    private val repository: MeterDataRepository,
 ) : ViewModel() {
 
     val readings: StateFlow<List<Reading>> = repository.readings()

@@ -9,25 +9,27 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import ru.rim.dd.core.model.MeterInfo
 import ru.rim.dd.core.model.TamperState
-import ru.rim.dd.data.repository.MeterRepository
+import ru.rim.dd.data.repository.ConnectionRepository
+import ru.rim.dd.data.repository.MeterDataRepository
 import javax.inject.Inject
 
 /** UC-06 — экран «Инфо». */
 @HiltViewModel
 class InfoViewModel @Inject constructor(
-    private val repository: MeterRepository,
+    private val meterData: MeterDataRepository,
+    private val connection: ConnectionRepository,
 ) : ViewModel() {
 
-    val meterInfo: StateFlow<MeterInfo?> = repository.meterInfo()
+    val meterInfo: StateFlow<MeterInfo?> = meterData.meterInfo()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
 
-    val tamperState: StateFlow<TamperState> = repository.tamperState()
+    val tamperState: StateFlow<TamperState> = meterData.tamperState()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), TamperState.UNKNOWN)
 
-    val signalStrengthDbm: StateFlow<Int?> = repository.signalStrengthDbm()
+    val signalStrengthDbm: StateFlow<Int?> = connection.signalStrengthDbm()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
 
     fun refresh() {
-        viewModelScope.launch { repository.refreshReadings() }
+        viewModelScope.launch { meterData.refreshReadings() }
     }
 }

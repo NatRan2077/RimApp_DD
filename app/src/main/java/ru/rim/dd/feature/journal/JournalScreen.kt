@@ -163,7 +163,7 @@ fun JournalScreen(
         if (entries.isEmpty()) {
             DataCard {
                 Text("Журнал пуст", color = p.textPrimary, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
-                Text(
+                Text("Здесь появятся приборы, к которым вы подключитесь",
                     color = p.textSecondary, fontSize = 15.sp, modifier = Modifier.padding(top = 4.dp),
                 )
             }

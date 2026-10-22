@@ -13,22 +13,24 @@ import ru.rim.dd.core.model.NetworkParams
 import ru.rim.dd.core.model.PhaseValues
 import ru.rim.dd.core.model.RelaySource
 import ru.rim.dd.core.model.RelayState
-import ru.rim.dd.data.repository.MeterRepository
+import ru.rim.dd.data.repository.MeterDataRepository
+import ru.rim.dd.data.repository.RelayRepository
 import javax.inject.Inject
 
 /** UC-05 (параметры сети), UC-07/UC-08 (состояние и управление реле). Экран «Сеть». */
 @HiltViewModel
 class NetworkViewModel @Inject constructor(
-    private val repository: MeterRepository,
+    private val meterData: MeterDataRepository,
+    private val relay: RelayRepository,
 ) : ViewModel() {
 
-    val networkParams: StateFlow<NetworkParams> = repository.networkParams()
+    val networkParams: StateFlow<NetworkParams> = meterData.networkParams()
         .stateIn(
             viewModelScope, SharingStarted.WhileSubscribed(5_000),
             NetworkParams(PhaseValues(0.0), PhaseValues(0.0), PhaseValues(0.0)),
         )
 
-    val relayState: StateFlow<RelayState> = repository.relayState()
+    val relayState: StateFlow<RelayState> = relay.relayState()
         .stateIn(
             viewModelScope, SharingStarted.WhileSubscribed(5_000),
             RelayState(isOn = false, powerLimitKw = 0.0, source = RelaySource.UNKNOWN),
@@ -40,11 +42,11 @@ class NetworkViewModel @Inject constructor(
 
     /** Кнопка «Обновить» — переспрашивает тот же буфер счётчика, что обновляет и «Показания». */
     fun refresh() {
-        viewModelScope.launch { repository.refreshReadings() }
+        viewModelScope.launch { meterData.refreshReadings() }
     }
 
     fun turnRelayOff() {
-        viewModelScope.launch { repository.turnRelayOff() }
+        viewModelScope.launch { relay.turnRelayOff() }
     }
 
     fun turnRelayOn() {
@@ -54,7 +56,7 @@ class NetworkViewModel @Inject constructor(
                 delay(1_000)
             }
             _turnOnCountdown.value = null
-            repository.turnRelayOn()
+            relay.turnRelayOn()
         }
     }
 }

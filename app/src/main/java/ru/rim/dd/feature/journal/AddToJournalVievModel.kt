@@ -4,13 +4,13 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.launch
-import ru.rim.dd.data.repository.MeterRepository
+import ru.rim.dd.data.repository.JournalRepository
 import javax.inject.Inject
 
 /** Кнопка «+» рядом с «Обновить»: добавляет текущие данные прибора в журнал. */
 @HiltViewModel
 class AddToJournalViewModel @Inject constructor(
-    private val repository: MeterRepository,
+    private val repository: JournalRepository,
 ) : ViewModel() {
 
     /** [onResult] вызывается в главном потоке: true — добавлено, false — целых данных ещё нет. */

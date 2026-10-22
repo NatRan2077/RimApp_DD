@@ -16,7 +16,7 @@ import kotlinx.coroutines.launch
 import ru.rim.dd.core.ble.BleDevice
 import ru.rim.dd.core.model.MeterDeviceName
 import ru.rim.dd.data.local.DeviceStore
-import ru.rim.dd.data.repository.MeterRepository
+import ru.rim.dd.data.repository.ConnectionRepository
 import ru.rim.dd.navigation.ConnectionNotice
 import javax.inject.Inject
 
@@ -31,7 +31,7 @@ data class PairingUiState(
 /** UC-01 (сканирование) и UC-02 (ввод номера). */
 @HiltViewModel
 class PairingViewModel @Inject constructor(
-    private val repository: MeterRepository,
+    private val repository: ConnectionRepository,
     private val deviceStore: DeviceStore,
     private val connectionNotice: ConnectionNotice,
 ) : ViewModel() {

@@ -81,10 +81,8 @@ class JournalStore @Inject constructor(
 
     private val _entries = MutableStateFlow<List<JournalEntry>>(emptyList())
 
-    /** Все карточки, новые сверху. */
     val entries: StateFlow<List<JournalEntry>> = _entries.asStateFlow()
 
-    /** Подключение, идущее сейчас; данные в памяти до [commit]/[end]. */
     private class Session(val id: Long) {
         var meterType = "—"
         var serialNumber = "—"
@@ -92,10 +90,8 @@ class JournalStore @Inject constructor(
         var voltage: String? = null
         var current: String? = null
 
-        /** Время последнего целого чтения; 0 — ни одного ещё не было. */
         var snapshotAt = 0L
 
-        /** Карточка уже записана в файл кнопкой «+». */
         var committed = false
 
         val hasData: Boolean
@@ -107,13 +103,11 @@ class JournalStore @Inject constructor(
     private var rawOut: FileOutputStream? = null
     private var rawSize = 0L
 
-    /** Перечитывает журнал с диска (вызывается при открытии экрана). */
     fun refresh() = synchronized(lock) {
         loadLocked()
         publishLocked()
     }
 
-    /** Начало подключения. Прошлый незакрытый сеанс закрывается ([end]). */
     fun begin() = synchronized(lock) {
         loadLocked()
         endLocked()
@@ -136,17 +130,13 @@ class JournalStore @Inject constructor(
         publishLocked()
     }
 
-    /** Выход: если «+» не нажимали — сохраняет последний целый снимок; иначе дописывает время отключения. */
     fun end() = synchronized(lock) {
         loadLocked()
         endLocked()
         publishLocked()
     }
 
-    /**
-     * Кнопка «+»: записывает в журнал снимок последнего целого чтения. Повторное нажатие
-     * обновляет ту же карточку. false — целых данных ещё нет (или нет подключения).
-     */
+
     fun commit(): Boolean = synchronized(lock) {
         loadLocked()
         val sess = session ?: return@synchronized false

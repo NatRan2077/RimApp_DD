@@ -9,8 +9,14 @@ import dagger.hilt.android.qualifiers.ApplicationContext
 import dagger.hilt.components.SingletonComponent
 import ru.rim.dd.data.local.AppDatabase
 import ru.rim.dd.data.local.ReadingDao
-import ru.rim.dd.data.repository.MeterRepository
-import ru.rim.dd.data.repository.MeterRepositoryImpl
+import ru.rim.dd.data.repository.ConnectionRepository
+import ru.rim.dd.data.repository.ConnectionRepositoryImpl
+import ru.rim.dd.data.repository.JournalRepository
+import ru.rim.dd.data.repository.JournalRepositoryImpl
+import ru.rim.dd.data.repository.MeterDataRepository
+import ru.rim.dd.data.repository.MeterDataRepositoryImpl
+import ru.rim.dd.data.repository.RelayRepository
+import ru.rim.dd.data.repository.RelayRepositoryImpl
 import javax.inject.Singleton
 
 @Module
@@ -18,7 +24,19 @@ import javax.inject.Singleton
 abstract class RepositoryModule {
     @Binds
     @Singleton
-    abstract fun bindMeterRepository(impl: MeterRepositoryImpl): MeterRepository
+    abstract fun bindConnectionRepository(impl: ConnectionRepositoryImpl): ConnectionRepository
+
+    @Binds
+    @Singleton
+    abstract fun bindMeterDataRepository(impl: MeterDataRepositoryImpl): MeterDataRepository
+
+    @Binds
+    @Singleton
+    abstract fun bindRelayRepository(impl: RelayRepositoryImpl): RelayRepository
+
+    @Binds
+    @Singleton
+    abstract fun bindJournalRepository(impl: JournalRepositoryImpl): JournalRepository
 }
 
 @Module

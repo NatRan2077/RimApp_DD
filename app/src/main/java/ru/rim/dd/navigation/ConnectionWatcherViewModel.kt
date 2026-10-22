@@ -10,7 +10,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import ru.rim.dd.core.model.ConnectionState
-import ru.rim.dd.data.repository.MeterRepository
+import ru.rim.dd.data.repository.ConnectionRepository
 import javax.inject.Inject
 
 /**
@@ -23,7 +23,7 @@ import javax.inject.Inject
  */
 @HiltViewModel
 class ConnectionWatcherViewModel @Inject constructor(
-    private val repository: MeterRepository,
+    private val repository: ConnectionRepository,
     private val notice: ConnectionNotice,
 ) : ViewModel() {
 

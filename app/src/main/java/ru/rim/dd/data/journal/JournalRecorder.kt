@@ -6,7 +6,7 @@ import ru.rim.dd.core.model.NetworkParams
 import ru.rim.dd.core.model.PhaseValues
 import ru.rim.dd.core.model.Reading
 import ru.rim.dd.data.local.JournalLine
-import ru.rim.dd.data.local.JournalStore
+import ru.rim.dd.data.local.JournalWriter
 import ru.rim.dd.ui.components.formatNumber
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -19,15 +19,9 @@ data class JournalSnapshot(
     val voltage: String?,
     val current: String?,
 )
-
-/**
- * Связка «данные прибора → журнал». Превращает текущие данные в текстовый снимок
- * ([snapshotOf] — чистая функция) и передаёт его в [JournalStore]; остальные методы —
- * жизненный цикл карточки (начало подключения, сохранение, выход).
- */
 @Singleton
 class JournalRecorder @Inject constructor(
-    private val journal: JournalStore,
+    private val journal: JournalWriter,
 ) {
     /** Начало подключения: карточка и лог байтов заводятся до первого обмена. */
     fun begin() = journal.begin()

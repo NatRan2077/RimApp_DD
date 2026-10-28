@@ -74,7 +74,7 @@ data class JournalEntry(
 @Singleton
 class JournalStore @Inject constructor(
     @ApplicationContext private val context: Context,
-) {
+) : JournalWriter {
     private val lock = Any()
     private val dir: File get() = File(context.filesDir, "journal").also { it.mkdirs() }
     private val exportDir: File get() = File(context.cacheDir, "journal_export").also { it.mkdirs() }
@@ -108,7 +108,7 @@ class JournalStore @Inject constructor(
         publishLocked()
     }
 
-    fun begin() = synchronized(lock) {
+    override fun begin() = synchronized(lock) {
         loadLocked()
         endLocked()
         val sess = Session(System.currentTimeMillis())
@@ -121,7 +121,7 @@ class JournalStore @Inject constructor(
     }
 
     /** Подключение не удалось — всё, что успело записаться, удаляется. */
-    fun discard() = synchronized(lock) {
+    override fun discard() = synchronized(lock) {
         val sess = session ?: return@synchronized
         closeRawLocked()
         session = null
@@ -130,14 +130,14 @@ class JournalStore @Inject constructor(
         publishLocked()
     }
 
-    fun end() = synchronized(lock) {
+    override fun end() = synchronized(lock) {
         loadLocked()
         endLocked()
         publishLocked()
     }
 
 
-    fun commit(): Boolean = synchronized(lock) {
+    override fun commit(): Boolean = synchronized(lock) {
         loadLocked()
         val sess = session ?: return@synchronized false
         if (!sess.hasData) return@synchronized false
@@ -148,7 +148,7 @@ class JournalStore @Inject constructor(
     }
 
     /** Добавляет пришедшие байты в лог: HEX, через пробел, чанки подряд одним потоком. */
-    fun appendBytes(chunk: ByteArray) {
+    override fun appendBytes(chunk: ByteArray) {
         if (!JOURNAL_RAW_LOG_ENABLED || chunk.isEmpty()) return
         synchronized(lock) {
             val out = rawOut ?: return
@@ -175,7 +175,7 @@ class JournalStore @Inject constructor(
      * Обновляет снимок подключения после ПОЛНОСТЬЮ разобранного буфера. Недостающие в этом
      * цикле поля сохраняют прежнее значение. На диск не пишет — см. [commit] и [end].
      */
-    fun update(
+    override fun update(
         meterType: String?,
         serialNumber: String?,
         energy: List<JournalLine>,

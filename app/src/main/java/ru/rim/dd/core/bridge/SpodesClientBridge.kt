@@ -4,16 +4,16 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 @Singleton
-class SpodesClientBridge @Inject constructor() {
+class SpodesClientBridge @Inject constructor() : NativeDlmsApi {
 
     /** Указатель на нативный объект SpodesClient (opaque handle из C API). 0 — не создан. */
     private var nativeHandle: Long = 0L
 
-    fun createClient() {
+    override fun createClient() {
         nativeHandle = nativeCreate()
     }
 
-    fun destroyClient() {
+    override fun destroyClient() {
         if (nativeHandle != 0L) {
             nativeDestroy(nativeHandle)
             nativeHandle = 0L
@@ -21,21 +21,21 @@ class SpodesClientBridge @Inject constructor() {
     }
 
     /** Байты, которые нужно отправить устройству. */
-    fun pullOutgoingBytes(): ByteArray = nativePullOutgoing(nativeHandle)
+    override fun pullOutgoingBytes(): ByteArray = nativePullOutgoing(nativeHandle)
 
     /** Передать байты, полученные по BLE-notify, обратно в библиотеку на разбор. */
-    fun pushIncomingBytes(bytes: ByteArray) = nativePushIncoming(nativeHandle, bytes)
+    override fun pushIncomingBytes(bytes: ByteArray) = nativePushIncoming(nativeHandle, bytes)
 
     /**
      * Запасной путь AKROS (стандартная ассоциация): корректный SNRM с согласованием max-info.
      * Библиотека принимает sourceAddress только 16/32/48.
      */
-    fun setNormalResponseModeStandard(
+    override fun setNormalResponseModeStandard(
         sourceAddress: Int,
         logicalAddress: Int,
         physicalAddress: Int,
-        maxInfoTransmit: Int = 128,
-        maxInfoReceive: Int = 128,
+        maxInfoTransmit: Int,
+        maxInfoReceive: Int,
     ): Boolean = nativeSetNormalResponseModeStandard(
         nativeHandle,
         sourceAddress,
@@ -46,18 +46,18 @@ class SpodesClientBridge @Inject constructor() {
     )
 
     /** Ожидание ответа на SNRM: 1 — UA, 2 — DM, 0 — ошибка/таймаут. */
-    fun receiveUnnumberedAcknowledge(): Int = nativeReceiveUnnumberedAcknowledge(nativeHandle)
+    override fun receiveUnnumberedAcknowledge(): Int = nativeReceiveUnnumberedAcknowledge(nativeHandle)
 
     /** AARQ; вызывать после успешного UA. */
-    fun establishConnection(securityLevel: Int, password: String?): Boolean =
+    override fun establishConnection(securityLevel: Int, password: String?): Boolean =
         nativeEstablishConnection(nativeHandle, securityLevel, password)
 
     /** GET атрибута со стандартной адресацией (запасной путь AKROS после ассоциации). */
-    fun getRequest(classId: Int, obisCode: String, attributeId: Int): Boolean =
+    override fun getRequest(classId: Int, obisCode: String, attributeId: Int): Boolean =
         nativeGetRequest(nativeHandle, classId, obisCode, attributeId)
 
     /** Запрос следующего блока ответа со стандартной адресацией (запасной путь AKROS). */
-    fun sendReadyToReceive(blockNumber: Int): Boolean =
+    override fun sendReadyToReceive(blockNumber: Int): Boolean =
         nativeSendReadyToReceive(nativeHandle, blockNumber)
 
     /**
@@ -65,7 +65,7 @@ class SpodesClientBridge @Inject constructor() {
      * счётчику штатный пульт РиМ (РиМ и AKROS, без SNRM и ассоциации). Нумерацию кадров N(S)/N(R)
      * ведёт нативный клиент. destAddress/srcAddress — готовые (несдвинутые) байты.
      */
-    fun getRequestFlatAddress(classId: Int, obisCode: String, attributeId: Int, destAddress: Int, srcAddress: Int): Boolean =
+    override fun getRequestFlatAddress(classId: Int, obisCode: String, attributeId: Int, destAddress: Int, srcAddress: Int): Boolean =
         nativeGetRequestFlatAddress(nativeHandle, classId, obisCode, attributeId, destAddress, srcAddress)
 
     /**
@@ -73,14 +73,14 @@ class SpodesClientBridge @Inject constructor() {
      * дочитывает ответ, разбитый прибором на DLMS-блоки. [lastBlockNumber] — номер последнего
      * полученного блока.
      */
-    fun getNextBlockRequestFlatAddress(lastBlockNumber: Int): Boolean =
+    override fun getNextBlockRequestFlatAddress(lastBlockNumber: Int): Boolean =
         nativeGetNextBlockRequestFlatAddress(nativeHandle, lastBlockNumber)
 
     /**
      * ACTION с той же «плоской» адресацией. Для Disconnect Control methodId: 1 — remote_disconnect,
      * 2 — remote_reconnect (у него параметр Integer8 = 0, подтверждено логом пульта).
      */
-    fun actionRequestFlatAddress(
+    override fun actionRequestFlatAddress(
         classId: Int,
         obisCode: String,
         methodId: Int,
@@ -98,9 +98,9 @@ class SpodesClientBridge @Inject constructor() {
      * который завязан на двухбайтовую адресацию. Сегментированный ответ РиМ дочитывается на
      * нативной стороне; разбор — в `ru.rim.dd.core.dlms`.
      */
-    fun getResponseRawBytes(): ByteArray = nativeGetResponseRaw(nativeHandle)
+    override fun getResponseRawBytes(): ByteArray = nativeGetResponseRaw(nativeHandle)
 
-    fun lastErrorMessage(): String = nativeGetErrorMessage(nativeHandle)
+    override fun lastErrorMessage(): String = nativeGetErrorMessage(nativeHandle)
 
     // Реализация — в spodes_jni_bridge.cpp.
     private external fun nativeCreate(): Long

@@ -2,7 +2,7 @@ package ru.rim.dd.data.dlms
 
 import ru.rim.dd.core.log.APP_LOGGING_ENABLED
 import ru.rim.dd.core.log.AppLog
-import ru.rim.dd.core.bridge.SpodesClientBridge
+import ru.rim.dd.core.bridge.NativeDlmsApi
 import ru.rim.dd.core.dlms.CaptureColumn
 import ru.rim.dd.core.dlms.DlmsValue
 import ru.rim.dd.core.dlms.ObisCatalog
@@ -50,7 +50,7 @@ sealed class MainBufferResult {
  */
 @Singleton
 class DlmsSessionClient @Inject constructor(
-    private val spodes: SpodesClientBridge,
+    private val spodes: NativeDlmsApi,
 ) {
     /**
      * true — AKROS читается запасным путём (SNRM + AARQ «Reader», компактный буфер); false —
@@ -333,13 +333,6 @@ class DlmsSessionClient @Inject constructor(
         }
     }
 
-    /**
-     * Читает единицу и множитель (атрибут scaler_unit) каждой колонки буфера: компактный буфер
-     * содержит только числа, а без множителя показания могли бы отличаться от настоящих в
-     * тысячу раз и выглядеть правдоподобно. Спрашиваем только объекты, у которых этот атрибут
-     * есть (см. [ScalerUnit.attributeFor]); единицы за сеанс не меняются, поэтому читаем один раз.
-     * Ошибка на одной колонке не фатальна — она остаётся без единицы.
-     */
     private fun readScalerUnits(columns: List<CaptureColumn?>) {
         val units = mutableMapOf<String, ScalerUnit>()
         columns.filterNotNull()

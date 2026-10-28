@@ -1,13 +1,13 @@
 package ru.rim.dd.data.transport
 
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import ru.rim.dd.core.ble.MeterBleClient
-import ru.rim.dd.core.bridge.SpodesClientBridge
+import ru.rim.dd.core.ble.MeterTransport
+import ru.rim.dd.core.bridge.NativeDlmsApi
+import ru.rim.dd.core.coroutines.DispatcherProvider
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -18,18 +18,15 @@ import javax.inject.Singleton
  */
 @Singleton
 class TransportPump @Inject constructor(
-    private val ble: MeterBleClient,
-    private val spodes: SpodesClientBridge,
+    private val ble: MeterTransport,
+    private val spodes: NativeDlmsApi,
+    dispatchers: DispatcherProvider,
 ) {
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val scope = CoroutineScope(SupervisorJob() + dispatchers.default)
     private var job: Job? = null
 
     val isActive: Boolean get() = job?.isActive == true
 
-    /**
-     * Запускает насос (предыдущий останавливается). [onIncoming] вызывается для каждого
-     * входящего пакета до передачи в нативный клиент — для журнала сырых байтов.
-     */
     fun start(onIncoming: (ByteArray) -> Unit = {}) {
         stop()
         job = scope.launch {

@@ -2,7 +2,6 @@ package ru.rim.dd.data.session
 
 import ru.rim.dd.core.log.AppLog
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
@@ -11,7 +10,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import ru.rim.dd.core.ble.MeterBleClient
+import ru.rim.dd.core.ble.MeterTransport
+import ru.rim.dd.core.coroutines.DispatcherProvider
 import ru.rim.dd.core.dlms.ObisReading
 import ru.rim.dd.core.model.ConnectionState
 import ru.rim.dd.core.model.MeterDeviceName
@@ -42,11 +42,12 @@ data class ConnectedMeter(
  */
 @Singleton
 class MeterSessionManager @Inject constructor(
-    private val ble: MeterBleClient,
+    private val ble: MeterTransport,
     private val dlms: DlmsSessionClient,
     private val pump: TransportPump,
     private val state: MeterState,
     private val journal: JournalRecorder,
+    private val dispatchers: DispatcherProvider,
 ) {
     /** Номер активного прибора, разобранный из BLE-имени (запасной вариант). */
     var activeSerialNumber: String? = null
@@ -62,7 +63,7 @@ class MeterSessionManager @Inject constructor(
     /** AKROS определяется по BLE-имени один раз при подключении; для РиМ всегда false. */
     private var isAkros = false
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val scope = CoroutineScope(SupervisorJob() + dispatchers.default)
     private var autoRefreshJob: Job? = null
 
     /**
@@ -107,7 +108,7 @@ class MeterSessionManager @Inject constructor(
     val isActive: Boolean get() = pump.isActive
 
     init {
-        // GATT переподключает MeterBleClient (свой цикл); здесь только протокольная часть:
+        // GATT переподключает транспорт (MeterBleClient, свой цикл); здесь только протокольная часть:
         // при обрыве останавливаем обмен, при восстановлении пересобираем DLMS-сеанс.
         scope.launch {
             ble.unexpectedDisconnects.collect {
@@ -151,7 +152,7 @@ class MeterSessionManager @Inject constructor(
     suspend fun connectByAddress(address: String, deviceName: String?): ConnectedMeter {
         // Всё, что осталось от прошлого прибора (номер, показания, инфо), к новому не относится.
         resetSessionData()
-        withContext(Dispatchers.IO) { ble.connectByAddress(address, deviceName) }
+        withContext(dispatchers.io) { ble.connectByAddress(address, deviceName) }
         openProtocolSession(deviceName)
 
         // Сбрасываем до разбора имени: иначе при неудачном разборе остался бы номер прошлого прибора.
@@ -173,7 +174,7 @@ class MeterSessionManager @Inject constructor(
      */
     suspend fun connectBySerialNumber(serialNumber: String): ConnectedMeter {
         resetSessionData()
-        val found = withContext(Dispatchers.IO) { ble.connectBySerialNumber(serialNumber) }
+        val found = withContext(dispatchers.io) { ble.connectBySerialNumber(serialNumber) }
         openProtocolSession(found.name)
 
         val reported = meterReportedSerial
@@ -231,9 +232,9 @@ class MeterSessionManager @Inject constructor(
      */
     suspend fun disconnect() {
         stopTransportPump()
-        protocolMutex.withLock { withContext(Dispatchers.IO) { dlms.destroyClient() } }
+        protocolMutex.withLock { withContext(dispatchers.io) { dlms.destroyClient() } }
         ble.disconnect()
-        withContext(NonCancellable + Dispatchers.IO) { journal.end() }
+        withContext(NonCancellable + dispatchers.io) { journal.end() }
         // Данные отключённого прибора не должны достаться следующему.
         resetSessionData()
         protocolSessionEstablished = false
@@ -252,7 +253,7 @@ class MeterSessionManager @Inject constructor(
         dlms.akrosAssociation = false
         AppLog.i(TAG, "Обмен с \"$deviceName\": ${if (isAkros) "AKROS" else "РиМ"}")
         // Карточка журнала и лог байтов заводятся до первого обмена; при неудаче удаляются.
-        withContext(Dispatchers.IO) { journal.begin() }
+        withContext(dispatchers.io) { journal.begin() }
         try {
             dlms.createClient()
             startTransportPump()
@@ -262,7 +263,7 @@ class MeterSessionManager @Inject constructor(
                 throw IllegalStateException(lastProtocolError ?: "неизвестная ошибка")
             }
         } catch (ex: Exception) {
-            withContext(NonCancellable + Dispatchers.IO) { journal.discard() }
+            withContext(NonCancellable + dispatchers.io) { journal.discard() }
             throw ex
         }
     }
@@ -289,7 +290,7 @@ class MeterSessionManager @Inject constructor(
         stopTransportPump()
         delay(AKROS_FALLBACK_SETTLE_DELAY_MS)
         protocolMutex.withLock {
-            withContext(Dispatchers.IO) { dlms.recreateClient() }
+            withContext(dispatchers.io) { dlms.recreateClient() }
         }
         startTransportPump()
         establishAkrosSession()
@@ -302,7 +303,7 @@ class MeterSessionManager @Inject constructor(
 
     /** Ассоциация AKROS; при отказе закрывает транспорт и бросает исключение (см. [abortSession]). */
     private suspend fun establishAkrosSession() {
-        withContext(Dispatchers.IO) { dlms.establishAkrosSession()?.let { abortSession(it) } }
+        withContext(dispatchers.io) { dlms.establishAkrosSession()?.let { abortSession(it) } }
     }
 
     /** Закрывает транспорт и бросает исключение — для сбоев при установлении сеанса. */
@@ -314,7 +315,7 @@ class MeterSessionManager @Inject constructor(
     }
 
     private suspend fun readMainBuffer(): Boolean =
-        protocolMutex.withLock { withContext(Dispatchers.IO) { readAndApplyMainBuffer() } }
+        protocolMutex.withLock { withContext(dispatchers.io) { readAndApplyMainBuffer() } }
 
     /**
      * Модель и серийный номер по DLMS без ассоциации не прочитать, но BLE-имя РиМ их содержит
@@ -473,7 +474,7 @@ class MeterSessionManager @Inject constructor(
         scope.launch {
             try {
                 delay(RECONNECT_SETTLE_DELAY_MS)
-                protocolMutex.withLock { withContext(Dispatchers.IO) { dlms.recreateClient() } }
+                protocolMutex.withLock { withContext(dispatchers.io) { dlms.recreateClient() } }
                 startTransportPump()
                 val connected = establishSessionAndReadFirst()
                 startAutoRefresh()

@@ -23,8 +23,16 @@ object RealMeterBuffer {
         return bytes.subList(7, bytes.size - 2)
     }
 
-    fun readings(): List<ObisReading> {
-        val raw = frames.flatMap { infoField(it) }.toByteArray()
-        return readingsOf(parseGetResponseValue(raw))
+    /** Полный ответ нативного клиента на GET буфера: информационные поля трёх кадров, склеенные подряд. */
+    fun rawResponse(): ByteArray = frames.flatMap { infoField(it) }.toByteArray()
+
+    fun readings(): List<ObisReading> = readingsOf(parseGetResponseValue(rawResponse()))
+
+    /**
+     * Сравнимое представление элементов буфера: у ObisReading поле с байтами (ByteArray), и обычное
+     * равенство data class сравнивало бы массивы по ссылке.
+     */
+    fun describe(readings: List<ObisReading>): List<String> = readings.map {
+        "${it.obisCode}|${it.rawValue}|${it.scaler}|${it.unit}|${it.octetValue?.toList()}|${it.textValue}|${it.floatValue}"
     }
 }

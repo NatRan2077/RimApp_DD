@@ -1,9 +1,9 @@
 package ru.rim.dd.data.repository
 
 import ru.rim.dd.core.log.AppLog
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.withContext
+import ru.rim.dd.core.coroutines.DispatcherProvider
 import ru.rim.dd.core.model.RelaySource
 import ru.rim.dd.core.model.RelayState
 import ru.rim.dd.data.dlms.DlmsSessionClient
@@ -17,6 +17,7 @@ class RelayRepositoryImpl @Inject constructor(
     private val session: MeterSessionManager,
     private val dlms: DlmsSessionClient,
     private val state: MeterState,
+    private val dispatchers: DispatcherProvider,
 ) : RelayRepository {
 
     override fun relayState(): Flow<RelayState> = state.relay
@@ -50,7 +51,7 @@ class RelayRepositoryImpl @Inject constructor(
             return
         }
         session.exclusive {
-            val done = withContext(Dispatchers.IO) { dlms.disconnectControlAction(methodId, label) }
+            val done = withContext(dispatchers.io) { dlms.disconnectControlAction(methodId, label) }
             if (done) state.updateRelay { it.copy(isOn = methodId == 2, source = RelaySource.REMOTE_CONTROL) }
         }
     }

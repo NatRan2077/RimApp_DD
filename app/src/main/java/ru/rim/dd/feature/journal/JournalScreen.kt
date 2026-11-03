@@ -44,6 +44,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
 import androidx.hilt.navigation.compose.hiltViewModel
 import kotlinx.coroutines.launch
+import ru.rim.dd.data.local.JOURNAL_RAW_LOG_ENABLED
 import ru.rim.dd.data.local.JournalEntry
 import ru.rim.dd.ui.components.DataCard
 import ru.rim.dd.ui.components.Divider
@@ -187,6 +188,7 @@ fun JournalScreen(
                             }
                         },
                         onSendThis = { scope.launch { share(viewModel.exportText(setOf(entry.id))) } },
+                        onSendRaw = { scope.launch { share(viewModel.exportRaw(entry.id)) } },
                     )
                 }
             }
@@ -247,6 +249,7 @@ private fun JournalCard(
     checked: Boolean,
     onClick: () -> Unit,
     onSendThis: () -> Unit,
+    onSendRaw: () -> Unit,
 ) {
     val p = RimTheme.palette
     val active = entry.isActive
@@ -303,6 +306,16 @@ private fun JournalCard(
 
                 Row(Modifier.fillMaxWidth().padding(top = 14.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     ActionButton("Отправить .txt", p.accentText, Modifier.weight(1f), onClick = onSendThis)
+                    // Лог байтов включается флагом JOURNAL_RAW_LOG_ENABLED (data/local/JournalStore.kt).
+                    if (JOURNAL_RAW_LOG_ENABLED) {
+                        ActionButton("Лог байтов", p.textSecondary, Modifier.weight(1f), enabled = entry.byteCount > 0, onClick = onSendRaw)
+                    }
+                }
+                if (JOURNAL_RAW_LOG_ENABLED) {
+                    Text(
+                        "Принято ${entry.byteCount} байт",
+                        color = p.textFaint, fontSize = 13.sp, modifier = Modifier.padding(top = 6.dp),
+                    )
                 }
             }
         }

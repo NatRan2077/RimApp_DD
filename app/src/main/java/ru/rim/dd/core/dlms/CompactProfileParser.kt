@@ -39,11 +39,7 @@ data class ScalerUnit(
     }
 }
 
-/**
- * Описания колонок из ответа на чтение capture_objects, в том же порядке, в каком значения придут
- * в буфере. Элемент, который не удалось разобрать, даёт null НА СВОЁМ МЕСТЕ — иначе остальные
- * колонки сдвинулись бы и значения разъехались по чужим OBIS-кодам.
- */
+
 fun captureColumnsOf(value: DlmsValue): List<CaptureColumn?> {
     val rows = when (value) {
         is DlmsValue.Arr -> value.items

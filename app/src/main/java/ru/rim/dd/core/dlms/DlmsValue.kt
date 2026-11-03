@@ -73,6 +73,8 @@ class DlmsDecoder(private val data: ByteArray) {
 
     private fun readSigned(pos: Int, size: Int): Long {
         val unsigned = readUnsigned(pos, size)
+        // 8 байт целиком занимают Long: он уже в дополнительном коде, а сдвиг 1L shl 64 равен 1L shl 0.
+        if (size >= 8) return unsigned
         val signBit = 1L shl (size * 8 - 1)
         return if (unsigned and signBit != 0L) unsigned - (1L shl (size * 8)) else unsigned
     }

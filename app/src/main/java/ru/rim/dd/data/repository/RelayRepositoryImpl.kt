@@ -52,7 +52,15 @@ class RelayRepositoryImpl @Inject constructor(
         }
         session.exclusive {
             val done = withContext(dispatchers.io) { dlms.disconnectControlAction(methodId, label) }
-            if (done) state.updateRelay { it.copy(isOn = methodId == 2, source = RelaySource.REMOTE_CONTROL) }
+            if (done) {
+                state.updateRelay {
+                    it.copy(
+                        isOn = methodId == 2,
+                        remoteTurnOnAllowed = if (methodId == 2) false else it.remoteTurnOnAllowed,
+                        source = RelaySource.REMOTE_CONTROL,
+                    )
+                }
+            }
         }
     }
 

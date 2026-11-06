@@ -496,7 +496,7 @@ class MeterSessionManager @Inject constructor(
     private companion object {
         const val TAG = "MeterSession"
 
-        const val AUTO_REFRESH_INTERVAL_MS = 5_000L
+        const val AUTO_REFRESH_INTERVAL_MS = 800L
 
         /** Три цикла × 5 с = 15 с: не реагируем на единичный сбой, но и не держим мёртвое «Подключено». */
         const val MAX_CONSECUTIVE_PROTOCOL_FAILURES = 3

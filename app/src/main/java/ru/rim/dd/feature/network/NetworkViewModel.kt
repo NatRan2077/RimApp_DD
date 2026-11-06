@@ -3,6 +3,7 @@ package ru.rim.dd.feature.network
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -40,6 +41,12 @@ class NetworkViewModel @Inject constructor(
     private val _turnOnCountdown = MutableStateFlow<Int?>(null)
     val turnOnCountdown: StateFlow<Int?> = _turnOnCountdown
 
+    /** Выполняется ли сейчас отправка команды включения на прибор. */
+    private val _isSendingCommand = MutableStateFlow(false)
+    val isSendingCommand: StateFlow<Boolean> = _isSendingCommand
+
+    private var turnOnJob: Job? = null
+
     /** Кнопка «Обновить» — переспрашивает тот же буфер счётчика, что обновляет и «Показания». */
     fun refresh() {
         viewModelScope.launch { meterData.refreshReadings() }
@@ -50,13 +57,28 @@ class NetworkViewModel @Inject constructor(
     }
 
     fun turnRelayOn() {
-        viewModelScope.launch {
-            for (secondsLeft in 60 downTo 1) {
-                _turnOnCountdown.value = secondsLeft
-                delay(1_000)
+        turnOnJob?.cancel()
+        turnOnJob = viewModelScope.launch {
+            try {
+                for (secondsLeft in 60 downTo 1) {
+                    _turnOnCountdown.value = secondsLeft
+                    delay(1_000)
+                }
+                _turnOnCountdown.value = null
+                _isSendingCommand.value = true
+                relay.turnRelayOn()
+            } finally {
+                _isSendingCommand.value = false
+                if (coroutineContext[Job]?.isCancelled == true) {
+                    _turnOnCountdown.value = null
+                }
             }
-            _turnOnCountdown.value = null
-            relay.turnRelayOn()
         }
+    }
+
+    fun cancelTurnOn() {
+        turnOnJob?.cancel()
+        turnOnJob = null
+        _turnOnCountdown.value = null
     }
 }

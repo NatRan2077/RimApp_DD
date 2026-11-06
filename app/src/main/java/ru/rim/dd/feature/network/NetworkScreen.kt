@@ -11,7 +11,9 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -39,17 +41,41 @@ import ru.rim.dd.ui.components.ScreenHeader
 import ru.rim.dd.ui.components.SectionLabel
 import ru.rim.dd.ui.components.StatusChip
 import ru.rim.dd.ui.components.formatNumber
+import androidx.compose.foundation.clickable
 import ru.rim.dd.ui.theme.RimError
 import ru.rim.dd.ui.theme.RimFonts
 import ru.rim.dd.ui.theme.RimSuccess
 import ru.rim.dd.ui.theme.RimTheme
+import ru.rim.dd.ui.theme.RimWarn
 
 @Composable
 fun NetworkScreen(showObis: Boolean, viewModel: NetworkViewModel = hiltViewModel()) {
     val params by viewModel.networkParams.collectAsState()
     val relay by viewModel.relayState.collectAsState()
+    val countdown by viewModel.turnOnCountdown.collectAsState()
+    val isSending by viewModel.isSendingCommand.collectAsState()
     val p = RimTheme.palette
     var refreshing by remember { mutableStateOf(false) }
+    var showTurnOnConfirmDialog by remember { mutableStateOf(false) }
+
+    if (showTurnOnConfirmDialog) {
+        AlertDialog(
+            onDismissRequest = { showTurnOnConfirmDialog = false },
+            containerColor = p.cardSurface,
+            shape = RimShapes.card,
+            title = { Text("Включение реле", color = p.textPrimary, fontFamily = RimFonts.Raleway, fontWeight = FontWeight.Bold) },
+            text = { Text("Вы уверены, что хотите включить реле?", color = p.textSecondary, fontSize = 16.sp) },
+            confirmButton = {
+                TextButton(onClick = {
+                    showTurnOnConfirmDialog = false
+                    viewModel.turnRelayOn()
+                }) { Text("Да", color = p.accentText, fontWeight = FontWeight.SemiBold) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showTurnOnConfirmDialog = false }) { Text("Нет", color = p.textSecondary) }
+            },
+        )
+    }
 
     Column(
         modifier = Modifier
@@ -119,7 +145,59 @@ fun NetworkScreen(showObis: Boolean, viewModel: NetworkViewModel = hiltViewModel
                 when {
                     relay.source == RelaySource.UNKNOWN -> StatusChip("НЕИЗВЕСТНО", p.textSecondary)
                     relay.isOn -> StatusChip("ВКЛЮЧЕНО", RimSuccess)
+                    relay.remoteTurnOnAllowed -> StatusChip("ГОТОВ К ВКЛЮЧЕНИЮ", RimWarn)
                     else -> StatusChip("ОТКЛЮЧЕНО", RimError)
+                }
+            }
+            RowDivider()
+            val isReady = !relay.isOn && relay.remoteTurnOnAllowed
+            val isCountingDown = countdown != null
+            val buttonEnabled = isReady && !isCountingDown && !isSending
+
+            val buttonText = when {
+                isCountingDown -> "Включение ($countdown с)"
+                isSending -> "Включение..."
+                else -> "Включить реле"
+            }
+
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RimShapes.card)
+                    .background(
+                        if (buttonEnabled) p.accent
+                        else if (p.dark) Color.White.copy(alpha = 0.08f)
+                        else Color.Black.copy(alpha = 0.07f)
+                    )
+                    .clickable(enabled = buttonEnabled) { showTurnOnConfirmDialog = true }
+                    .padding(vertical = 14.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = buttonText,
+                    color = if (buttonEnabled) Color.White else p.textFaint,
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+
+            if (isCountingDown) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 8.dp)
+                        .clip(RimShapes.card)
+                        .border(1.dp, RimError, RimShapes.card)
+                        .clickable { viewModel.cancelTurnOn() }
+                        .padding(vertical = 12.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        text = "Отменить",
+                        color = RimError,
+                        fontSize = 15.sp,
+                        fontWeight = FontWeight.SemiBold,
+                    )
                 }
             }
         }

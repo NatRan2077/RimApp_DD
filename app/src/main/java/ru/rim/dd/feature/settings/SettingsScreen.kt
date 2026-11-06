@@ -114,7 +114,7 @@ fun SettingsScreen(
         }
 
         Text(
-            "Дистанционный дисплей РиМ · v0.0.1 · 2026",
+            "Дистанционный дисплей РиМ · RU.ВНКЛ.00010-01",
             color = p.textFaint, fontSize = 14.sp,
             modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
             textAlign = androidx.compose.ui.text.style.TextAlign.Center,

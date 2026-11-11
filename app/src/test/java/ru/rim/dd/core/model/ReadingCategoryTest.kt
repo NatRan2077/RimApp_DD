@@ -4,7 +4,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Test
 import java.time.Instant
 
-/** Категория показания по группе C его OBIS-кода: от неё зависят заголовок, единица и порядок строк. */
+/** Категория показания по группе C его OBIS-кода: от неё зависят заголовок, единица и порядок строк . */
 class ReadingCategoryTest {
 
     private fun category(obis: String) = Reading(obisId = obis, valueKwh = 0.0, timestamp = Instant.EPOCH).category

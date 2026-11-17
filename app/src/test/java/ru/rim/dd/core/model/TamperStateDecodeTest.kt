@@ -108,4 +108,144 @@ class TamperStateDecodeTest {
         assertFalse(TamperState.UNKNOWN.anyActive)
         assertFalse(decode(0x00400000).unknown)
     }
+
+    //на мусор
+
+    @Test
+    fun lcdVersion0_bothMagnetBitsSet_isActive() {
+        val s = decode(0x00010100) // бит в байте 1 и бит в байте 2
+        assertEquals(0, s.lcdVersion)
+        assertEquals(TamperCondition.ACTIVE, s.magnet)
+    }
+
+    @Test
+    fun validDecodeResult_isNotUnknow() {
+        assertFalse(decode(0x00000000).unknown) // версия 0
+        assertFalse(decode(0x00400000).unknown) // версия 1
+    }
+
+    @Test
+    fun selfDiagnosticsFault_doesNotRaiseAnyActive() {
+        val s = decode(0x00600000) // selfDiagnosticsFault = ACTIVE
+        assertEquals(TamperCondition.ACTIVE, s.selfDiagnosticsFault)
+        assertFalse("ошибка самодиагностики не входит в anyActive", s.anyActive)
+    }
+// ACTIVE and FLAG для кажого датчика
+@Test
+fun activeWinsOverFlag_forAllSensors() {
+    assertEquals(
+        TamperCondition.ACTIVE,
+        decode(0x00410100).cover
+    )
+
+    assertEquals(
+        TamperCondition.ACTIVE,
+        decode(0x00420200).meter
+    )
+
+    assertEquals(
+        TamperCondition.ACTIVE,
+        decode(0x00440400).magnet
+    )
+
+    assertEquals(
+        TamperCondition.ACTIVE,
+        decode(0x00480800).battery
+    )
+
+    assertEquals(
+        TamperCondition.ACTIVE,
+        decode(0x00501000).rf
+    )
+
+    assertEquals(
+        TamperCondition.ACTIVE,
+        decode(0x00602000).selfDiagnosticsFault
+    )
+}
+
+    //Flag не подднимает anyActive на всех датчиках
+    @Test
+    fun flagOnlyConditions_doNotRaiseAnyActive() {
+        assertFalse(decode(0x00400100).anyActive) // cover
+        assertFalse(decode(0x00400200).anyActive) // meter
+        assertFalse(decode(0x00400400).anyActive) // magnet
+        assertFalse(decode(0x00400800).anyActive) // battery
+        assertFalse(decode(0x00401000).anyActive) // rf
+        assertFalse(decode(0x00402000).anyActive) // self diagnostics
+    }
+
+    //anyActive
+    @Test
+    fun activeConditions_raiseAnyActive() {
+        assertTrue(decode(0x00410000).anyActive) // cover
+        assertTrue(decode(0x00420000).anyActive) // meter
+        assertTrue(decode(0x00440000).anyActive) // magnet
+        assertTrue(decode(0x00480000).anyActive) // battery
+        assertTrue(decode(0x00500000).anyActive) // rf
+    }
+    //версия ЖКИ 0 не поддерживает остальные датчики
+    @Test
+    fun lcdVersion0_doesNotReportUnavailableSensors() {
+        val s = decode(0x00010000)
+
+        assertEquals(0, s.lcdVersion)
+        assertEquals(TamperCondition.ACTIVE, s.magnet)
+
+        assertEquals(TamperCondition.OK, s.cover)
+        assertEquals(TamperCondition.OK, s.meter)
+        assertEquals(TamperCondition.OK, s.battery)
+        assertEquals(TamperCondition.OK, s.rf)
+        assertEquals(TamperCondition.OK, s.selfDiagnosticsFault)
+    }
+    //Проверить, что ПКЭ и небаланс тоже соблюдают приоритет ACTIVE над FLAG
+    @Test
+    fun activeWinsOverFlag_forPowerQualityAndUnbalance() {
+        val s = decode(0x33400000)
+
+        assertEquals(TamperCondition.ACTIVE, s.eqi)
+        assertEquals(TamperCondition.ACTIVE, s.unbalance)
+    }
+
+    //Проверить лимит мощности в обоих состояниях
+    @Test
+    fun powerLimitExceeded_doesNotActivateTamperSensors() {
+        val s = decode(0x00408000)
+
+        assertTrue(s.powerLimitExceeded)
+
+        assertEquals(TamperCondition.OK, s.cover)
+        assertEquals(TamperCondition.OK, s.meter)
+        assertEquals(TamperCondition.OK, s.magnet)
+        assertEquals(TamperCondition.OK, s.battery)
+        assertEquals(TamperCondition.OK, s.rf)
+    }
+    @Test
+    fun byte3_isIgnored() {
+        val s = decode(0x004000FF)
+
+        assertEquals(TamperCondition.OK, s.cover)
+        assertEquals(TamperCondition.OK, s.meter)
+        assertEquals(TamperCondition.OK, s.magnet)
+        assertEquals(TamperCondition.OK, s.battery)
+        assertEquals(TamperCondition.OK, s.rf)
+        assertEquals(TamperCondition.OK, s.eqi)
+        assertEquals(TamperCondition.OK, s.unbalance)
+        assertFalse(s.powerLimitExceeded)
+        assertFalse(s.unknown)
+    }
+    @Test
+    fun flagOnlySensors_doNotRaiseAnyActive() {
+        val s = decode(0x00403F00)
+
+        assertEquals(TamperCondition.FLAG, s.cover)
+        assertEquals(TamperCondition.FLAG, s.meter)
+        assertEquals(TamperCondition.FLAG, s.magnet)
+        assertEquals(TamperCondition.FLAG, s.battery)
+        assertEquals(TamperCondition.FLAG, s.rf)
+
+        assertFalse(s.anyActive)
+    }
+
+
 }

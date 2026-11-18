@@ -36,7 +36,7 @@ class GetResponseParserTest {
         return readingsOf(root)
     }
 
-    // ---------- GET-response ----------
+    // GET-response
 
     @Test
     fun getResponse_returnsValue() {
@@ -65,7 +65,7 @@ class GetResponseParserTest {
         assertDecodeFails(ByteArray(0))
     }
 
-    // ---------- блоки ----------
+    //  блоки
 
     @Test
     fun block_parsedFromWireFormat() {
@@ -87,7 +87,7 @@ class GetResponseParserTest {
 
     @Test
     fun block_notABlockResponse_returnsNull() {
-        // обычный GET-response (choice = 1) — не блочный
+        // обычный GET-response (choice = 1) - не блочный
         assertNull(parseGetResponseBlock(DlmsFixtures.getResponse(DlmsFixtures.u16(5))))
         assertNull(parseGetResponseBlock(bytes(1, 2, 3)))
     }
@@ -107,7 +107,7 @@ class GetResponseParserTest {
         assertArrayEquals(bytes(0x11, 0x07), parseGetResponseBlock(frame)!!.data)
     }
 
-    // ---------- ACTION-response ----------
+    //  ACTION-response
 
     @Test
     fun actionResponse_successIsZero_errorsKeepTheirCode() {
@@ -123,7 +123,7 @@ class GetResponseParserTest {
         assertNull(parseActionResponseResult(ByteArray(0)))
     }
 
-    // ---------- единицы ----------
+    // единицы
 
     @Test
     fun unitLabels() {
@@ -147,7 +147,7 @@ class GetResponseParserTest {
         assertNull(kiloUnitLabelOf(null))
     }
 
-    // ---------- статус часов ----------
+    // статус часов
 
     @Test
     fun clockStatus_invalidWhenBit0_1_or3IsSet() {
@@ -159,7 +159,7 @@ class GetResponseParserTest {
         assertTrue(isClockStatusValid(0x80))
     }
 
-    // ---------- дата и время COSEM ----------
+    //дата и время COSEM
 
     @Test
     fun cosemDate_knownBytes_andNotSpecified() {
@@ -177,7 +177,7 @@ class GetResponseParserTest {
         assertNull(decodeCosemTime(bytes(12, 30)))
     }
 
-    // ---------- раскладка буфера в показания ----------
+    // раскладка буфера в показания
 
     private fun triple(obis: String, value: ByteArray, scaler: Int, unit: Int) =
         DlmsFixtures.struct(DlmsFixtures.obisValue(obis), value, DlmsFixtures.scalerUnit(scaler, unit))
@@ -253,15 +253,15 @@ class GetResponseParserTest {
         check("0.0.96.50.170.255", 826871552, 0, null)   // «Значки ДД»
     }
 
-    // ==================== ДОПОЛНЕНИЯ ====================
+    //  ДОПОЛНЕНИЯ
 
-    // ---------- П.1: байт длины 0x80 — БАГ ----------
+    // байт длины 0x80
 
     @Test
     fun block_lengthByte0x80_returnsNull() {
-        // В A-XDR 0x80 — маркер длинной формы, а не «длина 0». Сейчас код трактует
+        // В A-XDR 0x80 - маркер длинной формы, а не «длина 0». Сейчас код трактует
         // его как длину 0 (условие > 0x80 ложно). По решению разработчика это БАГ:
-        // некорректный блок → null.
+        // некорректный блок - null.
         val frame = bytes(0xE6, 0xE7, 0x00, 0xC4, 0x02, 0x00, 0, 0, 0, 1, 0x00, 0x00, 0x80) +
                 bytes(0x11, 0x22, 0x00, 0x00, 0x7E)
         assertNull(parseGetResponseBlock(frame))
@@ -269,28 +269,28 @@ class GetResponseParserTest {
 
     @Test
     fun getResponse_octetString_length0x80_throws() {
-        // В декодере 0x80 в поле длины — DlmsDecodeException (не «длина 0»).
+        // В декодере 0x80 в поле длины - DlmsDecodeException (не «длина 0»).
         assertDecodeFails(bytes(0xE6, 0xE7, 0x00, 0xC4, 0x01, 0xC1, 0x00, 0x09, 0x80))
     }
 
-    // ---------- П.2: обрыв внутри массива — ЗАДУМКА (толерантность) ----------
+    //  обрыв внутри массива  ЗАДУМКА
 
     @Test
     fun getResponse_arrayBrokenElement_partialResult() {
         // Задумка: толерантность к обрезанным кадрам приборов. 3 элемента: U8(1), U8(2),
-        // затем неизвестный тег 0x42 — возвращаются первые 2 без исключения.
+        // затем неизвестный тег 0x42 - возвращаются первые 2 без исключения.
         val v = parseGetResponseValue(bytes(0xE6, 0xE7, 0x00, 0xC4, 0x01, 0xC1, 0x00, 0x01, 0x03, 0x11, 0x01, 0x11, 0x02, 0x42))
         assertEquals(2, (v as DlmsValue.Arr).items.size)
     }
 
     @Test
     fun getResponse_arrayCountBiggerThanActual_partialResult() {
-        // Задумка: заявлено 3, реально 2 — вернутся 2 (сколько есть).
+        // Задумка: заявлено 3, реально 2 - вернутся 2 (сколько есть).
         val v = parseGetResponseValue(bytes(0xE6, 0xE7, 0x00, 0xC4, 0x01, 0xC1, 0x00, 0x01, 0x03, 0x11, 0x01, 0x11, 0x02))
         assertEquals(2, (v as DlmsValue.Arr).items.size)
     }
 
-    // ---------- П.7: RealMeterBuffer — полный список OBIS и текстовые поля ----------
+    //  RealMeterBuffer - полный список OBIS и текстовые поля
 
     @Test
     fun realMeter_fullObisList() {
@@ -317,15 +317,13 @@ class GetResponseParserTest {
     @Test
     fun realMeter_textAndOctetFields() {
         val all = RealMeterBuffer.readings().associateBy { it.obisCode }
-        // Версия ПО — текстовое поле (OctetString с печатным ASCII → textValue)
         assertEquals("1.58", all.getValue("0.0.96.1.2.255").textValue)
-        // Дата/время прибора — octetValue, не текст
         val clock = all.getValue("0.0.1.0.0.255")
         assertNotNull(clock.octetValue)
         assertNull(clock.textValue)
     }
 
-    // ---------- П.8: ACTION-response — граница длины
+    //  ACTION-response - граница длины
 
     @Test
     fun actionResponse_serviceId0xC7_butTooShortForResult_returnsNull() {

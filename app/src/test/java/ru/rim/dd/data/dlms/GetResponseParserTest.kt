@@ -3,6 +3,7 @@ package ru.rim.dd.core.dlms
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -30,6 +31,11 @@ class GetResponseParserTest {
         }
     }
 
+    private fun readingsFrom(vararg entries: ByteArray): List<ObisReading> {
+        val root = decodeDlmsValue(DlmsFixtures.struct(*entries))
+        return readingsOf(root)
+    }
+
     // ---------- GET-response ----------
 
     @Test
@@ -42,7 +48,7 @@ class GetResponseParserTest {
     fun getResponse_llcHeaderIsFoundByContent_notByOffset() {
         // Перед LLC — заголовок HDLC произвольной длины.
         val frame = bytes(0x7E, 0xA0, 0x0B, 0x03, 0x43, 0x03, 0xF4, 0x4F, 0xD9) +
-            bytes(0xE6, 0xE7, 0x00, 0xC4, 0x01, 0xAC, 0x00, 0x12, 0x01, 0x00)
+                bytes(0xE6, 0xE7, 0x00, 0xC4, 0x01, 0xAC, 0x00, 0x12, 0x01, 0x00)
         assertEquals(DlmsValue.U16(256), parseGetResponseValue(frame))
     }
 
@@ -173,8 +179,6 @@ class GetResponseParserTest {
 
     // ---------- раскладка буфера в показания ----------
 
-    private fun readingsFrom(vararg items: ByteArray) = readingsOf(decodeDlmsValue(DlmsFixtures.array(items.toList())))
-
     private fun triple(obis: String, value: ByteArray, scaler: Int, unit: Int) =
         DlmsFixtures.struct(DlmsFixtures.obisValue(obis), value, DlmsFixtures.scalerUnit(scaler, unit))
 
@@ -247,5 +251,244 @@ class GetResponseParserTest {
         check("0.0.96.6.3.255", 3637, -3, 35)    // батарейка 3,637 В
         check("0.0.96.3.10.255", 2, 0, null)     // control_state реле (позиционное поле)
         check("0.0.96.50.170.255", 826871552, 0, null)   // «Значки ДД»
+    }
+
+    // ==================== ДОПОЛНЕНИЯ ====================
+
+    // ---------- П.1: байт длины 0x80 — БАГ ----------
+
+    @Test
+    fun block_lengthByte0x80_returnsNull() {
+        // В A-XDR 0x80 — маркер длинной формы, а не «длина 0». Сейчас код трактует
+        // его как длину 0 (условие > 0x80 ложно). По решению разработчика это БАГ:
+        // некорректный блок → null.
+        val frame = bytes(0xE6, 0xE7, 0x00, 0xC4, 0x02, 0x00, 0, 0, 0, 1, 0x00, 0x00, 0x80) +
+                bytes(0x11, 0x22, 0x00, 0x00, 0x7E)
+        assertNull(parseGetResponseBlock(frame))
+    }
+
+    @Test
+    fun getResponse_octetString_length0x80_throws() {
+        // В декодере 0x80 в поле длины — DlmsDecodeException (не «длина 0»).
+        assertDecodeFails(bytes(0xE6, 0xE7, 0x00, 0xC4, 0x01, 0xC1, 0x00, 0x09, 0x80))
+    }
+
+    // ---------- П.2: обрыв внутри массива — ЗАДУМКА (толерантность) ----------
+
+    @Test
+    fun getResponse_arrayBrokenElement_partialResult() {
+        // Задумка: толерантность к обрезанным кадрам приборов. 3 элемента: U8(1), U8(2),
+        // затем неизвестный тег 0x42 — возвращаются первые 2 без исключения.
+        val v = parseGetResponseValue(bytes(0xE6, 0xE7, 0x00, 0xC4, 0x01, 0xC1, 0x00, 0x01, 0x03, 0x11, 0x01, 0x11, 0x02, 0x42))
+        assertEquals(2, (v as DlmsValue.Arr).items.size)
+    }
+
+    @Test
+    fun getResponse_arrayCountBiggerThanActual_partialResult() {
+        // Задумка: заявлено 3, реально 2 — вернутся 2 (сколько есть).
+        val v = parseGetResponseValue(bytes(0xE6, 0xE7, 0x00, 0xC4, 0x01, 0xC1, 0x00, 0x01, 0x03, 0x11, 0x01, 0x11, 0x02))
+        assertEquals(2, (v as DlmsValue.Arr).items.size)
+    }
+
+    // ---------- П.7: RealMeterBuffer — полный список OBIS и текстовые поля ----------
+
+    @Test
+    fun realMeter_fullObisList() {
+        // Эталон полного списка 22 OBIS. Тест должен падать при изменении раскладки.
+        val expected = setOf(
+            "0.0.1.0.0.255",        // статус часов
+            "0.0.96.3.10.255",      // control_state реле
+            "1.0.96.50.0.255",      // статус фаз ДД
+            "0.0.96.14.0.255",      // текущий тариф
+            "0.0.96.50.170.255",    // «Значки ДД»
+            "1.0.1.8.0.255", "1.0.1.8.1.255", "1.0.1.8.2.255", "1.0.1.8.3.255", "1.0.1.8.4.255",
+            "1.0.2.8.0.255", "1.0.2.8.1.255", "1.0.2.8.2.255", "1.0.2.8.3.255", "1.0.2.8.4.255",
+            "1.0.4.8.0.255",
+            "0.0.96.9.0.255",       // температура
+            "0.0.96.6.3.255",       // батарейка
+            "0.0.96.1.0.255",       // серийный номер
+            "0.0.96.1.2.255",       // версия ПО
+            "1.0.32.7.0.255",       // напряжение
+            "1.0.52.7.0.255"        // ток
+        )
+        assertEquals(expected, RealMeterBuffer.readings().map { it.obisCode }.toSet())
+    }
+
+    @Test
+    fun realMeter_textAndOctetFields() {
+        val all = RealMeterBuffer.readings().associateBy { it.obisCode }
+        // Версия ПО — текстовое поле (OctetString с печатным ASCII → textValue)
+        assertEquals("1.58", all.getValue("0.0.96.1.2.255").textValue)
+        // Дата/время прибора — octetValue, не текст
+        val clock = all.getValue("0.0.1.0.0.255")
+        assertNotNull(clock.octetValue)
+        assertNull(clock.textValue)
+    }
+
+    // ---------- П.8: ACTION-response — граница длины
+
+    @Test
+    fun actionResponse_serviceId0xC7_butTooShortForResult_returnsNull() {
+        // service-id = 0xC7, но кадр обрывается до Action-Result (pos + 4 > size)
+        assertNull(parseActionResponseResult(bytes(0xE6, 0xE7, 0x00, 0xC7, 0x01, 0x00)))
+    }
+
+    //Scaler и unit: неправильная структура не должна давать Wh
+
+    @Test
+    fun readings_invalidScalerUnit_doesNotAssumeWh() {
+        val entry = DlmsFixtures.struct(
+            DlmsFixtures.obisValue("1.0.1.8.0.255"),
+            DlmsFixtures.i8(5),
+            DlmsFixtures.u16(30) // вместо Structure(2)
+        )
+
+        val reading = readingsFrom(entry).single()
+
+        assertEquals(5L, reading.rawValue)
+        assertEquals(0, reading.scaler)
+        assertNull(reading.unit)
+    }
+
+    @Test
+    fun readings_scalerUnitWithWrongScalerType_hasNoUnit() {
+        val entry = DlmsFixtures.struct(
+            DlmsFixtures.obisValue("1.0.1.8.0.255"),
+            DlmsFixtures.i8(5),
+            DlmsFixtures.struct(
+                DlmsFixtures.enumVal(1),
+                DlmsFixtures.enumVal(30)
+            )
+        )
+
+        val reading = readingsFrom(entry).single()
+
+        assertEquals(5L, reading.rawValue)
+        assertEquals(0, reading.scaler)
+        assertNull(reading.unit)
+    }
+
+    @Test
+    fun readings_scalerUnitWithWrongUnitType_hasNoUnit() {
+        val entry = DlmsFixtures.struct(
+            DlmsFixtures.obisValue("1.0.1.8.0.255"),
+            DlmsFixtures.i8(5),
+            DlmsFixtures.struct(
+                DlmsFixtures.i8(1),
+                DlmsFixtures.u16(30)
+            )
+        )
+
+        val reading = readingsFrom(entry).single()
+
+        assertEquals(5L, reading.rawValue)
+        assertEquals(1, reading.scaler)
+        assertNull(reading.unit)
+    }
+
+//Вложенная структура не должна повторно распознаваться как главная строка
+
+    @Test
+    fun readings_nestedStructWithMainRowSignature_doesNotDuplicatePositionalReadings() {
+        val nested = DlmsFixtures.struct(
+            DlmsFixtures.i8(1),
+            DlmsFixtures.enumVal(2),
+            DlmsFixtures.i8(3)
+        )
+
+        val root = DlmsFixtures.struct(
+            DlmsFixtures.i8(0),
+            DlmsFixtures.enumVal(1),
+            nested
+        )
+
+        val readings = readingsOf(decodeDlmsValue(root))
+
+        assertEquals(
+            1,
+            readings.count { it.obisCode == CLOCK_STATUS_OBIS }
+        )
+        assertEquals(
+            1,
+            readings.count { it.obisCode == RELAY_CONTROL_STATE_OBIS }
+        )
+    }
+
+    //Проверка уникальности OBIS в реальном буфере
+
+    @Test
+    fun realMeter_obisCodesAreUnique() {
+        val readings = RealMeterBuffer.readings()
+
+        val obisCodes = readings.map { it.obisCode }
+
+        assertEquals(
+            "В буфере не должно быть повторяющихся OBIS",
+            obisCodes.size,
+            obisCodes.toSet().size
+        )
+    }
+
+
+
+//ACTION-response: неправильный choice
+
+    @Test
+    fun actionResponse_wrongChoice_returnsNull() {
+        val frame = byteArrayOf(
+            0xE6.toByte(), 0xE7.toByte(), 0x00,
+            0xC7.toByte(), 0x02, 0xC1.toByte(), 0x00, 0x00
+        )
+
+        assertNull(parseActionResponseResult(frame))
+    }
+
+
+
+//GET-response: неправильный choice
+
+    @Test
+    fun getResponse_wrongChoice_throws() {
+        val frame = byteArrayOf(
+            0xE6.toByte(), 0xE7.toByte(), 0x00,
+            0xC4.toByte(), 0x02, 0xC1.toByte(), 0x00, 0x00
+        )
+
+        assertThrows(DlmsDecodeException::class.java) {
+            parseGetResponseValue(frame)
+        }
+    }
+
+
+//Float: проверка scaler и unit
+
+
+
+    @Test
+    fun readings_float32_appliesScalerAndUnit() {
+        val value = DlmsFixtures.struct(
+            DlmsFixtures.obisValue("1.0.32.7.0.255"),
+            DlmsFixtures.float32(2301f),
+            DlmsFixtures.scalerUnit(-1, 35)
+        )
+
+        val r = readingsFrom(value).single()
+
+        assertEquals(230.1 , r.value, 0.001)
+        assertEquals(35, r.unit)
+        assertEquals("В", r.unitLabel)
+    }
+
+    @Test
+    fun readings_float64_withoutScalerUnit_keepsOriginalValue() {
+        val value = DlmsFixtures.struct(
+            DlmsFixtures.obisValue("1.0.32.7.0.255"),
+            DlmsFixtures.float32(230.123f)
+        )
+
+        val r = readingsFrom(value).single()
+
+        assertEquals(230.123, r.value, 0.001)
+        assertNull(r.unit)
     }
 }

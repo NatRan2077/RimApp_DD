@@ -14,6 +14,7 @@ import ru.rim.dd.testutil.RealMeterBuffer
 import java.time.LocalDate
 import java.time.LocalTime
 
+
 /**
  * Разбор ответов прибора: APDU GET-response и ACTION-response, блоки, единицы измерения, дата и
  * время COSEM и раскладка буфера индикации в показания (OBIS + значение × 10^scaler + единица).

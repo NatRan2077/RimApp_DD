@@ -12,11 +12,14 @@ import ru.rim.dd.core.model.RelaySource
 import ru.rim.dd.core.model.TamperCondition
 import ru.rim.dd.data.dlms.DlmsSessionClient
 import ru.rim.dd.data.dlms.MainBufferResult
+import ru.rim.dd.testutil.DlmsFixtures
 import ru.rim.dd.testutil.FakeNativeDlmsApi
 import ru.rim.dd.testutil.RealAkrosBuffer
 import java.time.Instant
 import java.time.LocalDate
 import java.time.LocalTime
+import org.junit.Assert.assertNotNull
+import ru.rim.dd.core.dlms.longOrBoolValueOf
 
 /**
  * Настоящий ответ AKROS из лога (подключение 29.10.2026) на путь пульта: разбор пакета и вся
@@ -164,5 +167,106 @@ class RealAkrosBufferTest {
         assertEquals(0.0, net.current.total, 0.0)
         assertEquals(0.0, net.power.total, 0.0)
         assertEquals(0.0, net.frequencyHz!!, 0.0)
+    }
+
+
+    //Склейка кадров: ровно один LLC
+
+    @Test
+    fun rawResponse_hasExactlyOneLlcHeader() {
+        // Если infoField ошибётся на байт (захватит HCS/FCS), склейка сдвинется,
+        // и LLC (E6 E7 00) может оказаться дважды. Проверяем, что он один.
+        val raw = RealAkrosBuffer.rawResponse()
+        val count = (0..raw.size - 3).count { i ->
+            (raw[i].toInt() and 0xFF) == 0xE6 &&
+                    (raw[i + 1].toInt() and 0xFF) == 0xE7 &&
+                    (raw[i + 2].toInt() and 0xFF) == 0x00
+        }
+        assertEquals("один LLC на склеенный ответ", 1, count)
+    }
+
+    // HDLC-объекты: не «съедают» друг друга
+
+    @Test
+    fun hdlcSetup_bothObjectsHaveExactly8Attributes_andDoNotOverlap() {
+        // В буфере AKROS два HDLC-объекта (0.0.22 и 0.1.22). Если один не последний,
+        // код, забирающий «остаток», съест атрибуты второго. Проверяем: оба по 8,
+        // и последний элемент каждого — device_address = 16 (не элементы соседа).
+        val first = byObis.getValue("0.0.22.0.0.255").structItems!!
+        val second = byObis.getValue("0.1.22.0.0.255").structItems!!
+
+        assertEquals("0.0.22 - 8 атрибутов", 8, first.size)
+        assertEquals("0.1.22 - 8 атрибутов", 8, second.size)
+        assertEquals("device_address 0.0.22", 16L, longOrBoolValueOf(first.last()))
+        assertEquals("device_address 0.1.22", 16L, longOrBoolValueOf(second.last()))
+    }
+
+    //  Сеть при нулевой нагрузке: не только total
+    // под вопросом пока
+
+//    @Test
+//    fun network_zeroWithoutLoad_allFieldsPresent() {
+//        val net = applied().network.value!!
+//
+//        assertEquals(0.0, net.voltage.total, 0.0)
+//        assertEquals(0.0, net.current.total, 0.0)
+//        assertEquals(0.0, net.power.total, 0.0)
+//        assertEquals(0.0, net.frequencyHz!!, 0.0)
+//
+//        // Трёхфазный AKROS: три фазы присутствуют (не null), по нулям.
+//        assertTrue("прибор трёхфазный", net.voltage.isThreePhase)
+//        assertNotNull("фаза L1", net.voltage.l1)
+//        assertNotNull("фаза L2", net.voltage.l2)
+//        assertNotNull("фаза L3", net.voltage.l3)
+//        assertEquals(0.0, net.voltage.l1!!, 0.0)
+//        assertEquals(0.0, net.voltage.l2!!, 0.0)
+//        assertEquals(0.0, net.voltage.l3!!, 0.0)
+//    }
+
+    //Энергия: единица не теряется при маппинге
+
+    @Test
+    fun energy_keepsUnitBeforeMapping() {
+        // unit проверяем на сырых ObisReading (до маппинга в Reading),
+        // потому что у Reading единица зашита в category.
+        val raw = RealAkrosBuffer.readings().associateBy { it.obisCode }
+        assertEquals(30, raw.getValue("1.0.1.8.0.255").unit)
+        assertEquals(30, raw.getValue("1.0.2.8.0.255").unit)
+        assertEquals(32, raw.getValue("1.0.3.8.0.255").unit)
+        assertEquals(32, raw.getValue("1.0.4.8.0.255").unit)
+    }
+
+    //  Протокольный клиент: пустой и ошибочный ответ
+
+    @Test
+    fun readMainBuffer_emptyAnswer_returnsNotDecoded() {
+        // Пустой ответ не должен ронять клиент - должен вернуть «не разобрано».
+        val native = FakeNativeDlmsApi()
+        native.onFlatGet = { _, _, _ -> ByteArray(0) }
+
+        val result = DlmsSessionClient(native).readMainBuffer()
+
+        assertFalse("пустой ответ - не Decoded", result is MainBufferResult.Decoded)
+    }
+
+    @Test
+    fun readMainBuffer_errorAnswer_returnsNotDecoded() {
+        // data-access-result вместо данных — тоже «не разобрано», без краха.
+        val native = FakeNativeDlmsApi()
+        native.onFlatGet = { _, _, _ -> DlmsFixtures.getResponseError(code = 0x0D) }
+
+        val result = DlmsSessionClient(native).readMainBuffer()
+
+        assertFalse("ошибка доступа - не Decoded", result is MainBufferResult.Decoded)
+    }
+
+    // Серийный номер: из буфера или переданный
+
+    @Test
+    fun meterInfo_serialNumber_comesFromBufferOrGiven() {
+        val info = applied().info.value!!
+        assertEquals("07200090", info.serialNumber)
+        // Проверяем, что в буфере AKROS поля серийного номера действительно нет.
+        assertNull("AKROS не присылает 0.0.96.1.0.255", byObis["0.0.96.1.0.255"])
     }
 }

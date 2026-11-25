@@ -19,6 +19,9 @@ import ru.rim.dd.core.dlms.CLOCK_STATUS_OBIS
 import java.time.LocalDate
 import java.time.LocalDateTime
 import ru.rim.dd.core.dlms.DlmsValue
+import ru.rim.dd.core.dlms.DD_PHASE_DISPLAY_OBIS
+import ru.rim.dd.core.model.PhaseStatus
+
 /**
  * Проверка разбора буфера индикации на реальном ответе прибора (3-кадровый HDLC-ответ на
  * GET 0.0.21.0.2.255, снятый с трёхфазного РиМ). Кадры собираются так же, как это делает
@@ -262,6 +265,7 @@ class MeterBufferMapperTest {
         assertEquals(229.8, net.voltage.l3!!, 1e-9)
     }
 
+
     //покрытие добавить еще!!! (линейное напряжение)
     @Test
     fun networkParams_lineVoltagesNewCodes() {
@@ -462,5 +466,124 @@ class MeterBufferMapperTest {
         assertEquals(1, ObisReading("1.0.1.8.1.255", 0, 0, null).tariff)
         assertEquals(3, ObisReading("1.0.1.8.3.255", 0, 0, null).tariff)
         assertNull(ObisReading("1.0.1.8.0.255", 0, 0, null).tariff)
+    }
+
+    // Для покрытия еще некоторых веток
+
+    @Test
+    fun meterInfo_hdlcAndOperatingTime_parsedAndFallbacks() {
+        // Передаем HDLC настройки и время работы без unit
+        val all = listOf(
+            ObisReading("0.0.22.0.0.255", 0, 0, null, textValue = "P1"),
+            ObisReading("0.1.22.0.0.255", 0, 0, null, textValue = "P2"),
+            ObisReading("0.2.22.0.0.255", 0, 0, null, textValue = "P3"),
+            ObisReading("0.3.22.0.0.255", 0, 0, null, textValue = "P4"),
+            ObisReading("0.0.96.8.0.255", rawValue = 120, scaler = 0, unit = null)
+        )
+        val info = MeterBufferMapper.meterInfo(all, null, null, null, now)!!.info
+
+        assertEquals("P1", info.hdlcP1)
+        assertEquals("P2", info.hdlcP2)
+        assertEquals("P3", info.hdlcP3)
+        assertEquals("P4", info.hdlcP4)
+        assertEquals(120.0, info.operatingTime!!, 0.0)
+        assertNull(info.operatingTimeUnit)
+    }
+
+    @Test
+    fun meterInfo_rdchDateOnly_usesMidnight() {
+        val dateBytes = byteArrayOf(0x07, 0xEA.toByte(), 10, 15, 0) // 2026-10-15
+        val all = listOf(ObisReading("0.0.0.9.2.101", 0, 0, null, octetValue = dateBytes))
+
+        val info = MeterBufferMapper.meterInfo(all, null, null, null, now)!!
+        assertEquals(LocalDateTime.of(2026, 10, 15, 0, 0), info.info.rdchDateTime)
+    }
+
+    @Test
+    fun meterInfo_onlyOneFieldNotNull_passesBigIf() {
+        val all = listOf(ObisReading(DD_PHASE_DISPLAY_OBIS, 0x07, 0, null))
+        val info = MeterBufferMapper.meterInfo(all, null, null, null, now)
+        assertNotNull(info)
+        assertNotNull(info!!.info.phaseStatus)
+    }
+
+    @Test
+    fun meterInfo_firmwareAndModelNull_fallbacks() {
+        // Покрывает: 256 и 262 (firmwareEntry?.second и modelEntry?.second)
+        // В буфере нет версии ПО и модели, но есть температура (чтобы не выйти в null)
+        val all = listOf(ObisReading("0.0.96.9.0.255", rawValue = 25, scaler = 0, unit = 33))
+        val info = MeterBufferMapper.meterInfo(all, null, null, null, now)!!.info
+
+        assertEquals("—", info.firmwareVersion)
+        assertEquals("—", info.model)
+    }
+
+    @Test
+    fun meterInfo_keepsAllPreviousValues_whenMissingInBuffer() {
+        // Покрывает: 316-327 (ВСЕ ветки "?: prev?....")
+        val prev = MeterBufferMapper.blankMeterInfo("11111111").copy(
+            modelObis = "0.0.96.1.1.255",
+            firmwareVersionObis = "0.0.96.1.2.255",
+            serialNumberObis = "0.0.96.1.0.255",
+            hdlcP1 = "9600 бод",
+            hdlcP2 = "19200 бод",
+            hdlcP3 = "38400 бод",
+            hdlcP4 = "57600 бод",
+            operatingTime = 12.0,
+            operatingTimeUnit = "ч",
+            rdchDateTime = LocalDateTime.of(2026, 1, 1, 0, 0),
+            phaseStatus = PhaseStatus.decode(1L)
+        )
+
+        // Буфер содержит только температуру, остального нет
+        val all = listOf(ObisReading("0.0.96.9.0.255", rawValue = 25, scaler = 0, unit = 33))
+        val info = MeterBufferMapper.meterInfo(all, prev, "11111111", null, now)!!.info
+
+        assertEquals("0.0.96.1.1.255", info.modelObis)
+        assertEquals("0.0.96.1.2.255", info.firmwareVersionObis)
+        assertEquals("0.0.96.1.0.255", info.serialNumberObis)
+        assertEquals("9600 бод", info.hdlcP1)
+        assertEquals("19200 бод", info.hdlcP2)
+        assertEquals("38400 бод", info.hdlcP3)
+        assertEquals("57600 бод", info.hdlcP4)
+        assertEquals(12.0, info.operatingTime!!, 0.0)
+        assertEquals("ч", info.operatingTimeUnit)
+        assertEquals(LocalDateTime.of(2026, 1, 1, 0, 0), info.rdchDateTime)
+        assertNotNull(info.phaseStatus)
+    }
+
+    //хотела покрыть где только 3, не вышло, тк функция сразу 0 возращает из-за того что это просто доп.
+    @Test
+    fun networkParams_lineVoltages_onlyOneCode() {
+        // Только новый L23
+        val newCodes = listOf(
+            ObisReading(obisCode = "1.0.12.7.0.255", rawValue = 2300, scaler = -1, unit = 35),
+            ObisReading(obisCode = "1.0.125.7.0.255", rawValue = 4000, scaler = -1, unit = 35)
+        )
+        val netNew = MeterBufferMapper.networkParams(newCodes)!!
+        assertNotNull(netNew.lineVoltages)
+        assertNull(netNew.lineVoltages!!.l12)
+        assertEquals(400.0, netNew.lineVoltages!!.l23!!, 1e-9)
+
+        // Только старый L13
+        val oldCodes = listOf(
+            ObisReading(obisCode = "1.0.12.7.0.255", rawValue = 2300, scaler = -1, unit = 35),
+            ObisReading(obisCode = "1.0.12.7.3.255", rawValue = 4000, scaler = -1, unit = 35)
+        )
+        val netOld = MeterBufferMapper.networkParams(oldCodes)!!
+        assertNotNull(netOld.lineVoltages)
+        assertEquals(400.0, netOld.lineVoltages!!.l13!!, 1e-9)
+        assertTrue(netOld.lineVoltages!!.legacyCodes)
+    }
+
+    @Test
+    fun networkParams_zeroFallbacks() {
+        // Есть только мощность, нет напряжения и тока
+        val all = listOf(ObisReading("1.0.1.7.0.255", 1000, 0, 27))
+        val net = MeterBufferMapper.networkParams(all)!!
+
+        assertEquals(0.0, net.voltage.total, 1e-9) // voltage ?: 0.0
+        assertEquals(0.0, net.current.total, 1e-9)  // current ?: 0.0
+        assertEquals(1.0, net.power.total, 1e-9)    // power есть
     }
 }

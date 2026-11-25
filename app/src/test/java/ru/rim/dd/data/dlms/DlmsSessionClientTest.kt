@@ -268,4 +268,147 @@ class DlmsSessionClientTest {
         assertEquals(listOf("create", "destroy", "create"), native.calls)
         assertTrue(native.clientAlive)
     }
+    // функции которые не вызывали
+    @Test
+    fun recreateClient_CreateDestroys() {
+        client.createClient()
+        //Такого нету, но оказывается тут просто можно без таких проверок вызывать, тест сам напишет если будет исключение
+        //assertDoesNotThrow(client.destroyClient());
+        client.destroyClient()
+        assertEquals(listOf("create", "destroy"), native.calls)
+    }
+    //создать-удалить-создать
+    @Test
+    fun recreateClient_CreateDestroysCreate() {
+        client.createClient()
+        client.destroyClient()
+        client.createClient()
+
+        assertEquals(listOf("create", "destroy", "create"), native.calls)
+        assertTrue(native.clientAlive)
+
+    }
+    //создать - удалить -удалить
+    @Test
+    fun recreateClient__CreateDestroysDestroys() {
+        client.createClient()
+        client.destroyClient()
+        client.destroyClient()
+        assertEquals(listOf("create", "destroy", "destroy"), native.calls)
+    }
+    //просто удалить
+    @Test
+    fun recreateClient_Destroys() {
+        client.destroyClient()
+        assertEquals(listOf("destroy"), native.calls)
+    }
+    //создать - удалить - пересоздать
+    @Test
+    fun recreateClient_CreateDestroysRecreate() {
+        client.createClient()
+        client.destroyClient()
+        client.recreateClient()
+
+        assertEquals(listOf("create", "destroy", "destroy", "create"), native.calls)
+        assertTrue(native.clientAlive)
+    }
+
+    // покрыть resetDescription
+    @Test
+    fun fun_resetDescription() {
+        client.resetDescription()
+        client.createClient()
+    }
+
+    // тест последней ошибки
+
+    @Test
+    fun lastErrorMessage_returnsNativeError() {
+        native.error = "Ошибка связи"
+        assertEquals("Ошибка связи", client.lastErrorMessage())
+    }
+
+    @Test
+    fun resetDescription_clearsCapturedColumns() {
+        prepareAkrosDevice()
+        client.establishAkrosSession()
+        client.akrosAssociation = true
+
+        // Описание получено, буфер разбирается
+        val firstResult = client.readMainBuffer()
+        assertTrue(firstResult is MainBufferResult.Decoded)
+
+        // Сбрасываем описание
+        client.resetDescription()
+
+        // При следующем GET клиент должен понять, что описания нет,
+        // и запросить capture_objects повторно (или вернуть пустой список колонок)
+        native.calls.clear()
+        val secondResult = client.readMainBuffer()
+
+        assertTrue(secondResult is MainBufferResult.Decoded)
+        // Проверяем, что клиент сходил за capture_objects заново (classId = 7, attribute = 3)
+        assertTrue("Должен быть повторный запрос capture_objects",
+            native.calls.contains("get 7 $mainBuffer 3"))
+    }
+    //короче мертвый код, туда не зайти. Но пусть будет, это все равно защита на всякий случай
+
+//    @Test
+//    //Покрыть ветку catch в readMainBuffer через readingsOf невозможно,
+//    //потому что эта функция сама по себе никогда не выбрасывает исключений на битых данных
+//    // она спроектирована так, чтобы "молча выживать"
+//    fun readMainBuffer_decodeException_returnsDecodeFailed() {
+//        // Формируем валидный GET-response, внутри которого лежит битая структура.
+//        // Тег 0x02 (Structure) обещает 2 элемента, но самих элементов нет.
+//        val fakePayload = byteArrayOf(0x02, 0x02)
+//
+//        native.onFlatGet = { _, _, _ -> DlmsFixtures.getResponse(fakePayload) }
+//
+//        val result = client.readMainBuffer()
+//
+//        assertTrue("Ожидался DecodeFailed, но был $result", result is MainBufferResult.DecodeFailed)
+//    }
+
+    @Test
+    fun establishAkrosSession_scalerUnitGarbage_skipsColumnButContinues() {
+        // Настраиваем AKROS
+        native.onGet = DlmsFixtures.akrosGetResponder()
+
+        // Ломаем ответ для scaler_unit первой колонки
+        val originalOnGet = native.onGet
+        native.onGet = { classId, obis, attribute ->
+            if (obis == "1.0.1.8.0.255" && attribute == 3) {
+                // Возвращаем мусор вместо нормального scaler_unit
+                DlmsFixtures.getResponse(byteArrayOf(0x01, 0x02, 0x03))
+            } else {
+                originalOnGet?.invoke(classId, obis, attribute)
+            }
+        }
+
+        val error = client.establishAkrosSession()
+
+        assertNull(error) // Сеанс не должен рваться
+        client.akrosAssociation = true
+
+        // Буфер должен разобраться, просто у первой колонки не будет единиц измерения
+        val result = client.readMainBuffer()
+        assertTrue(result is MainBufferResult.Decoded)
+        val readings = (result as MainBufferResult.Decoded).readings
+
+        // Первая колонка (1.0.1.8.0.255) — unit должен быть null, так как scaler_unit упал
+        val firstColumn = readings.first { it.obisCode == "1.0.1.8.0.255" }
+        assertNull("Единица измерения должна отсутствовать из-за ошибки парсинга", firstColumn.unit)
+    }
+
+    @Test
+    fun disconnectControlAction_malformedResponse_returnsFalse() {
+        // Возвращаем ответ, который parseActionResponseResult не сможет разобрать (вернёт null)
+        native.onAction = { byteArrayOf(0x01, 0x02, 0x03, 0x04, 0x05) }
+        assertFalse(client.disconnectControlAction(1, "битый ответ"))
+    }
+
+
+
+
+
 }

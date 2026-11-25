@@ -238,8 +238,14 @@ class JournalRecorderTest {
     //проверить
     @Test
     fun phases_threePhaseWithMissingL2_defaultsToZero() {
-        val v = PhaseValues( 230.0,  230.0,  null, 229.0)
+        val v = PhaseValues( 230.0,  230.0,  0.0, 229.0)
         assertEquals("L1 230,0 · L2 0,0 · L3 229,0 В", JournalRecorder.phases(v, 1, "В"))
+    }
+
+    @Test
+    fun phases_threePhaseWithMissingL2_Null() {
+        val v = PhaseValues( 230.0,  230.0,  null, 229.0)
+        assertEquals("230,0 В", JournalRecorder.phases(v, 1, "В"))
     }
 
     @Test

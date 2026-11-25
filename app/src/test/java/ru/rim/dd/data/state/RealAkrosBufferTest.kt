@@ -204,24 +204,24 @@ class RealAkrosBufferTest {
     //  Сеть при нулевой нагрузке: не только total
     // под вопросом пока
 
-//    @Test
-//    fun network_zeroWithoutLoad_allFieldsPresent() {
-//        val net = applied().network.value!!
-//
-//        assertEquals(0.0, net.voltage.total, 0.0)
-//        assertEquals(0.0, net.current.total, 0.0)
-//        assertEquals(0.0, net.power.total, 0.0)
-//        assertEquals(0.0, net.frequencyHz!!, 0.0)
-//
-//        // Трёхфазный AKROS: три фазы присутствуют (не null), по нулям.
-//        assertTrue("прибор трёхфазный", net.voltage.isThreePhase)
-//        assertNotNull("фаза L1", net.voltage.l1)
-//        assertNotNull("фаза L2", net.voltage.l2)
-//        assertNotNull("фаза L3", net.voltage.l3)
-//        assertEquals(0.0, net.voltage.l1!!, 0.0)
-//        assertEquals(0.0, net.voltage.l2!!, 0.0)
-//        assertEquals(0.0, net.voltage.l3!!, 0.0)
-//    }
+    @Test
+    fun network_zeroWithoutLoad_allFieldsPresent() {
+        val net = applied().network.value!!
+
+        assertEquals(0.0, net.voltage.total, 0.0)
+        assertEquals(0.0, net.current.total, 0.0)
+        assertEquals(0.0, net.power.total, 0.0)
+        assertEquals(0.0, net.frequencyHz!!, 0.0)
+
+        // Трёхфазный AKROS: три фазы присутствуют (не null), по нулям.
+        assertTrue("прибор трёхфазный", net.voltage.isThreePhase)
+        assertNotNull("фаза L1", net.voltage.l1)
+        assertNotNull("фаза L2", net.voltage.l2)
+        assertNotNull("фаза L3", net.voltage.l3)
+        assertEquals(0.0, net.voltage.l1!!, 0.0)
+        assertEquals(0.0, net.voltage.l2!!, 0.0)
+        assertEquals(0.0, net.voltage.l3!!, 0.0)
+    }
 
     //Энергия: единица не теряется при маппинге
 

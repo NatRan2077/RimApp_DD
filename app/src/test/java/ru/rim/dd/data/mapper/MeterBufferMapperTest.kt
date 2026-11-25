@@ -1,6 +1,7 @@
 package ru.rim.dd.data.mapper
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
@@ -13,7 +14,11 @@ import ru.rim.dd.core.model.RelayState
 import ru.rim.dd.core.model.TamperState
 import ru.rim.dd.testutil.RealMeterBuffer
 import java.time.Instant
-
+import ru.rim.dd.core.dlms.ObisReading
+import ru.rim.dd.core.dlms.CLOCK_STATUS_OBIS
+import java.time.LocalDate
+import java.time.LocalDateTime
+import ru.rim.dd.core.dlms.DlmsValue
 /**
  * Проверка разбора буфера индикации на реальном ответе прибора (3-кадровый HDLC-ответ на
  * GET 0.0.21.0.2.255, снятый с трёхфазного РиМ). Кадры собираются так же, как это делает
@@ -158,5 +163,304 @@ class MeterBufferMapperTest {
         assertEquals("9600 бод", MeterBufferMapper.hdlcSpeedLabel(5))
         assertEquals("115200 бод", MeterBufferMapper.hdlcSpeedLabel(9))
         assertEquals("скорость код 42", MeterBufferMapper.hdlcSpeedLabel(42))
+    }
+
+    //доп
+    //на покрытие
+    //hdlcSpeedLabel
+    @Test
+    fun hdlcSpeedLabel_knownAndUnknownCodesAll() {
+        assertEquals("300 бод", MeterBufferMapper.hdlcSpeedLabel(0))
+        assertEquals("600 бод", MeterBufferMapper.hdlcSpeedLabel(1))
+        assertEquals("1200 бод", MeterBufferMapper.hdlcSpeedLabel(2))
+        assertEquals("2400 бод", MeterBufferMapper.hdlcSpeedLabel(3))
+        assertEquals("4800 бод", MeterBufferMapper.hdlcSpeedLabel(4))
+        assertEquals("19200 бод", MeterBufferMapper.hdlcSpeedLabel(6))
+        assertEquals("38400 бод", MeterBufferMapper.hdlcSpeedLabel(7))
+        assertEquals("57600 бод", MeterBufferMapper.hdlcSpeedLabel(8))
+    }
+    //на ошибки
+    @Test
+    fun hdlcSpeedLabel_Negative() {
+        //скорость может быть отриуательной? Нет
+        assertNotEquals("скорость код -12", MeterBufferMapper.hdlcSpeedLabel(-12))
+    }
+
+    @Test
+    fun hdlcSpeedLabel_Overflow() {
+        //скорость может быть отриуательной? Нет
+        val trash: Int = Int.MAX_VALUE + 1;
+        assertNotEquals("скорость код -2147483648", MeterBufferMapper.hdlcSpeedLabel(trash))
+    }
+
+    //покрытие energyReadings
+    @Test
+    fun energyReadings_filterBranches() {
+        fun r(obis: String) = ObisReading(obisCode = obis, rawValue = 1000, scaler = 0, unit = 30)
+        val all = listOf(
+            r("1.0.1.8.0.255"),   // A+ сумма (g[2]=1, g[3]=8, g[5]=255)
+            r("1.0.4.8.1.255"),   // R- Т1 (g[2]=4, g[5]=255)
+            r("1.0.9.8.0.255"),   //  g[2]=9 вне 1..4
+            r("1.0.X.8.0.255"),   //  g[2] не число
+            r("1.0.1"),           // size != 6
+            r("1.0.1.8.0.100"),   // F=100 не 255/101
+            r("1.0.1.17.0.255"),  // РДЧ старого формата (g[3]=17)
+            r("1.0.4.8.0.101"),   //  РДЧ (F=101)
+            r("1.0.1.9.0.255"),   //  g[3]=9 (не 8 и не 17)
+        )
+        val result = MeterBufferMapper.energyReadings(all, now)!!
+
+        assertEquals(4, result.size)
+        assertEquals(
+            listOf("1.0.1.8.0.255", "1.0.4.8.1.255", "1.0.1.17.0.255", "1.0.4.8.0.101"),
+            result.map { it.obisId },
+        )
+        // isRdch: F=101 или D=17
+        assertFalse(result.first { it.obisId == "1.0.1.8.0.255" }.isRdch)
+        assertFalse(result.first { it.obisId == "1.0.4.8.1.255" }.isRdch)
+        assertTrue(result.first { it.obisId == "1.0.1.17.0.255" }.isRdch)
+        assertTrue(result.first { it.obisId == "1.0.4.8.0.101" }.isRdch)
+    }
+
+    //покрытие networkParams
+    @Test
+    fun networkParams_totalFallsBackToL1() {
+        // Нет total (1.0.12.7), есть только L1 (1.0.32.7)
+        val all = listOf(
+            ObisReading(obisCode = "1.0.32.7.0.255", rawValue = 2300, scaler = -1, unit = 35), // 230.0
+        )
+        val net = MeterBufferMapper.networkParams(all)!!
+        assertEquals(230.0, net.voltage.total, 1e-9)   // total = a (fallback)
+        assertEquals(230.0, net.voltage.l1!!, 1e-9)
+        assertNull(net.voltage.l2)
+        assertNull(net.voltage.l3)
+    }
+
+    @Test
+    fun networkParams_totalIsZeroWhenOnlyPower() {
+        // Есть только мощность - voltage/current = PhaseValues(0.0)
+        val all = listOf(
+            ObisReading(obisCode = "1.0.1.7.0.255", rawValue = 1000, scaler = 0, unit = 27), // 1000 Вт
+        )
+        val net = MeterBufferMapper.networkParams(all)!!
+        assertEquals(0.0, net.voltage.total, 1e-9)
+        assertEquals(0.0, net.current.total, 1e-9)
+        assertEquals(1.0, net.power.total, 1e-9)  // 1000 / 1000
+    }
+
+    @Test
+    fun networkParams_partialPhases() {
+        // L1 есть, L2 нет, L3 есть
+        val all = listOf(
+            ObisReading(obisCode = "1.0.12.7.0.255", rawValue = 2300, scaler = -1, unit = 35),
+            ObisReading(obisCode = "1.0.32.7.0.255", rawValue = 2300, scaler = -1, unit = 35),
+            ObisReading(obisCode = "1.0.72.7.0.255", rawValue = 2298, scaler = -1, unit = 35),
+        )
+        val net = MeterBufferMapper.networkParams(all)!!
+        assertEquals(230.0, net.voltage.l1!!, 1e-9)
+        assertNull(net.voltage.l2)               // ветка b == null
+        assertEquals(229.8, net.voltage.l3!!, 1e-9)
+    }
+
+    //покрытие добавить еще!!! (линейное напряжение)
+    @Test
+    fun networkParams_lineVoltagesNewCodes() {
+        val all = listOf(
+            ObisReading(obisCode = "1.0.12.7.0.255", rawValue = 2300, scaler = -1, unit = 35),
+            ObisReading(obisCode = "1.0.124.7.0.255", rawValue = 4000, scaler = -1, unit = 35),
+        )
+        val net = MeterBufferMapper.networkParams(all)!!
+        assertNotNull(net.lineVoltages)
+        assertEquals(400.0, net.lineVoltages!!.l12!!, 1e-9)
+        assertFalse(net.lineVoltages!!.legacyCodes)
+    }
+
+    @Test
+    fun networkParams_lineVoltagesLegacyCodes() {
+        val all = listOf(
+            ObisReading(obisCode = "1.0.12.7.0.255", rawValue = 2300, scaler = -1, unit = 35),
+            ObisReading(obisCode = "1.0.12.7.1.255", rawValue = 4000, scaler = -1, unit = 35),
+        )
+        val net = MeterBufferMapper.networkParams(all)!!
+        assertTrue(net.lineVoltages!!.legacyCodes)
+        assertEquals(400.0, net.lineVoltages!!.l12!!, 1e-9)
+    }
+
+    @Test
+    fun networkParams_lineVoltagesNullWhenAbsent() {
+        val all = listOf(
+            ObisReading(obisCode = "1.0.12.7.0.255", rawValue = 2300, scaler = -1, unit = 35),
+        )
+        assertNull(MeterBufferMapper.networkParams(all)!!.lineVoltages)
+    }
+
+    // попробовать с приватной, не выйдет пох
+
+    private fun clockBytes(year: Int = 2026, status: Int = 0x00): ByteArray {
+        val y = year
+        return byteArrayOf(
+            (y shr 8).toByte(), (y and 0xFF).toByte(),
+            10, 15, 0,          // month, day, dayOfWeek
+            12, 0, 0, 0,        // hour, min, sec, hundredths
+            0, 0,               // deviation
+            status.toByte(),
+        )
+    }
+
+    @Test
+    fun clockFields_yearFFFF_ignoredButStatusStillUsed() {
+        val bytes = clockBytes(year = 0xFFFF, status = 0xFF)
+        val info = MeterBufferMapper.meterInfo(
+            all = listOf(ObisReading(obisCode = CLOCK_STATUS_OBIS, rawValue = 0, scaler = 0, unit = null, octetValue = bytes)),
+            prev = null, activeSerialNumber = null, knownReportedSerial = null, now = now,
+        )
+        // clock.date = null, clock.time = null, clock.status = null - всё null - meterInfo = null
+        assertNull(info)
+    }
+
+    @Test
+    fun clockFields_statusFF_meansNull() {
+        val bytes = clockBytes(year = 2026, status = 0xFF)
+        val info = MeterBufferMapper.meterInfo(
+            all = listOf(ObisReading(obisCode = CLOCK_STATUS_OBIS, rawValue = 0, scaler = 0, unit = null, octetValue = bytes)),
+            prev = null, activeSerialNumber = null, knownReportedSerial = null, now = now,
+        )
+        // date/time есть, status = null - clockValid = null
+        assertNotNull(info)
+        assertEquals(LocalDate.of(2026, 10, 15), info!!.info.deviceDate)
+        assertNull(info.info.clockValid)
+    }
+
+    @Test
+    fun clockFields_wrongSize_ignored() {
+        val bytes = ByteArray(5) { 0 }
+        val info = MeterBufferMapper.meterInfo(
+            all = listOf(ObisReading(obisCode = CLOCK_STATUS_OBIS, rawValue = 0, scaler = 0, unit = null, octetValue = bytes)),
+            prev = null, activeSerialNumber = null, knownReportedSerial = null, now = now,
+        )
+        assertNull(info)  // size != 12 - clockFields = null - всё null
+    }
+
+    @Test
+    fun clockFields_statusDecoded() {
+        val bytes = clockBytes(year = 2026, status = 0x00)
+        val info = MeterBufferMapper.meterInfo(
+            all = listOf(ObisReading(obisCode = CLOCK_STATUS_OBIS, rawValue = 0, scaler = 0, unit = null, octetValue = bytes)),
+            prev = null, activeSerialNumber = null, knownReportedSerial = null, now = now,
+        )
+        assertNotNull(info!!.info.clockValid)  // status=0 - isClockStatusValid(0) = true (обычно)
+    }
+
+    private fun dateBytes(y: Int = 2026, m: Int = 10, d: Int = 15): ByteArray =
+        byteArrayOf((y shr 8).toByte(), (y and 0xFF).toByte(), m.toByte(), d.toByte(), 0)
+
+    private fun timeBytes(h: Int = 12, min: Int = 30): ByteArray =
+        byteArrayOf(h.toByte(), min.toByte(), 0, 0)
+
+    @Test
+    fun rdchDateTime_onlyDate_usesMidnight() {
+        val all = listOf(
+            ObisReading(obisCode = "0.0.0.9.2.101", rawValue = 0, scaler = 0, unit = null, octetValue = dateBytes()),
+        )
+        val info = MeterBufferMapper.meterInfo(all, null, null, null, now)!!
+        assertEquals(LocalDateTime.of(2026, 10, 15, 0, 0), info.info.rdchDateTime)
+    }
+
+    @Test
+    fun rdchDateTime_onlyTime_ignored() {
+        val all = listOf(
+            ObisReading(obisCode = "0.0.0.9.1.101", rawValue = 0, scaler = 0, unit = null, octetValue = timeBytes()),
+        )
+        // Время без даты не даёт rdchDateTime. Но даёт ли оно info?
+        // В большом if: rdchDateTime == null, но deviceTime == null (это .101, не .255)
+        // - скорее всего info = null.
+        val info = MeterBufferMapper.meterInfo(all, null, null, null, now)
+        assertNull(info)
+    }
+
+    @Test
+    fun rdchDateTime_bothDateAndTime() {
+        val all = listOf(
+            ObisReading(obisCode = "0.0.0.9.2.101", rawValue = 0, scaler = 0, unit = null, octetValue = dateBytes()),
+            ObisReading(obisCode = "0.0.0.9.1.101", rawValue = 0, scaler = 0, unit = null, octetValue = timeBytes()),
+        )
+        val info = MeterBufferMapper.meterInfo(all, null, null, null, now)!!
+        assertEquals(LocalDateTime.of(2026, 10, 15, 12, 30), info.info.rdchDateTime)
+    }
+
+    @Test
+    fun describeHdlcSetup_structWithSpeedAndAddress() {
+        val items = listOf(
+            DlmsValue.EnumVal(5),      // 9600
+            DlmsValue.U32(0), DlmsValue.U32(0),
+            DlmsValue.U16(0), DlmsValue.U16(0),
+            DlmsValue.U16(0), DlmsValue.U16(0),
+            DlmsValue.U16(16),         // адрес
+        )
+        val r = ObisReading(obisCode = "0.0.22.0.0.255", rawValue = 0, scaler = 0, unit = null, structItems = items)
+        assertEquals("9600 бод, адрес 16", MeterBufferMapper.describeHdlcSetup(r))
+    }
+
+    @Test
+    fun describeHdlcSetup_structWithoutAddress() {
+        val items = listOf(
+            DlmsValue.EnumVal(5),
+            DlmsValue.U32(0), DlmsValue.U32(0),
+            DlmsValue.U16(0), DlmsValue.U16(0),
+            DlmsValue.U16(0), DlmsValue.U16(0),
+            DlmsValue.BoolVal(true),     // не U16/U32/U8 - address = null
+        )
+        val r = ObisReading(obisCode = "0.0.22.0.0.255", rawValue = 0, scaler = 0, unit = null, structItems = items)
+        assertEquals("9600 бод", MeterBufferMapper.describeHdlcSetup(r))
+    }
+
+    @Test
+    fun describeHdlcSetup_shortStruct() {
+        val items = listOf(DlmsValue.U8(1), DlmsValue.U8(2))
+        val r = ObisReading(obisCode = "0.0.22.0.0.255", rawValue = 0, scaler = 0, unit = null, structItems = items)
+        // items.size < 8 → joinToString через describeDlmsValue
+        val text = MeterBufferMapper.describeHdlcSetup(r)
+        assertTrue(text.contains("1"))
+        assertTrue(text.contains("2"))
+    }
+
+    @Test
+    fun describeHdlcSetup_textValue() {
+        val r = ObisReading(obisCode = "0.0.22.0.0.255", rawValue = 0, scaler = 0, unit = null, textValue = "hello")
+        assertEquals("hello", MeterBufferMapper.describeHdlcSetup(r))
+    }
+
+    @Test
+    fun describeHdlcSetup_octetValue() {
+        val r = ObisReading(obisCode = "0.0.22.0.0.255", rawValue = 0, scaler = 0, unit = null,
+            octetValue = byteArrayOf(0x01, 0xAB.toByte()))
+        assertEquals("01 AB", MeterBufferMapper.describeHdlcSetup(r))
+    }
+
+    @Test
+    fun describeHdlcSetup_rawValue() {
+        val r = ObisReading(obisCode = "0.0.22.0.0.255", rawValue = 42, scaler = 0, unit = null)
+        assertEquals("42", MeterBufferMapper.describeHdlcSetup(r))
+    }
+
+    @Test
+    fun obisReading_valueFromRawAndScaler() {
+        val r = ObisReading(obisCode = "1.0.1.8.0.255", rawValue = 1740, scaler = -3, unit = 30)
+        assertEquals(1.74, r.value, 1e-9)     // 1740 * 10^-3
+        assertEquals(0.00174, r.valueKwh, 1e-9)
+        assertNull(r.tariff)                   // 5-я группа = "0" - null
+    }
+
+    @Test
+    fun obisReading_valueFromFloatHasPriority() {
+        val r = ObisReading(obisCode = "1.0.1.8.0.255", rawValue = 999, scaler = 0, unit = 30, floatValue = 1.74)
+        assertEquals(1.74, r.value, 1e-9)     // floatValue важнее
+    }
+
+    @Test
+    fun obisReading_tariff() {
+        assertEquals(1, ObisReading("1.0.1.8.1.255", 0, 0, null).tariff)
+        assertEquals(3, ObisReading("1.0.1.8.3.255", 0, 0, null).tariff)
+        assertNull(ObisReading("1.0.1.8.0.255", 0, 0, null).tariff)
     }
 }
